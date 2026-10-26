@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use futures::future::try_join_all;
 use log::{debug, info, warn};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
                           MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
@@ -26,12 +28,14 @@ use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::command::flye::FlyeConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          choose_temp_dir};
-use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter, fastq_to_fasta_stream, fastq_bytes_to_fasta_stream};
+use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
+                          fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord};
 use crate::utils::sambam::{filter_clipped_alignments, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
-                            ChannelReader, parse_fastq, spawn_cmd};
+                            ChannelReader, parse_fastq, spawn_cmd, y_junction};
 use crate::utils::subsample::subsample_uniform_reservoir;
+use crate::utils::system::compute_buffer_size;
 
 
 struct ReadsToContigsOutputs {
@@ -1878,159 +1882,340 @@ async fn run_reads_to_contigs(
 
 
 async fn remove_unmapped_contigs(
+    config: Arc<RunConfig>,
     assembled_reads: &PathBuf,
     contigs_with_reads: &HashSet<String>,
     mapped_contigs_fasta: &PathBuf,
-) -> Result<(), PipelineError> {
-    use tokio::io::{
-        AsyncBufReadExt,
-        AsyncWriteExt,
-        BufReader,
-        BufWriter,
-    };
-
-    debug!(
-        "RemoveUnmappedContigs: {} contig IDs have mapped reads",
-        contigs_with_reads.len()
-    );
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
     // ================================================================
-    // Filter assembled FASTA.
+    // Filter the Flye assembly into a structured FASTA stream.
     //
-    // `contigs_with_reads` was collected directly from the final
-    // reads-to-contigs SAM stream while reads_to_contigs.tsv was being
-    // written asynchronously. There is therefore no need to reopen and
-    // parse the TSV here.
+    // This work runs asynchronously. The function installs the stream
+    // topology and returns without waiting for the complete assembly to
+    // be filtered.
     //
-    // Stream the Flye assembly rather than loading all contig sequences
-    // into memory.
+    // Each retained contig is emitted as ParseOutput::Fasta
     //
-    // Biopython SeqRecord.id is the first whitespace-delimited token
-    // following '>', so preserve that definition here.
     // ================================================================
 
-    let fasta_file = tokio::fs::File::open(assembled_reads)
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "Failed to open assembled FASTA {}: {}",
-                assembled_reads.display(),
-                e
-            ))
-        })?;
+    let (mapped_tx, mapped_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
-    let output_file = tokio::fs::File::create(
-        mapped_contigs_fasta,
-    )
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "Failed to create mapped contigs FASTA {}: {}",
-                mapped_contigs_fasta.display(),
-                e
-            ))
-        })?;
+    let assembled_reads_for_task =
+        assembled_reads.clone();
 
-    let mut fasta_lines =
-        BufReader::new(fasta_file).lines();
+    let contigs_with_reads_for_task =
+        contigs_with_reads.clone();
 
-    let mut writer =
-        BufWriter::new(output_file);
+    let filter_task = tokio::spawn(async move {
 
-    let mut keep_current = false;
-    let mut total_contigs: u64 = 0;
-    let mut mapped_contigs: u64 = 0;
 
-    while let Some(line) = fasta_lines
-        .next_line()
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(e.to_string())
-        })?
-    {
-        // A new FASTA record begins.
-        if let Some(header) = line.strip_prefix('>') {
-            total_contigs += 1;
 
-            // Match Biopython SeqRecord.id behavior:
-            //
-            // >contig_123 description...
-            //
-            // becomes:
-            //
-            // contig_123
-            let contig_id = header
-                .split_whitespace()
-                .next()
-                .unwrap_or("");
+        debug!(
+            "RemoveUnmappedContigs: {} contig IDs have mapped reads",
+            contigs_with_reads_for_task.len()
+        );
 
-            keep_current =
-                contigs_with_reads.contains(contig_id);
+        let fasta_file =
+            tokio::fs::File::open(&assembled_reads_for_task)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to open assembled FASTA {}: {}",
+                        assembled_reads_for_task.display(),
+                        e
+                    )
+                })?;
 
-            if keep_current {
-                mapped_contigs += 1;
+        let mut fasta_lines =
+            BufReader::new(fasta_file).lines();
 
-                writer
-                    .write_all(line.as_bytes())
-                    .await
-                    .map_err(|e| {
-                        PipelineError::IOError(
-                            e.to_string()
-                        )
-                    })?;
+        // Current FASTA record being accumulated.
+        let mut current_id: Option<String> = None;
+        let mut current_desc: Option<String> = None;
+        let mut current_seq: Vec<u8> = Vec::new();
 
-                writer
-                    .write_all(b"\n")
-                    .await
-                    .map_err(|e| {
-                        PipelineError::IOError(
-                            e.to_string()
-                        )
-                    })?;
+        let mut keep_current = false;
+
+        let mut total_contigs: u64 = 0;
+        let mut mapped_contigs: u64 = 0;
+
+
+        // ------------------------------------------------------------
+        // Helper for emitting a completed retained record.
+        //
+        // A FASTA record is the natural streaming unit here. Only one
+        // contig sequence is accumulated at a time.
+        // ------------------------------------------------------------
+
+        async fn emit_contig(
+            tx: &mpsc::Sender<ParseOutput>,
+            id: String,
+            desc: Option<String>,
+            seq: Vec<u8>,
+        ) -> Result<()> {
+            let record = SequenceRecord::Fasta {
+                id,
+                desc,
+                seq: Bytes::from(seq),
+            };
+
+            tx.send(ParseOutput::Fasta(record))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "Mapped-contig FASTA downstream receiver dropped"
+                    )
+                })?;
+
+            Ok(())
+        }
+
+
+        // ------------------------------------------------------------
+        // Stream through the Flye assembly.
+        // ------------------------------------------------------------
+
+        while let Some(line) =
+            fasta_lines
+                .next_line()
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed reading assembled FASTA {}: {}",
+                        assembled_reads_for_task.display(),
+                        e
+                    )
+                })?
+        {
+            if let Some(header) = line.strip_prefix('>') {
+                // Finish the preceding record before starting this one.
+                if keep_current {
+                    let id = current_id
+                        .take()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Internal error: retained FASTA record \
+                                 missing contig ID"
+                            )
+                        })?;
+
+                    let desc = current_desc.take();
+
+                    emit_contig(
+                        &mapped_tx,
+                        id,
+                        desc,
+                        std::mem::take(&mut current_seq),
+                    )
+                        .await?;
+
+                    mapped_contigs += 1;
+                } else {
+                    current_id = None;
+                    current_desc = None;
+                    current_seq.clear();
+                }
+
+                total_contigs += 1;
+
+                // Match Biopython SeqRecord.id semantics:
+                //
+                //     >contig_123 description...
+                //
+                // becomes:
+                //
+                //     id   = "contig_123"
+                //     desc = Some("description...")
+                //
+                // Filtering is based only on `id`.
+                let mut header_parts =
+                    header.splitn(2, char::is_whitespace);
+
+                let contig_id =
+                    header_parts
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+
+                let description =
+                    header_parts
+                        .next()
+                        .map(str::trim_start)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+
+                keep_current =
+                    contigs_with_reads_for_task
+                        .contains(&contig_id);
+
+                if keep_current {
+                    current_id = Some(contig_id);
+                    current_desc = description;
+                } else {
+                    current_id = None;
+                    current_desc = None;
+                }
+
+                continue;
             }
 
-            continue;
+
+            // --------------------------------------------------------
+            // Sequence line belonging to the current record.
+            //
+            // Only retain sequence bytes for contigs that are actually
+            // required downstream.
+            // --------------------------------------------------------
+
+            if keep_current {
+                current_seq.extend_from_slice(
+                    line.as_bytes()
+                );
+            }
         }
 
-        // Sequence belonging to the current FASTA record.
+
+        // ------------------------------------------------------------
+        // Flush the final FASTA record.
+        // ------------------------------------------------------------
+
         if keep_current {
-            writer
-                .write_all(line.as_bytes())
-                .await
-                .map_err(|e| {
-                    PipelineError::IOError(
-                        e.to_string()
+            let id = current_id
+                .take()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Internal error: retained final FASTA record \
+                         missing contig ID"
                     )
                 })?;
 
-            writer
-                .write_all(b"\n")
-                .await
-                .map_err(|e| {
-                    PipelineError::IOError(
-                        e.to_string()
-                    )
-                })?;
+            emit_contig(
+                &mapped_tx,
+                id,
+                current_desc.take(),
+                std::mem::take(&mut current_seq),
+            )
+                .await?;
+
+            mapped_contigs += 1;
         }
-    }
 
-    writer
-        .flush()
+
+        // Dropping mapped_tx gives the fanout clean EOF.
+
+        info!(
+            "RemoveUnmappedContigs: retained {} of {} assembled contigs \
+             ({} referenced contig IDs)",
+            mapped_contigs,
+            total_contigs,
+            contigs_with_reads_for_task.len(),
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(filter_task);
+
+
+    // ================================================================
+    // Fan out the structured mapped-contig FASTA stream.
+    //
+    // Branch 1:
+    //     downstream computational stream
+    //
+    // Branch 2:
+    //     durable mapped_contigs.fasta artifact
+    //
+    // Empty input is valid. fanout_to_channels propagates clean EOF to
+    // both branches when Flye produced no mapped contigs.
+    // ================================================================
+
+    let (
+        mapped_contig_streams,
+        mapped_contig_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(mapped_rx),
+        2,
+        "mapped_contigs_fasta",
+        &config,
+        StreamDataType::JustBytes,
+    )
         .await
-        .map_err(|e| {
-            PipelineError::IOError(e.to_string())
-        })?;
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    info!(
-        "RemoveUnmappedContigs: retained {} of {} assembled contigs \
-         ({} referenced contig IDs) -> {}",
-        mapped_contigs,
-        total_contigs,
-        contigs_with_reads.len(),
-        mapped_contigs_fasta.display()
-    );
+    cleanup_receivers.push(mapped_contig_done_rx);
 
-    Ok(())
+    let mut mapped_contig_streams =
+        mapped_contig_streams.into_iter();
+
+
+    // ------------------------------------------------
+    // Branch 1: computational stream.
+    // ------------------------------------------------
+
+    let mapped_contigs_out_stream =
+        ReceiverStream::new(
+            mapped_contig_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // ------------------------------------------------
+    // Branch 2: durable mapped_contigs.fasta.
+    //
+    // Do not await this write. The computational branch is independent
+    // of completion of the artifact.
+    // ------------------------------------------------
+
+    let mapped_contigs_file_stream =
+        ReceiverStream::new(
+            mapped_contig_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let mapped_contigs_write_task =
+        write_byte_stream_to_file(
+            mapped_contigs_fasta,
+            mapped_contigs_file_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "mapped_contigs_fasta",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(mapped_contigs_write_task);
+
+
+    // ================================================================
+    // Return immediately.
+    //
+    // Filtering, fanout, and mapped_contigs.fasta serialization continue
+    // asynchronously. Downstream computation consumes the returned
+    // structured FASTA stream directly.
+    // ================================================================
+
+    Ok((
+        mapped_contigs_out_stream,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 
@@ -2525,12 +2710,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let mapped_contigs_fasta_path =
         out_dir.join("mapped_contigs.fasta");
 
-    remove_unmapped_contigs(
+    let (
+        mapped_contigs_fasta_stream,
+        remove_unmapped_cleanup_tasks,
+        remove_unmapped_cleanup_receivers,
+    ) = remove_unmapped_contigs(
+        config.clone(),
         &flye_assembly_path,
         &reads_to_contigs_metadata.mapped_contig_ids,
         &mapped_contigs_fasta_path,
     )
         .await?;
+
+    cleanup_tasks.extend(remove_unmapped_cleanup_tasks);
+    cleanup_receivers.extend(remove_unmapped_cleanup_receivers);
 
 
     // *******************
@@ -2693,19 +2886,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     read2contig.len(),
 );
 
+
+    let (combined_fasta_rx, combined_task) = y_junction(
+        vec![
+            mapped_contigs_fasta_stream.into_inner(),
+            non_contig_fasta_stream.into_inner(),
+        ],
+        config.base_buffer_size,
+    ).await?;
+
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
 
-    let mut final_temp_drain_stream = non_contig_fasta_stream;
-
-    let final_temp_drain_task = tokio::spawn(async move {
-        while final_temp_drain_stream.next().await.is_some() {}
-        Ok::<(), anyhow::Error>(())
-    });
-
-    cleanup_tasks.push(final_temp_drain_task);
+    // let mut final_temp_drain_stream = combined_fasta_rx;
+    //
+    // let final_temp_drain_task = tokio::spawn(async move {
+    //     while final_temp_drain_stream.next().await.is_some() {}
+    //     Ok::<(), anyhow::Error>(())
+    // });
+    //
+    // cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************
