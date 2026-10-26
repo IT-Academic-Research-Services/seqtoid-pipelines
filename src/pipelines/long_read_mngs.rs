@@ -11,15 +11,23 @@ use futures::future::try_join_all;
 use log::{debug, info, warn};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
-                          MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
-                          BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
-                          SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand};
+use crate::config::defs::{
+    PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
+    ExecutionMode,
+    MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
+    BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
+    SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand
+};
 use crate::cli::args::{Technology, LibraryType};
+use crate::utils::align::{
+    sharded_minimap2_align,
+    Minimap2Preset,
+    ShardedMinimap2Config,
+};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::minimap2::{Minimap2Config};
@@ -2219,6 +2227,27 @@ async fn remove_unmapped_contigs(
     ))
 }
 
+async fn nt_non_host_align(
+    config: Arc<RunConfig>,
+    query_path: PathBuf,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let alignment = ShardedMinimap2Config {
+        index_dir: PathBuf::from(&config.args.nt_split_dir),
+        preset: Minimap2Preset::MapOnt,
+        query1: query_path,
+        query2: None,
+    };
+
+    sharded_minimap2_align(config, alignment).await
+}
+
 
 async fn prepare_nt_alignment_inputs(
     config: Arc<RunConfig>,
@@ -2226,15 +2255,37 @@ async fn prepare_nt_alignment_inputs(
     out_dir: &PathBuf,
 ) -> Result<
     (
-        ReceiverStream<ParseOutput>,
+        PathBuf,
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+        TempDir,
     ),
     PipelineError,
 > {
     let mut cleanup_tasks = Vec::new();
     let mut cleanup_receivers = Vec::new();
 
+    // ================================================================
+    // Choose scratch for the replayable NT query FASTA.
+    //
+    // Every sharded minimap2 process must be able to read the complete
+    // deduplicated query set independently, so this is a genuine
+    // materialization/synchronization boundary.
+    // ================================================================
+
+    let nt_temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    )
+        .await?;
+
+    let nt_alignment_input_path =
+        nt_temp_dir.path().join("sample.all_sequences_to_align.fasta");
+
+    // Durable WDL-equivalent artifact.
     let all_sequences_to_align_path =
         out_dir.join("sample.all_sequences_to_align.fasta");
 
@@ -2255,9 +2306,8 @@ async fn prepare_nt_alignment_inputs(
     // y_junction().
     //
     // combined_fasta_rx contains structured ParseOutput::Fasta records.
-    // stream_to_cmd() serializes those records directly to FASTA bytes
-    // while writing seqkit stdin, so there is no intermediate conversion
-    // task and no materialized *_full.fasta file.
+    // stream_to_cmd() serializes those records directly to FASTA bytes,
+    // eliminating the legacy *_full.fasta intermediate.
     // ================================================================
 
     let seqkit_config =
@@ -2282,12 +2332,6 @@ async fn prepare_nt_alignment_inputs(
         "PrepareNTAlignmentInputs seqkit args: {:?}",
         seqkit_args
     );
-
-
-    // ================================================================
-    // Structured FASTA -> seqkit stdin.
-    //
-    // ================================================================
 
     let (
         seqkit_child,
@@ -2315,13 +2359,7 @@ async fn prepare_nt_alignment_inputs(
 
 
     // ================================================================
-    // SeqKit stdout.
-    //
-    // Keep this as opaque serialized FASTA bytes.
-    //
-    // RunNTAlignment will feed the resulting stream directly into
-    // minimap2, so parsing FASTA records here only to serialize them
-    // again for minimap2 would be unnecessary work.
+    // SeqKit stdout is serialized deduplicated FASTA.
     // ================================================================
 
     let seqkit_output_rx = {
@@ -2344,16 +2382,16 @@ async fn prepare_nt_alignment_inputs(
 
 
     // ================================================================
-    // Fan out deduplicated FASTA bytes.
+    // Fan out SeqKit output.
     //
     // Branch 1:
-    //     computational byte stream -> RunNTAlignment
+    //     scratch computational checkpoint
     //
     // Branch 2:
-    //     durable sample.all_sequences_to_align.fasta
+    //     durable WDL-equivalent artifact
     //
-    // The durable artifact remains a side branch and is never read back
-    // into the computational pipeline.
+    // Both writes proceed concurrently. Only the scratch branch is a
+    // synchronization dependency for RunNTAlignment.
     // ================================================================
 
     let (
@@ -2371,25 +2409,14 @@ async fn prepare_nt_alignment_inputs(
 
     cleanup_receivers.push(seqkit_done_rx);
 
-    let mut seqkit_streams =
-        seqkit_streams.into_iter();
+    let mut seqkit_streams = seqkit_streams.into_iter();
 
-
-    // ------------------------------------------------
-    // Branch 1: byte stream for RunNTAlignment.
-    // ------------------------------------------------
-
-    let nt_alignment_input_stream =
+    let nt_alignment_file_stream =
         ReceiverStream::new(
             seqkit_streams
                 .next()
                 .ok_or(PipelineError::EmptyStream)?,
         );
-
-
-    // ------------------------------------------------
-    // Branch 2: durable WDL-equivalent artifact.
-    // ------------------------------------------------
 
     let all_sequences_file_stream =
         ReceiverStream::new(
@@ -2397,6 +2424,36 @@ async fn prepare_nt_alignment_inputs(
                 .next()
                 .ok_or(PipelineError::EmptyStream)?,
         );
+
+
+    // ================================================================
+    // Computational scratch copy.
+    //
+    // This MUST complete before returning because every minimap2 shard
+    // independently reopens the complete query FASTA.
+    // ================================================================
+
+    let nt_alignment_write_task =
+        write_byte_stream_to_file(
+            &nt_alignment_input_path,
+            nt_alignment_file_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "nt_alignment_input_scratch",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+
+    // ================================================================
+    // Durable artifact.
+    //
+    // This is not a computational dependency and therefore remains
+    // asynchronous.
+    // ================================================================
 
     let all_sequences_write_task =
         write_byte_stream_to_file(
@@ -2416,20 +2473,32 @@ async fn prepare_nt_alignment_inputs(
 
 
     // ================================================================
-    // Return.
+    // Synchronization point.
     //
-    // nt_alignment_input_stream contains:
-    //
-    //     ParseOutput::Bytes
-    //
-    // whose semantic format is FASTA. It is ready to feed directly into
-    // minimap2 stdin in RunNTAlignment.
+    // Wait only for the scratch copy required by sharded minimap2.
     // ================================================================
 
+    nt_alignment_write_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "NT alignment input writer task panicked: {}",
+                e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "PrepareNTAlignmentInputs complete; NT query FASTA ready at {}",
+        nt_alignment_input_path.display()
+    );
+
+
     Ok((
-        nt_alignment_input_stream,
+        nt_alignment_input_path,
         cleanup_tasks,
         cleanup_receivers,
+        nt_temp_dir,
     ))
 }
 
@@ -2940,6 +3009,36 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(remove_unmapped_cleanup_receivers);
 
 
+
+
+    // Fanout mapped_contigs_fasta_stream
+    // brtanch 1: NT: joined with and fed as stream to mm2
+    // branch 2: NR: write to temp
+
+
+    let (mapped_contigs_fasta_streams, mapped_contigs_fasta_router_done_rx) = fanout_to_channels(
+        mapped_contigs_fasta_stream,
+        2,
+        "mapped_contigs_fasta",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(mapped_contigs_fasta_router_done_rx);
+
+    let mut mapped_contigs_fasta__streams_iter = mapped_contigs_fasta_streams.into_iter();
+
+    let nt_mapped_contigs_fasta_out_stream =
+        ReceiverStream::new(mapped_contigs_fasta__streams_iter .next().ok_or(PipelineError::EmptyStream)?);
+
+    let nr_mapped_contigs_fasta_file_stream =
+        ReceiverStream::new(mapped_contigs_fasta__streams_iter .next().ok_or(PipelineError::EmptyStream)?);
+
+
+
+
     // *******************
     // Generate Contig Stats
     // *******************
@@ -3103,16 +3202,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (combined_fasta_rx, combined_task) = y_junction(
         vec![
-            mapped_contigs_fasta_stream.into_inner(),
+            nt_mapped_contigs_fasta_out_stream.into_inner(),
             non_contig_fasta_stream.into_inner(),
         ],
         config.base_buffer_size,
     ).await?;
 
     let (
-        nt_alignment_input_stream,
+        nt_alignment_input_path,
         prepare_nt_cleanup_tasks,
         prepare_nt_cleanup_receivers,
+        nt_alignment_temp_dir,
     ) = prepare_nt_alignment_inputs(
         config.clone(),
         combined_fasta_rx,
@@ -3120,22 +3220,153 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await?;
 
+    cleanup_tasks.push(combined_task);
     cleanup_tasks.extend(prepare_nt_cleanup_tasks);
     cleanup_receivers.extend(prepare_nt_cleanup_receivers);
+
+    final_temp_dirs.push(nt_alignment_temp_dir);
+
+
+    // ---------------------------------------------------------------------
+    // NT non-host alignment future
+    // ---------------------------------------------------------------------
+
+    let nt_non_host_align_fut = async {
+        info!("[run] NT non-host alignment phase started");
+
+        let (
+            nt_paf_stream,
+            nt_cleanup_tasks,
+            nt_cleanup_receivers,
+        ) = nt_non_host_align(
+            config.clone(),
+            nt_alignment_input_path,
+        )
+            .await?;
+
+        Ok::<_, PipelineError>((
+            nt_paf_stream,
+            nt_cleanup_tasks,
+            nt_cleanup_receivers,
+        ))
+    };
+
+
+    let nr_non_host_align_fut = async {
+        info!("[run] NR non-host alignment phase started");
+
+
+        let nr_temp_dir = choose_temp_dir(
+            config.input_size,
+            &config.ram_temp_dir,
+            &config.args.nvme_scratch,
+            4,
+            false,
+        )
+            .await?;
+
+        let nr_input_path =
+            nr_temp_dir.path().join("mapped_contigs.fasta");
+
+        let write_task = write_byte_stream_to_file(
+            &nr_input_path,
+            nr_mapped_contigs_fasta_file_stream,
+            config.clone(),
+            StreamDataType::OntFastq,
+            "nr_mapped_contigs_temp",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+        // This file is an actual synchronization requirement for NR.
+        write_task.await??;
+
+        Ok::<_, PipelineError>((
+            nr_input_path,
+            Vec::<JoinHandle<anyhow::Result<(), anyhow::Error>>>::new(),
+            Vec::<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>::new(),
+            vec![nr_temp_dir],
+        ))
+
+    };
+
+
+    // ---------------------------------------------------------------------
+    //
+    // SINGLE:
+    //     Await NT completely before starting NR.
+    //
+    // DISTRIBUTED:
+    //     Drive both futures concurrently.
+    //
+    // ---------------------------------------------------------------------
+
+    let (
+        (
+            nt_paf_stream,
+            mut nt_non_host_cleanup_tasks,
+            mut nt_non_host_cleanup_receivers,
+        ),
+        (
+            nr_m8_stream,
+            mut nr_non_host_cleanup_tasks,
+            mut nr_non_host_cleanup_receivers,
+            nr_non_host_align_temp_dirs,
+        ),
+    ) = match config.execution_mode {
+        ExecutionMode::Single => {
+            info!(
+            "[run] Long-read non-host alignment mode=single: \
+             running NT then NR serially"
+        );
+
+            let nt_result = nt_non_host_align_fut.await?;
+
+            let nr_result = nr_non_host_align_fut.await?;
+
+            (nt_result, nr_result)
+        }
+
+        ExecutionMode::Distributed => {
+            info!(
+            "[run] Long-read non-host alignment mode=distributed: \
+             running local NT and distributed NR concurrently"
+        );
+
+            tokio::try_join!(
+            nt_non_host_align_fut,
+            nr_non_host_align_fut,
+        )?
+        }
+    };
+
+
+    // ---------------------------------------------------------------------
+    // Transfer branch-owned resources to run-level cleanup.
+    // ---------------------------------------------------------------------
+
+    cleanup_tasks.append(&mut nt_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nt_non_host_cleanup_receivers);
+
+    cleanup_tasks.append(&mut nr_non_host_cleanup_tasks);
+    cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
+
+    final_temp_dirs.extend(nr_non_host_align_temp_dirs);
 
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
 
-    let mut final_temp_drain_stream = nt_alignment_input_stream;
-
-    let final_temp_drain_task = tokio::spawn(async move {
-        while final_temp_drain_stream.next().await.is_some() {}
-        Ok::<(), anyhow::Error>(())
-    });
-
-    cleanup_tasks.push(final_temp_drain_task);
+    // let mut final_temp_drain_stream = nt_alignment_input_stream;
+    //
+    // let final_temp_drain_task = tokio::spawn(async move {
+    //     while final_temp_drain_stream.next().await.is_some() {}
+    //     Ok::<(), anyhow::Error>(())
+    // });
+    //
+    // cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************
