@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::config::defs::{PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
                           MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
                           BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
-                          SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG};
+                          SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand};
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::fastp::FastpConfig;
@@ -26,6 +26,7 @@ use crate::utils::command::minimap2::{Minimap2Config};
 use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::command::flye::FlyeConfig;
+use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
                          choose_temp_dir};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
@@ -2219,6 +2220,219 @@ async fn remove_unmapped_contigs(
 }
 
 
+async fn prepare_nt_alignment_inputs(
+    config: Arc<RunConfig>,
+    combined_fasta_rx: mpsc::Receiver<ParseOutput>,
+    out_dir: &PathBuf,
+) -> Result<
+    (
+        ReceiverStream<ParseOutput>,
+        Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+        Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let mut cleanup_receivers = Vec::new();
+
+    let all_sequences_to_align_path =
+        out_dir.join("sample.all_sequences_to_align.fasta");
+
+
+    // ================================================================
+    // seqkit rmdup -s
+    //
+    // Legacy:
+    //
+    //     cat mapped_contigs.fasta non_contigs.fasta \
+    //         > sample.all_sequences_to_align_full.fasta
+    //
+    //     seqkit rmdup -s \
+    //         < sample.all_sequences_to_align_full.fasta \
+    //         > sample.all_sequences_to_align.fasta
+    //
+    // The ordered concatenation has already been performed upstream by
+    // y_junction().
+    //
+    // combined_fasta_rx contains structured ParseOutput::Fasta records.
+    // stream_to_cmd() serializes those records directly to FASTA bytes
+    // while writing seqkit stdin, so there is no intermediate conversion
+    // task and no materialized *_full.fasta file.
+    // ================================================================
+
+    let seqkit_config =
+        SeqkitConfig::new(SeqkitSubcommand::Rmdup)
+            .flag("-s")
+            .positional("-");
+
+    let seqkit_args =
+        generate_cli(
+            SEQKIT_TAG,
+            &config,
+            Some(&seqkit_config),
+        )
+            .map_err(|e| {
+                PipelineError::ToolExecution {
+                    tool: SEQKIT_TAG.to_string(),
+                    error: e.to_string(),
+                }
+            })?;
+
+    info!(
+        "PrepareNTAlignmentInputs seqkit args: {:?}",
+        seqkit_args
+    );
+
+
+    // ================================================================
+    // Structured FASTA -> seqkit stdin.
+    //
+    // ================================================================
+
+    let (
+        seqkit_child,
+        seqkit_stream_task,
+        seqkit_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        combined_fasta_rx,
+        SEQKIT_TAG,
+        seqkit_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::ToolExecution {
+                tool: SEQKIT_TAG.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+
+    cleanup_tasks.push(seqkit_stream_task);
+    cleanup_tasks.push(seqkit_err_task);
+
+
+    // ================================================================
+    // SeqKit stdout.
+    //
+    // Keep this as opaque serialized FASTA bytes.
+    //
+    // RunNTAlignment will feed the resulting stream directly into
+    // minimap2, so parsing FASTA records here only to serialize them
+    // again for minimap2 would be unnecessary work.
+    // ================================================================
+
+    let seqkit_output_rx = {
+        let mut guard = seqkit_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::ToolExecution {
+                    tool: SEQKIT_TAG.to_string(),
+                    error: e.to_string(),
+                }
+            })?
+    };
+
+
+    // ================================================================
+    // Fan out deduplicated FASTA bytes.
+    //
+    // Branch 1:
+    //     computational byte stream -> RunNTAlignment
+    //
+    // Branch 2:
+    //     durable sample.all_sequences_to_align.fasta
+    //
+    // The durable artifact remains a side branch and is never read back
+    // into the computational pipeline.
+    // ================================================================
+
+    let (
+        seqkit_streams,
+        seqkit_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(seqkit_output_rx),
+        2,
+        "nt_alignment_input",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(seqkit_done_rx);
+
+    let mut seqkit_streams =
+        seqkit_streams.into_iter();
+
+
+    // ------------------------------------------------
+    // Branch 1: byte stream for RunNTAlignment.
+    // ------------------------------------------------
+
+    let nt_alignment_input_stream =
+        ReceiverStream::new(
+            seqkit_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // ------------------------------------------------
+    // Branch 2: durable WDL-equivalent artifact.
+    // ------------------------------------------------
+
+    let all_sequences_file_stream =
+        ReceiverStream::new(
+            seqkit_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let all_sequences_write_task =
+        write_byte_stream_to_file(
+            &all_sequences_to_align_path,
+            all_sequences_file_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "all_sequences_to_align_fasta",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(all_sequences_write_task);
+
+
+    // ================================================================
+    // Return.
+    //
+    // nt_alignment_input_stream contains:
+    //
+    //     ParseOutput::Bytes
+    //
+    // whose semantic format is FASTA. It is ready to feed directly into
+    // minimap2 stdin in RunNTAlignment.
+    // ================================================================
+
+    Ok((
+        nt_alignment_input_stream,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
+}
+
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
@@ -2255,7 +2469,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // External tools check
 
     let mut versions_vec = vec![
-        FASTP_TAG, MINIMAP2_TAG, FLYE_TAG, SAMTOOLS_TAG, PIGZ_TAG
+        FASTP_TAG, MINIMAP2_TAG, FLYE_TAG, SAMTOOLS_TAG, PIGZ_TAG, SEQKIT_TAG,
     ];
 
     if !config.args.no_version_check {
@@ -2895,19 +3109,33 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.base_buffer_size,
     ).await?;
 
+    let (
+        nt_alignment_input_stream,
+        prepare_nt_cleanup_tasks,
+        prepare_nt_cleanup_receivers,
+    ) = prepare_nt_alignment_inputs(
+        config.clone(),
+        combined_fasta_rx,
+        &out_dir,
+    )
+        .await?;
+
+    cleanup_tasks.extend(prepare_nt_cleanup_tasks);
+    cleanup_receivers.extend(prepare_nt_cleanup_receivers);
+
     // *******************
     // Temporary final stream drain for construction
     // *******************
 
 
-    // let mut final_temp_drain_stream = combined_fasta_rx;
-    //
-    // let final_temp_drain_task = tokio::spawn(async move {
-    //     while final_temp_drain_stream.next().await.is_some() {}
-    //     Ok::<(), anyhow::Error>(())
-    // });
-    //
-    // cleanup_tasks.push(final_temp_drain_task);
+    let mut final_temp_drain_stream = nt_alignment_input_stream;
+
+    let final_temp_drain_task = tokio::spawn(async move {
+        while final_temp_drain_stream.next().await.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************
