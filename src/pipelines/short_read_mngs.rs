@@ -54,6 +54,11 @@ use crate::config::defs::{
     FASTP_TAG, HISAT2_TAG, KALLISTO_TAG, MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, NR_TAG, NT_TAG,
     READ_COUNTING_MODE, SAMTOOLS_TAG, SORT_TAG, SPADES_TAG, ReducedRead, ExecutionMode
 };
+use crate::utils::align::{
+    sharded_minimap2_align,
+    Minimap2Preset,
+    ShardedMinimap2Config,
+};
 use crate::utils::blast::{
     build_taxon_counts_list, call_hits_m8, compute_merged_taxon_counts,
     generate_taxon_count_json_from_m8, generate_taxon_counts, merge_aggregations,
@@ -2787,6 +2792,9 @@ async fn dedup_worker(
 /// - stream of alignment results (PAF format)
 /// - vector of cleanup tasks
 /// - vector of cleanup receivers
+/// Short-read NT non-host alignment.
+///
+/// Short-read-specific wrapper around the shared sharded minimap2 aligner.
 async fn nt_non_host_align(
     config: Arc<RunConfig>,
     r1_path: PathBuf,
@@ -2799,258 +2807,14 @@ async fn nt_non_host_align(
     ),
     PipelineError,
 > {
-    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
-
-    let base_buffer_size = config.base_buffer_size;
-    let channel_buffer = (base_buffer_size * 8).max(1024);
-
-    // 1) Discover NT split .mmi chunks and sort largest-first.
-    let nt_split_dir = PathBuf::from(config.args.nt_split_dir.clone());
-    let mut chunk_paths: Vec<PathBuf> = Vec::new();
-    let mut max_size_bytes: u64 = 0;
-
-    let mut entries = fs::read_dir(&nt_split_dir)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Cannot read NT split dir: {}", e)))?;
-
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let path = entry.path();
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "mmi") {
-            if let Ok(meta) = path.metadata() {
-                let size: u64 = meta.len();
-                if size > max_size_bytes {
-                    max_size_bytes = size;
-                }
-            }
-            chunk_paths.push(path);
-        }
-    }
-
-    if chunk_paths.is_empty() {
-        return Err(PipelineError::Other(anyhow!(
-            "No .mmi chunk files found in {}",
-            nt_split_dir.display()
-        )));
-    }
-
-    chunk_paths.sort_by_key(|p| std::cmp::Reverse(p.metadata().map(|m| m.len()).unwrap_or(0)));
-
-    let num_chunks = chunk_paths.len();
-    info!(
-        "Found {} minimap2 NT index chunks (sorted largest first)",
-        num_chunks
-    );
-
-    const TARGET_RAM_FRACTION: f64 = 0.55; // was 0.35
-    const HARD_MAX_CONCURRENCY: usize = 14; // was 8
-    const MIN_CONCURRENCY: usize = 4;
-    const MIN_THREADS_PER_JOB: usize = 6; // was 8
-    const MAX_THREADS_PER_JOB: usize = 12; // was 16
-
-    let largest_gb = if max_size_bytes > 0 {
-        ((max_size_bytes + (1 << 30) - 1) / (1 << 30)) as f64
-    } else {
-        70.0
+    let alignment = ShardedMinimap2Config {
+        index_dir: PathBuf::from(&config.args.nt_split_dir),
+        preset: Minimap2Preset::ShortRead,
+        query1: r1_path,
+        query2: r2_path_opt,
     };
 
-    // Tighter, more realistic per-job RAM estimate
-    let est_gb_per_job = (largest_gb * 0.85).max(35.0).min(65.0);
-
-    info!(
-    "Largest NT chunk: {:.1} GiB -> estimating {:.0} GiB RAM per minimap2 job",
-    largest_gb, est_gb_per_job
-);
-
-    let available_ram_gb = config.available_ram as f64 / 1_000_000_000.0;
-
-    // Use a lower concurrency floor on small-memory machines,
-    // while preserving the existing minimum on larger machines.
-    let effective_min_concurrency = if available_ram_gb < 64.0 {
-        1
-    } else {
-        MIN_CONCURRENCY
-    };
-
-    let ram_based =
-        (available_ram_gb * TARGET_RAM_FRACTION / est_gb_per_job).floor() as usize;
-
-    let mut concurrency =
-        ram_based.clamp(effective_min_concurrency, HARD_MAX_CONCURRENCY);
-
-    // Extra safety valve
-    let estimated_peak = concurrency as f64 * est_gb_per_job;
-    if estimated_peak > available_ram_gb * 0.82 {
-        let new_conc = concurrency
-            .saturating_sub(1)
-            .max(effective_min_concurrency);
-
-        warn!(
-        "Estimated peak {:.0} GiB exceeds 82% of available ({:.0} GiB) -> reducing concurrency from {} to {}",
-        estimated_peak,
-        available_ram_gb,
-        concurrency,
-        new_conc
-    );
-
-        concurrency = new_conc;
-    }
-
-    let threads_per_job = if available_ram_gb < 64.0 {
-        config.max_cores.min(6).max(1)
-    } else {
-        (config.max_cores / concurrency.max(1))
-            .clamp(MIN_THREADS_PER_JOB, MAX_THREADS_PER_JOB)
-    };
-
-    info!(
-    concat!(
-        "NT minimap2 stage : {} concurrent jobs × {} threads/job\n",
-        "  est peak RAM: ~{:.0} GiB ({:.0}% of available)\n",
-        "  single-job baseline: ~81 s real time (measured)\n",
-        "  largest chunk: {:.1} GiB -> est/job: {:.0} GiB"
-    ),
-    concurrency,
-    threads_per_job,
-    estimated_peak,
-    (estimated_peak / available_ram_gb * 100.0).round(),
-    largest_gb,
-    est_gb_per_job
-);
-    // =========================================================
-
-    // Global merged output stream.
-    let (merged_tx, merged_rx) = mpsc::channel::<ParseOutput>(channel_buffer * 4);
-
-    // Each worker gets its own job queue and its own output queue.
-    let mut worker_job_txs: Vec<mpsc::Sender<(PathBuf, String)>> = Vec::with_capacity(concurrency);
-    let mut worker_output_streams: Vec<ReceiverStream<ParseOutput>> =
-        Vec::with_capacity(concurrency);
-    let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> =
-        Vec::with_capacity(concurrency);
-
-    for _worker_idx in 0..concurrency {
-        let (job_tx, mut job_rx) = mpsc::channel::<(PathBuf, String)>(num_chunks.max(1));
-        let (out_tx, out_rx) = mpsc::channel::<ParseOutput>(channel_buffer);
-
-        worker_job_txs.push(job_tx);
-        worker_output_streams.push(ReceiverStream::new(out_rx));
-
-        let config = config.clone();
-        let r1 = r1_path.clone();
-        let r2 = r2_path_opt.clone();
-
-        let handle = tokio::spawn(async move {
-            while let Some((chunk_mmi, chunk_name)) = job_rx.recv().await {
-
-                let mm_config = Minimap2Config::new()
-                    .option("-t", threads_per_job.to_string())
-                    .flag("-c")
-                    .option("-x", "sr")
-                    .option("--secondary", "yes")
-                    .positional(chunk_mmi.to_string_lossy().to_string())
-                    .positional(r1.to_string_lossy().to_string());
-
-                let mm_config = if let Some(r2_path) = &r2 {
-                    mm_config.positional(r2_path.to_string_lossy().to_string())
-                } else {
-                    mm_config
-                };
-
-                let args =
-                    generate_cli(MINIMAP2_TAG, &config, Some(&mm_config))
-                        .context("Failed to generate minimap2 args")?;
-
-                debug!("Launching minimap2 {} → stdout (streaming PAF)", chunk_name);
-
-                let (mut child, stderr_task) = spawn_cmd(
-                    config.clone(),
-                    MINIMAP2_TAG,
-                    args,
-                    config.args.verbose,
-                    None,
-                )
-                    .await
-                    .context("Failed to spawn minimap2")?;
-
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = tokio::io::BufReader::new(stdout);
-                    let mut line = String::new();
-
-                    while reader.read_line(&mut line).await? > 0 {
-                        let trimmed = line.trim_end();
-                        if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                            let mut bytes = trimmed.as_bytes().to_vec();
-                            bytes.push(b'\n');
-
-                            if out_tx
-                                .send(ParseOutput::Bytes(Bytes::from(bytes)))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        line.clear();
-                    }
-                }
-
-                let status = child.wait().await.context("minimap2 wait failed")?;
-                if !status.success() {
-                    warn!("minimap2 for {} exited with status: {}", chunk_name, status);
-                } else {
-                    info!("minimap2 for {} completed successfully", chunk_name);
-                }
-
-                let _ = stderr_task.await;
-            }
-
-            Ok::<(), anyhow::Error>(())
-        });
-
-        worker_handles.push(handle);
-    }
-
-    // Merge all worker output streams fairly.
-    let merger_handle = tokio::spawn({
-        let merged_tx = merged_tx;
-        let mut merged_stream = futures::stream::select_all(worker_output_streams);
-        async move {
-            while let Some(item) = merged_stream.next().await {
-                let _ = merged_tx.send(item).await;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-    });
-    cleanup_tasks.push(merger_handle);
-
-    // Assign chunks round-robin to workers.
-    for (idx, chunk_mmi) in chunk_paths.into_iter().enumerate() {
-        let chunk_name = chunk_mmi
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("chunk_{}", idx));
-
-        let worker_idx = idx % worker_job_txs.len();
-        let _ = worker_job_txs[worker_idx]
-            .send((chunk_mmi, chunk_name))
-            .await;
-    }
-
-    drop(worker_job_txs);
-
-    cleanup_tasks.extend(worker_handles);
-
-    info!(
-        "[nt_non_host_align] Launched {} minimap2 workers — PAF stream now feeding paf_to_m8",
-        concurrency
-    );
-
-    Ok((
-        ReceiverStream::new(merged_rx),
-        cleanup_tasks,
-        cleanup_receivers,
-    ))
+    sharded_minimap2_align(config, alignment).await
 }
 
 /// Converts a PAF stream to an BLAST m8 format stream and writes it to a file.
