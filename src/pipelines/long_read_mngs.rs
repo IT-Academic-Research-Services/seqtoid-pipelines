@@ -6016,15 +6016,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (
         merged_taxon_counts,
+        merged_contig_summary,
         merged_taxon_cleanup_tasks,
     ) = compute_merged_taxon_counts(
         config.clone(),
 
         nt_pairs_for_merged_taxon_counts,
-        nt_contig_summary,
+        nt_contig_summary.clone(),
 
         nr_pairs_for_merged_taxon_counts,
-        nr_contig_summary,
+        nr_contig_summary.clone(),
 
         lineage_map.clone(),
         should_keep_filter.clone(),
@@ -6085,6 +6086,91 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!(
     "[run] CombineTaxonCounts completed; taxon_counts.json write started"
+);
+
+
+    let assembly_out_dir =
+        out_dir.join("assembly");
+
+    tokio::fs::create_dir_all(&assembly_out_dir)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to create assembly output directory {}: {}",
+                assembly_out_dir.display(),
+                e
+            ))
+        })?;
+
+    // *******************
+    // CombineJson
+    // *******************
+    //
+    // Legacy WDL inputs:
+    //
+    //     SummarizeContigsNT.nt_contig_summary_json
+    //     SummarizeContigsNR.nr_contig_summary_json
+    //     ComputeMergedTaxonCounts.merged_contig_summary_json
+    //
+    // All three JSON files contain Vec<ContigSummaryEntry>. Rust already retains
+    // those typed values, so concatenate them directly rather than reopening and
+    // parsing the three durable JSON artifacts.
+    //
+    // Preserve the WDL input order:
+    //
+    //     NT -> NR -> merged
+
+
+    let combined_contig_summary_path =
+        assembly_out_dir.join("combined_contig_summary.json");
+
+    let mut combined_contig_summary =
+        Vec::with_capacity(
+            nt_contig_summary.len()
+                + nr_contig_summary.len()
+                + merged_contig_summary.len(),
+        );
+
+    combined_contig_summary.extend(nt_contig_summary);
+    combined_contig_summary.extend(nr_contig_summary);
+    combined_contig_summary.extend(merged_contig_summary);
+
+    let combined_contig_summary_json =
+        serde_json::to_vec(&combined_contig_summary)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to serialize combined contig summary: {}",
+                e
+            ))
+            })?;
+
+    let combined_contig_summary_write_task = {
+        let path = combined_contig_summary_path.clone();
+
+        tokio::spawn(async move {
+            tokio::fs::write(
+                &path,
+                combined_contig_summary_json,
+            )
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                "Failed to write combined contig summary {}: {}",
+                path.display(),
+                e
+            )
+                })?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    cleanup_tasks.push(combined_contig_summary_write_task);
+
+    info!(
+    "[run] CombineJson completed; {} contig-summary entries -> {}",
+    combined_contig_summary.len(),
+    combined_contig_summary_path.display(),
 );
 
     // *******************
