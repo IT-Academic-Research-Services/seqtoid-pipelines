@@ -5,22 +5,28 @@ use std::sync::Arc;
 use bio::alignment::pairwise::Aligner;
 use bio::alignment::AlignmentOperation;
 use tokio::sync::mpsc::Receiver;
+use std::io::{BufRead, BufReader};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::stream::select_all;
 use log::{debug, info, warn};
+use tempfile::TempDir;
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader, BufWriter};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG};
+
+use crate::config::defs::{RunConfig, PipelineError, MINIMAP2_TAG, DIAMOND_TAG, StreamDataType, ExecutionMode, NRAlignmentBackend};
 use crate::utils::fastx::SequenceRecord;
 use crate::utils::command::{generate_cli};
+use crate::utils::command::diamond::DiamondConfig;
 use crate::utils::command::minimap2::Minimap2Config;
+use crate::utils::command::mmseqs::MmseqsBackend;
+use crate::utils::file::write_byte_stream_to_file;
 use crate::utils::streams::{ParseOutput, spawn_cmd};
 
 
@@ -493,7 +499,7 @@ pub async fn sharded_minimap2_align(
                         )
                     })?;
 
-                let mut reader = BufReader::new(stdout);
+                let mut reader = TokioBufReader::new(stdout);
                 let mut line = String::new();
 
                 loop {
@@ -685,4 +691,153 @@ pub async fn sharded_minimap2_align(
         cleanup_receivers,
     ))
 }
+
+
+
+
+// Helper: runs Diamond on one file, waits for both parse and write to finish, returns only the m8 path
+/// Runs Diamond alignment on a single query file.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+/// * `query_path`: path to the query FASTA/FASTQ file
+/// * `db_prefix`: path to the Diamond database
+/// * `options`: additional command-line options for Diamond
+/// * `temp_dir`: temporary directory for Diamond's work
+/// * `label`: label for logging
+///
+/// # Returns
+///
+/// Result containing the path to the output m8 file
+pub async fn run_diamond_single_file(
+    config: Arc<RunConfig>,
+    diamond_config: DiamondConfig,
+    temp_dir: &TempDir,
+    label: &str,
+) -> Result<PathBuf, PipelineError> {
+    let m8_path = temp_dir
+        .path()
+        .join(format!("diamond_{}.m8", label));
+
+    let diamond_args =
+        generate_cli(
+            DIAMOND_TAG,
+            &config,
+            Some(&diamond_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: DIAMOND_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    info!(
+        "[single-node] spawning diamond: {:?}",
+        diamond_args
+    );
+
+    let (mut diamond_child, _diamond_stderr_task) =
+        spawn_cmd(
+            config.clone(),
+            DIAMOND_TAG,
+            diamond_args,
+            config.args.verbose,
+            None,
+        )
+            .await?;
+
+    let diamond_stdout = diamond_child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("diamond stdout missing"))?;
+
+    let (m8_tx, m8_rx) =
+        mpsc::channel(config.base_buffer_size * 8);
+
+    let parse_task: JoinHandle<Result<(), anyhow::Error>> =
+        tokio::spawn(async move {
+            let mut reader =
+                TokioBufReader::new(diamond_stdout);
+
+            let mut line =
+                Vec::with_capacity(1024);
+
+            loop {
+                line.clear();
+
+                if reader
+                    .read_until(b'\n', &mut line)
+                    .await?
+                    == 0
+                {
+                    break;
+                }
+
+                if !line.is_empty()
+                    && line[0] != b'#'
+                {
+                    let bytes =
+                        Bytes::from(std::mem::take(&mut line));
+
+                    if m8_tx
+                        .send(ParseOutput::Bytes(bytes))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+
+            Ok(())
+        });
+
+    let write_task =
+        write_byte_stream_to_file(
+            &m8_path,
+            ReceiverStream::new(m8_rx),
+            config.clone(),
+            StreamDataType::JustBytes,
+            &format!("diamond_{}", label),
+            false,
+        )
+            .await?;
+
+    // Wait for Diamond process.
+    let status =
+        diamond_child.wait().await?;
+
+    if !status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: DIAMOND_TAG.to_string(),
+            error: format!(
+                "exited with code {:?}",
+                status.code()
+            ),
+        });
+    }
+
+    // Wait for both tasks to complete.
+    parse_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "parse_task panicked: {}",
+                e
+            ))
+        })??;
+
+    write_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "write_task panicked: {}",
+                e
+            ))
+        })??;
+
+    Ok(m8_path)
+}
+
+
 
