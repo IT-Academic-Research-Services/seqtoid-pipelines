@@ -3477,8 +3477,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let nr_non_host_align_fut = async {
         info!("[run] NR non-host alignment phase started");
 
+        // ================================================================
+        // Materialize mapped contigs into computational scratch.
+        //
+        // RunNRAlignment consumes only mapped contigs, unlike NT which
+        // consumes mapped contigs + non-contig reads.
+        //
+        // The completed FASTA is a genuine synchronization boundary because
+        // Diamond consumes it as a file.
+        // ================================================================
 
-        let nr_temp_dir = choose_temp_dir(
+        let nr_input_temp_dir = choose_temp_dir(
             config.input_size,
             &config.ram_temp_dir,
             &config.args.nvme_scratch,
@@ -3488,29 +3497,72 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await?;
 
         let nr_input_path =
-            nr_temp_dir.path().join("mapped_contigs.fasta");
+            nr_input_temp_dir.path().join("mapped_contigs.fasta");
 
         let write_task = write_byte_stream_to_file(
             &nr_input_path,
             nr_mapped_contigs_fasta_file_stream,
             config.clone(),
-            StreamDataType::OntFastq,
+            StreamDataType::JustBytes,
             "nr_mapped_contigs_temp",
             true,
         )
             .await
             .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-        // This file is an actual synchronization requirement for NR.
-        write_task.await??;
+        write_task
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "NR mapped-contig FASTA writer task panicked: {}",
+                e
+            ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        info!(
+        "[run] NR mapped-contig FASTA ready: {}",
+        nr_input_path.display()
+    );
+
+
+        // ================================================================
+        // RunNRAlignment.
+        //
+        // Currently:
+        //
+        //   Single + Diamond  -> implemented
+        //   Single + MMseqs   -> explicit not-implemented error
+        //   Distributed       -> explicit not-implemented error
+        //
+        // The dispatcher owns that policy, keeping run() backend-agnostic.
+        // ================================================================
+
+        let (
+            nr_m8_rx,
+            nr_cleanup_tasks,
+            nr_cleanup_receivers,
+            mut nr_alignment_temp_dirs,
+        ) = nr_non_host_align(
+            config.clone(),
+            nr_input_path,
+            sample_base.clone(),
+        )
+            .await?;
+
+        // Keep the materialized mapped-contig input alive for as long as
+        // downstream NR processing may need resources associated with this
+        // branch.
+        nr_alignment_temp_dirs.push(nr_input_temp_dir);
+
+        info!("[run] NR non-host alignment phase complete");
 
         Ok::<_, PipelineError>((
-            nr_input_path,
-            Vec::<JoinHandle<anyhow::Result<(), anyhow::Error>>>::new(),
-            Vec::<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>::new(),
-            vec![nr_temp_dir],
+            ReceiverStream::new(nr_m8_rx),
+            nr_cleanup_tasks,
+            nr_cleanup_receivers,
+            nr_alignment_temp_dirs,
         ))
-
     };
 
 
