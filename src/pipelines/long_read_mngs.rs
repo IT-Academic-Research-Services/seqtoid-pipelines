@@ -50,6 +50,7 @@ use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseO
                             ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines};
 use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::compute_buffer_size;
+use crate::utils::taxonomy::{get_top_m8_nt, get_top_m8_nr};
 
 
 struct ReadsToContigsOutputs {
@@ -3871,6 +3872,84 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
 
     final_temp_dirs.extend(nr_non_host_align_temp_dirs);
+
+
+    // Call top hits
+    let nt_find_top_hits_fut = async {
+        info!("[run] FindTopHitsNT started");
+
+        let (nt_top_m8_tx, nt_top_m8_rx) =
+            mpsc::channel::<ParseOutput>(
+                config.base_buffer_size * 8
+            );
+
+        let nt_top_hits_task = tokio::spawn(async move {
+            get_top_m8_nt(
+                nt_m8_stream,
+                nt_top_m8_tx,
+                1,
+                0,
+            )
+                .await
+        });
+
+        let nt_top_m8_stream =
+            ReceiverStream::new(nt_top_m8_rx);
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                JoinHandle<anyhow::Result<()>>,
+            ),
+            PipelineError,
+        >((
+            nt_top_m8_stream,
+            nt_top_hits_task,
+        ))
+    };
+
+    let nr_find_top_hits_fut = async {
+        info!("[run] FindTopHitsNR started");
+
+        let (nr_top_m8_tx, nr_top_m8_rx) =
+            mpsc::channel::<ParseOutput>(
+                config.base_buffer_size * 8
+            );
+
+        let nr_top_hits_task = tokio::spawn(async move {
+            get_top_m8_nr(
+                nr_m8_stream,
+                nr_top_m8_tx,
+                1,
+                0,
+            )
+                .await
+        });
+
+        let nr_top_m8_stream =
+            ReceiverStream::new(nr_top_m8_rx);
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                JoinHandle<anyhow::Result<()>>,
+            ),
+            PipelineError,
+        >((
+            nr_top_m8_stream,
+            nr_top_hits_task,
+        ))
+    };
+
+
+    let (
+        (nt_top_m8_stream, nt_top_hits_task),
+        (nr_top_m8_stream, nr_top_hits_task),
+    ) = tokio::try_join!(
+    nt_find_top_hits_fut,
+    nr_find_top_hits_fut,
+)?;
+
 
     // *******************
     // Temporary final stream drain for construction
