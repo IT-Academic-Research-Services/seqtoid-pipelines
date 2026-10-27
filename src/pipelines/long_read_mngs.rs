@@ -36,7 +36,8 @@ use crate::utils::align::{
     run_diamond_single_file
 };
 use crate::utils::blast::{M8Record,  AggBucket, ContigSummaryEntry, SpeciesAlignmentResults,
-                          TaxonCount, build_taxon_counts_list, compute_merged_taxon_counts};
+                          TaxonCount, build_taxon_counts_list, compute_merged_taxon_counts,
+                          combine_taxon_counts};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::diamond::{diamond_index_prep};
 use crate::utils::command::fastp::FastpConfig;
@@ -6041,6 +6042,49 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!(
     "[run] ComputeMergedTaxonCounts completed successfully: {} merged taxa",
     merged_taxon_counts.len()
+);
+
+    // *******************
+    // CombineTaxonCounts
+    // *******************
+    //
+    // Legacy WDL inputs:
+    //
+    //     SummarizeContigsNT.nt_refined_counts_with_dcr_json
+    //     SummarizeContigsNR.nr_refined_counts_with_dcr_json
+    //     ComputeMergedTaxonCounts.merged_taxon_counts_with_dcr_json
+    //
+    // Rust already retains all three as Vec<TaxonCount>, so CombineTaxonCounts
+    // operates directly on the typed computational results rather than reopening
+    // the three JSON artifacts.
+
+    let taxon_counts_path =
+        out_dir.join("taxon_counts.json");
+
+    let (
+        _taxon_counts_path,
+        taxon_counts_write_task,
+    ) = combine_taxon_counts(
+        &nt_refined_counts,
+        &nr_refined_counts,
+        &merged_taxon_counts,
+        taxon_counts_path,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "CombineTaxonCounts failed: {}",
+        e
+    ))
+        })?;
+
+    // taxon_counts.json is a durable artifact. The computational inputs have
+    // already been consumed into the serialized payload, so its filesystem write
+    // does not need to block construction of downstream stages.
+    cleanup_tasks.push(taxon_counts_write_task);
+
+    info!(
+    "[run] CombineTaxonCounts completed; taxon_counts.json write started"
 );
 
     // *******************
