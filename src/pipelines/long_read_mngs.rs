@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
+use ahash::AHashMap;
+use fst::Map;
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::future::try_join_all;
@@ -22,7 +24,7 @@ use crate::config::defs::{
     MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
     BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
     SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand,
-    NRAlignmentBackend, DIAMOND_TAG, DiamondSubcommand
+    NRAlignmentBackend, DIAMOND_TAG, DiamondSubcommand, Lineage, Taxid, ReducedRead
 };
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::align::{
@@ -31,6 +33,7 @@ use crate::utils::align::{
     ShardedMinimap2Config,
     run_diamond_single_file
 };
+use crate::utils::blast::{M8Record};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::diamond::{diamond_index_prep};
 use crate::utils::command::fastp::FastpConfig;
@@ -39,8 +42,7 @@ use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::command::flye::FlyeConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file,
-                         choose_temp_dir};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir, resolve_optional_path};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
                           fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord};
 use crate::utils::paf::paf_to_m8;
@@ -50,7 +52,8 @@ use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseO
                             ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines};
 use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::compute_buffer_size;
-use crate::utils::taxonomy::{get_top_m8_nt, get_top_m8_nr};
+use crate::utils::taxonomy::{get_top_m8_nt, get_top_m8_nr, load_lineage_and_acc2tax_maps,
+                             build_should_keep_filter};
 
 
 struct ReadsToContigsOutputs {
@@ -66,6 +69,7 @@ struct ReadsToContigsOutputs {
 struct ReadsToContigsMetadata {
     mapped_contig_ids: HashSet<String>,
     read_base_counts: HashMap<String, u64>,
+    contig_to_reads: HashMap<String, Vec<String>>,
 }
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
@@ -731,8 +735,15 @@ async fn run_reads_to_contigs(
 
         // Completes when reads_to_contigs.tsv has been written and
         // returns the in-memory metadata needed downstream:
+        //
         //   * mapped contig IDs
         //   * read ID -> read length
+        //   * contig ID -> reads mapped to that contig
+        //
+        // contig_to_reads is collected directly from the same sequential
+        // SAM records used to write reads_to_contigs.tsv. This preserves
+        // the legacy TSV encounter order within each contig and avoids
+        // reopening or reparsing the durable TSV downstream.
         JoinHandle<anyhow::Result<ReadsToContigsMetadata>>,
 
         // Computational read-to-contig statistics branch.
@@ -939,7 +950,7 @@ async fn run_reads_to_contigs(
     // 1. durable sample.reads_to_contigs.sam
     //
     // 2. durable reads_to_contigs.tsv +
-    //    in-memory mapped-contig IDs/read lengths
+    //    in-memory mapped-contig IDs/read lengths/contig-to-reads
     //
     // 3. SAM -> BAM ONCE, then BAM fanout:
     //
@@ -1005,8 +1016,8 @@ async fn run_reads_to_contigs(
     // to AsyncRead with ChannelReader and reconstruct complete SAM lines
     // before parsing fields.
     //
-    // Preserve the TSV as a durable artifact, but retain the useful
-    // information in memory:
+    // Preserve the TSV as a durable artifact, but retain all useful
+    // information computationally:
     //
     //   mapped_contig_ids:
     //       unique non-"*" RNAMEs
@@ -1014,8 +1025,17 @@ async fn run_reads_to_contigs(
     //   read_base_counts:
     //       QNAME -> length(SEQ)
     //
-    // The latter is the in-memory equivalent of the legacy
-    // read2base_count dictionary.
+    //   contig_to_reads:
+    //       RNAME -> [QNAME, ...]
+    //
+    // contig_to_reads is the in-memory equivalent of:
+    //
+    //     contig_to_reads = defaultdict(list)
+    //     for row in reads_to_contigs.tsv:
+    //         contig_to_reads[row[1]].append(row[0])
+    //
+    // Collecting it here preserves the same sequential encounter order
+    // as the TSV and prevents SummarizeHits from reopening that artifact.
     // ================================================================
 
     let tsv_input = filtered_sam_streams
@@ -1030,7 +1050,6 @@ async fn run_reads_to_contigs(
             AsyncWriteExt,
         };
 
-        // Convert the arbitrary SAM byte chunks into a continuous AsyncRead.
         let channel_reader =
             ChannelReader::new(tsv_input);
 
@@ -1050,6 +1069,9 @@ async fn run_reads_to_contigs(
             HashSet::new();
 
         let mut read_base_counts: HashMap<String, u64> =
+            HashMap::new();
+
+        let mut contig_to_reads: HashMap<String, Vec<String>> =
             HashMap::new();
 
         let mut line = Vec::<u8>::new();
@@ -1090,10 +1112,10 @@ async fn run_reads_to_contigs(
             let line_str = std::str::from_utf8(&line)
                 .map_err(|e| {
                     anyhow!(
-                    "Invalid UTF-8 in reads-to-contigs SAM record {}: {}",
-                    sam_record_count,
-                    e
-                )
+                        "Invalid UTF-8 in reads-to-contigs SAM record {}: {}",
+                        sam_record_count,
+                        e
+                    )
                 })?;
 
             // We only need fields:
@@ -1109,9 +1131,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing QNAME",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing QNAME",
+                        sam_record_count
+                    )
                 })?;
 
             // FLAG
@@ -1119,18 +1141,18 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing FLAG",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing FLAG",
+                        sam_record_count
+                    )
                 })?;
 
             let rname = fields
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing RNAME",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing RNAME",
+                        sam_record_count
+                    )
                 })?;
 
             // POS
@@ -1138,9 +1160,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing POS",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing POS",
+                        sam_record_count
+                    )
                 })?;
 
             // MAPQ
@@ -1148,9 +1170,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing MAPQ",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing MAPQ",
+                        sam_record_count
+                    )
                 })?;
 
             // CIGAR
@@ -1158,9 +1180,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing CIGAR",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing CIGAR",
+                        sam_record_count
+                    )
                 })?;
 
             // RNEXT
@@ -1168,9 +1190,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing RNEXT",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing RNEXT",
+                        sam_record_count
+                    )
                 })?;
 
             // PNEXT
@@ -1178,9 +1200,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing PNEXT",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing PNEXT",
+                        sam_record_count
+                    )
                 })?;
 
             // TLEN
@@ -1188,9 +1210,9 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing TLEN",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing TLEN",
+                        sam_record_count
+                    )
                 })?;
 
             // SEQ -- SAM field 10, matching legacy length($10).
@@ -1198,16 +1220,22 @@ async fn run_reads_to_contigs(
                 .next()
                 .ok_or_else(|| {
                     anyhow!(
-                    "Malformed reads-to-contigs SAM record {}: missing SEQ",
-                    sam_record_count
-                )
+                        "Malformed reads-to-contigs SAM record {}: missing SEQ",
+                        sam_record_count
+                    )
                 })?;
 
             let read_length = seq.len() as u64;
 
+
+            // --------------------------------------------------------
+            // Durable reads_to_contigs.tsv
+            //
             // Match the legacy TSV exactly:
             //
             // QNAME <tab> RNAME <tab> length(SEQ)
+            // --------------------------------------------------------
+
             writer
                 .write_all(qname.as_bytes())
                 .await?;
@@ -1232,10 +1260,27 @@ async fn run_reads_to_contigs(
                 .write_all(b"\n")
                 .await?;
 
+
+            // --------------------------------------------------------
+            // Computational metadata.
+            //
+            // Keep mapped contigs and the inverse contig -> reads map
+            // together here while the SAM records are encountered in
+            // their original order.
+            //
+            // Do NOT add "*" to contig_to_reads. Those are non-contig
+            // reads and must remain direct NT queries downstream.
+            // --------------------------------------------------------
+
             if rname != "*" {
                 mapped_contig_ids.insert(
                     rname.to_owned(),
                 );
+
+                contig_to_reads
+                    .entry(rname.to_owned())
+                    .or_default()
+                    .push(qname.to_owned());
             }
 
             read_base_counts.insert(
@@ -1246,18 +1291,27 @@ async fn run_reads_to_contigs(
 
         writer.flush().await?;
 
+        let mapped_read_count: usize =
+            contig_to_reads
+                .values()
+                .map(Vec::len)
+                .sum();
+
         info!(
-        "reads_to_contigs.tsv complete; processed {} SAM records, \
-         {} contigs have mapped reads, {} read lengths collected",
-        sam_record_count,
-        mapped_contig_ids.len(),
-        read_base_counts.len(),
-    );
+            "reads_to_contigs.tsv complete; processed {} SAM records, \
+             {} contigs have mapped reads, {} mapped read assignments, \
+             {} read lengths collected",
+            sam_record_count,
+            mapped_contig_ids.len(),
+            mapped_read_count,
+            read_base_counts.len(),
+        );
 
         Ok::<ReadsToContigsMetadata, anyhow::Error>(
             ReadsToContigsMetadata {
                 mapped_contig_ids,
                 read_base_counts,
+                contig_to_reads,
             }
         )
     });
@@ -1514,9 +1568,9 @@ async fn run_reads_to_contigs(
         )
             .map_err(|e| {
                 anyhow!(
-                "Failed to generate samtools index arguments: {}",
-                e
-            )
+                    "Failed to generate samtools index arguments: {}",
+                    e
+                )
             })?;
 
         let (
@@ -1532,9 +1586,9 @@ async fn run_reads_to_contigs(
             .await
             .map_err(|e| {
                 anyhow!(
-                "Failed to start samtools index: {}",
-                e
-            )
+                    "Failed to start samtools index: {}",
+                    e
+                )
             })?;
 
         let index_status = index_child
@@ -1876,6 +1930,10 @@ async fn run_reads_to_contigs(
     // Query-name sorting and contig-info generation also continue
     // asynchronously, but contig_info_task is returned because its
     // in-memory result is required by downstream computation.
+    //
+    // reads_to_contigs_metadata_task now additionally carries the
+    // ordered contig -> reads relationship required by long-read
+    // SummarizeHitsNT / SummarizeHitsNR.
     // ================================================================
 
     Ok((
@@ -2727,6 +2785,516 @@ async fn diamond_non_host_align(
     ))
 }
 
+/// Long-read equivalent of:
+///
+///     idseq_dag.util.contig_hitsummary.summarize_hits
+///
+/// Input is the output of FindTopHitsNT / FindTopHitsNR.
+///
+/// Unlike short-read call_hits_m8(), this function does NOT perform
+/// taxonomic consensus across competing alignments. FindTopHits has
+/// already reduced the raw alignment results.
+///
+/// Long-read-specific behavior:
+///
+///   1. Parse/filter top M8 records.
+///   2. Resolve accession -> taxid -> lineage.
+///   3. Apply taxonomy filtering.
+///   4. Merge repeated rows for the same qseqid.
+///   5. If qseqid is a contig, propagate that hit to every read mapped
+///      to the contig.
+///   6. Otherwise emit the query itself.
+///   7. Keep reassigned M8 + HitSummary together as ReducedRead.
+///
+/// This replaces the filesystem dependency on reads_to_contigs.tsv with
+/// the in-memory contig_to_reads map produced upstream.
+async fn summarize_contig_hits<F>(
+    mut top_m8_stream: ReceiverStream<ParseOutput>,
+    db_type: &str,
+    contig_to_reads: Arc<HashMap<String, Vec<String>>>,
+    lineage_map: Arc<AHashMap<Taxid, Lineage>>,
+    acc2taxid_map: Arc<Map<Vec<u8>>>,
+    should_keep_filter: Arc<F>,
+    min_alignment_length: u64,
+    config: Arc<RunConfig>,
+) -> Result<
+    (
+        ReceiverStream<ReducedRead>,
+        JoinHandle<anyhow::Result<()>>,
+    ),
+    PipelineError,
+>
+where
+    F: Fn(&[i32]) -> bool + Send + Sync + 'static,
+{
+    if !db_type.eq_ignore_ascii_case("nt")
+        && !db_type.eq_ignore_ascii_case("nr")
+    {
+        return Err(PipelineError::Other(anyhow!(
+            "summarize_contig_hits: unsupported db_type '{}'",
+            db_type
+        )));
+    }
+
+    let db_type = db_type.to_ascii_lowercase();
+
+    let (pair_tx, pair_rx) =
+        mpsc::channel::<ReducedRead>(
+            config.base_buffer_size * 8
+        );
+
+    let task = tokio::spawn(async move {
+        // ============================================================
+        // Pass 1
+        //
+        // Python:
+        //
+        //     hit_by_qseqid = {}
+        //     for hit in reader:
+        //         ...
+        //         if prev_hit := hit_by_qseqid.get(qseqid):
+        //             merge...
+        //         else:
+        //             hit_by_qseqid[qseqid] = hit
+        //
+        // FindTopHits normally gives us one row per query, but preserve
+        // the legacy merge semantics rather than depending on that.
+        // ============================================================
+
+        let mut hit_by_qseqid: AHashMap<String, M8Record> =
+            AHashMap::with_capacity(64_000);
+
+        let mut lines_in = 0u64;
+        let mut filtered_short = 0u64;
+        let mut accession_misses = 0u64;
+        let mut taxonomy_filtered = 0u64;
+
+        while let Some(item) = top_m8_stream.next().await {
+            let ParseOutput::Bytes(bytes) = item else {
+                continue;
+            };
+
+            let line = std::str::from_utf8(&bytes)
+                .map_err(|e| {
+                    anyhow!(
+                        "[summarize_contig_hits:{}] invalid UTF-8: {}",
+                        db_type,
+                        e
+                    )
+                })?
+                .trim_end();
+
+            if line.is_empty() {
+                continue;
+            }
+
+            lines_in += 1;
+
+            // --------------------------------------------------------
+            // Legacy reader distinction:
+            //
+            // NT -> BlastnOutput6NTRerankedReader
+            // NR -> BlastnOutput6Reader
+            // --------------------------------------------------------
+
+            let hit = if db_type == "nt" {
+                M8Record::parse_line_nt(line)
+            } else {
+                M8Record::parse_line_nr(line)
+            }
+                .map_err(|e| {
+                    anyhow!(
+                    "[summarize_contig_hits:{}] failed parsing M8 line: {}",
+                    db_type,
+                    e
+                )
+                })?;
+
+            // Both legacy readers receive min_alignment_length.
+            if hit.alen < min_alignment_length {
+                filtered_short += 1;
+                continue;
+            }
+
+            // --------------------------------------------------------
+            // accession -> taxid -> lineage
+            //
+            // M8Record parsing already normalizes accession versions,
+            // but use the base explicitly here to preserve the Python
+            // accession.split(".")[0] behavior.
+            // --------------------------------------------------------
+
+            let accession_base =
+                hit.tname
+                    .split('.')
+                    .next()
+                    .unwrap_or(hit.tname.as_str());
+
+            let taxid = match acc2taxid_map.get(accession_base.as_bytes()) {
+                Some(taxid) => taxid as Taxid,
+                None => {
+                    accession_misses += 1;
+
+                    if accession_misses <= 20 {
+                        warn!(
+                            "[summarize_contig_hits:{}] accession2taxid miss: \
+                             q={} accession={}",
+                            db_type,
+                            hit.qname,
+                            hit.tname,
+                        );
+                    }
+
+                    continue;
+                }
+            };
+
+            let lineage = lineage_map
+                .get(&taxid)
+                .copied()
+                .unwrap_or([-1; 3]);
+
+            // Python:
+            //
+            //     if not should_keep(lineage):
+            //         continue
+            //
+            if !should_keep_filter(&lineage) {
+                taxonomy_filtered += 1;
+                continue;
+            }
+
+            let qseqid = hit.qname.clone();
+
+            // --------------------------------------------------------
+            // Preserve contig_hitsummary.py's same-qseqid merge.
+            //
+            // weighted:
+            //     pident
+            //     evalue
+            //
+            // summed:
+            //     mismatch
+            //     gapopen
+            //     bitscore
+            //     length
+            //
+            // min/max:
+            //     qstart/qend
+            //     sstart/send
+            // --------------------------------------------------------
+
+            if let Some(prev) = hit_by_qseqid.get_mut(&qseqid) {
+                let prev_len = prev.alen as f64;
+                let hit_len = hit.alen as f64;
+                let total_len = prev_len + hit_len;
+
+                if total_len > 0.0 {
+                    prev.pident =
+                        (
+                            prev.pident * prev_len
+                                + hit.pident * hit_len
+                        )
+                            / total_len;
+
+                    prev.evalue =
+                        (
+                            prev.evalue * prev_len
+                                + hit.evalue * hit_len
+                        )
+                            / total_len;
+                }
+
+                prev.mismatch += hit.mismatch;
+                prev.gapopen += hit.gapopen;
+                prev.bitscore += hit.bitscore;
+                prev.alen += hit.alen;
+
+                prev.qstart = prev.qstart.min(hit.qstart);
+                prev.qend = prev.qend.max(hit.qend);
+
+                prev.tstart = prev.tstart.min(hit.tstart);
+                prev.tend = prev.tend.max(hit.tend);
+            } else {
+                hit_by_qseqid.insert(qseqid, hit);
+            }
+        }
+
+        info!(
+            "[summarize_contig_hits:{}] pass1 complete: \
+             input={} retained_queries={} short={} acc_miss={} taxonomy_filtered={}",
+            db_type,
+            lines_in,
+            hit_by_qseqid.len(),
+            filtered_short,
+            accession_misses,
+            taxonomy_filtered,
+        );
+
+        // ============================================================
+        // Pass 2
+        //
+        // Emit:
+        //
+        //     qseqid not a contig:
+        //         one M8 + HitSummary for qseqid
+        //
+        //     qseqid is a contig:
+        //         one M8 + HitSummary for EACH constituent read
+        //
+        // The pair stays together in ReducedRead.
+        // ============================================================
+
+        let mut seq = 0u64;
+        let mut direct_queries = 0u64;
+        let mut contig_queries = 0u64;
+        let mut propagated_reads = 0u64;
+
+        for (_qseqid, hit) in hit_by_qseqid {
+            let original_qseqid = hit.qname.clone();
+            let accession = hit.tname.clone();
+
+            let accession_base =
+                accession
+                    .split('.')
+                    .next()
+                    .unwrap_or(accession.as_str());
+
+            let taxid = match acc2taxid_map.get(accession_base.as_bytes()) {
+                Some(taxid) => taxid as Taxid,
+                None => {
+                    // This should already have been excluded in pass 1.
+                    continue;
+                }
+            };
+
+            let lineage = lineage_map
+                .get(&taxid)
+                .copied()
+                .unwrap_or([-1; 3]);
+
+            let species_taxid = lineage[0];
+            let genus_taxid = lineage[1];
+            let family_taxid = lineage[2];
+
+            // --------------------------------------------------------
+            // Helper closure:
+            //
+            // Serialize one reassigned M8 + corresponding merged
+            // HitSummary into a ReducedRead.
+            // --------------------------------------------------------
+
+            let make_pair =
+                |seq: u64,
+                 read_id: &str,
+                 contig_id: Option<&str>|
+                 -> ReducedRead
+                    {
+                        let mut reassigned_hit = hit.clone();
+                        reassigned_hit.qname = read_id.to_string();
+
+                        // ----------------------------------------------------
+                        // M8 serialization.
+                        //
+                        // Legacy:
+                        //   NT -> BlastnOutput6NTRerankedWriter
+                        //   NR -> BlastnOutput6Writer
+                        //
+                        // NT therefore retains qlen/slen.
+                        // NR remains standard 12-column blast6.
+                        // ----------------------------------------------------
+
+                        let dedup = if db_type == "nt" {
+                            format!(
+                                "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\t{}\t{}\n",
+                                reassigned_hit.qname,
+                                reassigned_hit.tname,
+                                reassigned_hit.pident,
+                                reassigned_hit.alen,
+                                reassigned_hit.mismatch,
+                                reassigned_hit.gapopen,
+                                reassigned_hit.qstart,
+                                reassigned_hit.qend,
+                                reassigned_hit.tstart,
+                                reassigned_hit.tend,
+                                reassigned_hit.evalue,
+                                reassigned_hit.bitscore,
+                                reassigned_hit.qlen,
+                                reassigned_hit.slen,
+                            )
+                                .into_bytes()
+                        } else {
+                            format!(
+                                "{}\t{}\t{:.2}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.2e}\t{:.1}\n",
+                                reassigned_hit.qname,
+                                reassigned_hit.tname,
+                                reassigned_hit.pident,
+                                reassigned_hit.alen,
+                                reassigned_hit.mismatch,
+                                reassigned_hit.gapopen,
+                                reassigned_hit.qstart,
+                                reassigned_hit.qend,
+                                reassigned_hit.tstart,
+                                reassigned_hit.tend,
+                                reassigned_hit.evalue,
+                                reassigned_hit.bitscore,
+                            )
+                                .into_bytes()
+                        };
+
+                        // ----------------------------------------------------
+                        // HitSummaryMergedWriter semantic fields:
+                        //
+                        //   0 read_id
+                        //   1 level
+                        //   2 taxid
+                        //   3 accession_id
+                        //   4 species_taxid
+                        //   5 genus_taxid
+                        //   6 family_taxid
+                        //   7 contig_id
+                        //   8 contig_accession_id
+                        //   9 contig_species_taxid
+                        //  10 contig_genus_taxid
+                        //  11 contig_family_taxid
+                        //
+                        // For a direct/non-contig hit Python uses contig_id="*".
+                        // For a propagated contig hit it uses the original
+                        // contig qseqid.
+                        //
+                        // "from_assembly" is represented by the presence of the
+                        // contig assignment in the downstream Rust model; the
+                        // first 12 fields are the computationally consumed
+                        // HitSummaryMerged fields.
+                        // ----------------------------------------------------
+
+                        let summary = match contig_id {
+                            Some(contig_id) => {
+                                format!(
+                                    "{}\t1\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                                    read_id,
+                                    species_taxid,
+                                    accession,
+                                    species_taxid,
+                                    genus_taxid,
+                                    family_taxid,
+                                    contig_id,
+                                    accession,
+                                    species_taxid,
+                                    genus_taxid,
+                                    family_taxid,
+                                )
+                            }
+
+                            None => {
+                                format!(
+                                    "{}\t1\t{}\t{}\t{}\t{}\t{}\t*\t{}\t{}\t{}\t{}\n",
+                                    read_id,
+                                    species_taxid,
+                                    accession,
+                                    species_taxid,
+                                    genus_taxid,
+                                    family_taxid,
+                                    accession,
+                                    species_taxid,
+                                    genus_taxid,
+                                    family_taxid,
+                                )
+                            }
+                        }
+                            .into_bytes();
+
+                        ReducedRead {
+                            seq,
+                            dedup,
+                            summary,
+                            accession: accession.clone(),
+                        }
+                    };
+
+            // --------------------------------------------------------
+            // Python:
+            //
+            //     if qseqid not in contig_to_reads:
+            //         emit qseqid itself
+            //     else:
+            //         for read_id in contig_to_reads[qseqid]:
+            //             hit["qseqid"] = read_id
+            //             emit
+            // --------------------------------------------------------
+
+            if let Some(read_ids) =
+                contig_to_reads.get(&original_qseqid)
+            {
+                contig_queries += 1;
+
+                for read_id in read_ids {
+                    seq += 1;
+
+                    let pair =
+                        make_pair(
+                            seq,
+                            read_id,
+                            Some(&original_qseqid),
+                        );
+
+                    pair_tx
+                        .send(pair)
+                        .await
+                        .map_err(|_| {
+                            anyhow!(
+                                "[summarize_contig_hits:{}] \
+                                 downstream ReducedRead receiver closed",
+                                db_type
+                            )
+                        })?;
+
+                    propagated_reads += 1;
+                }
+            } else {
+                seq += 1;
+
+                let pair =
+                    make_pair(
+                        seq,
+                        &original_qseqid,
+                        None,
+                    );
+
+                pair_tx
+                    .send(pair)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "[summarize_contig_hits:{}] \
+                             downstream ReducedRead receiver closed",
+                            db_type
+                        )
+                    })?;
+
+                direct_queries += 1;
+            }
+        }
+
+        info!(
+            "[summarize_contig_hits:{}] complete: \
+             emitted={} direct_queries={} contig_queries={} propagated_reads={}",
+            db_type,
+            seq,
+            direct_queries,
+            contig_queries,
+            propagated_reads,
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok((
+        ReceiverStream::new(pair_rx),
+        task,
+    ))
+}
+
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -2771,6 +3339,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .map_err(|e| PipelineError::Other(e.into()))?;
     }
 
+
+    let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
 
     let (input_fastq, _file2, sample_base_buf, sample_base) =
         validate_file_inputs(&config, &cwd, true).await?;
@@ -3810,7 +4380,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ))
     };
 
-
     // ---------------------------------------------------------------------
     //
     // SINGLE:
@@ -3840,9 +4409,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
              running NT then NR serially"
         );
 
-            let nt_result = nt_non_host_align_fut.await?;
+            let nt_result =
+                nt_non_host_align_fut.await?;
 
-            let nr_result = nr_non_host_align_fut.await?;
+            let nr_result =
+                nr_non_host_align_fut.await?;
 
             (nt_result, nr_result)
         }
@@ -3865,16 +4436,45 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Transfer branch-owned resources to run-level cleanup.
     // ---------------------------------------------------------------------
 
-    cleanup_tasks.append(&mut nt_non_host_cleanup_tasks);
-    cleanup_receivers.append(&mut nt_non_host_cleanup_receivers);
+    cleanup_tasks.append(
+        &mut nt_non_host_cleanup_tasks
+    );
 
-    cleanup_tasks.append(&mut nr_non_host_cleanup_tasks);
-    cleanup_receivers.append(&mut nr_non_host_cleanup_receivers);
+    cleanup_receivers.append(
+        &mut nt_non_host_cleanup_receivers
+    );
 
-    final_temp_dirs.extend(nr_non_host_align_temp_dirs);
+    cleanup_tasks.append(
+        &mut nr_non_host_cleanup_tasks
+    );
 
+    cleanup_receivers.append(
+        &mut nr_non_host_cleanup_receivers
+    );
 
-    // Call top hits
+    final_temp_dirs.extend(
+        nr_non_host_align_temp_dirs
+    );
+
+    // =====================================================================
+    // FindTopHitsNT / FindTopHitsNR
+    //
+    // RunNTAlignment.nt_m8
+    //         ↓
+    // get_top_m8_nt()
+    //         ↓
+    // nt_top_m8_stream
+    //
+    // RunNRAlignment.nr_m8
+    //         ↓
+    // get_top_m8_nr()
+    //         ↓
+    // nr_top_m8_stream
+    //
+    // get_top_m8_nt() and get_top_m8_nr() perform global aggregation and
+    // therefore do not require sort_m8_by_read_id() beforehand.
+    // =====================================================================
+
     let nt_find_top_hits_fut = async {
         info!("[run] FindTopHitsNT started");
 
@@ -3907,6 +4507,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             nt_top_hits_task,
         ))
     };
+
 
     let nr_find_top_hits_fut = async {
         info!("[run] FindTopHitsNR started");
@@ -3942,6 +4543,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
+    // Install both FindTopHits stages.
+    //
+    // Do NOT await the producer tasks here. Their bounded output channels
+    // must have downstream consumers installed first.
     let (
         (nt_top_m8_stream, nt_top_hits_task),
         (nr_top_m8_stream, nr_top_hits_task),
@@ -3949,6 +4554,318 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     nt_find_top_hits_fut,
     nr_find_top_hits_fut,
 )?;
+
+
+    // =====================================================================
+    // Fan out FindTopHitsNT output.
+    //
+    // WDL FindTopHitsNT.nt_top_m8 has multiple consumers:
+    //
+    //   1. SummarizeHitsNT
+    //   2. durable gsnap.blast.top.m8
+    //   3. later NT coverage visualization
+    //
+    // Do not use the durable file as a synchronization point.
+    // =====================================================================
+
+    let (
+        nt_top_m8_streams,
+        nt_top_m8_router_done_rx,
+    ) = fanout_to_channels(
+        nt_top_m8_stream,
+        3,
+        "long_read_nt_top_m8",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(nt_top_m8_router_done_rx);
+
+    let mut nt_top_m8_streams =
+        nt_top_m8_streams.into_iter();
+
+
+    // Computational branch for SummarizeHitsNT.
+    let nt_top_m8_for_summarize =
+        ReceiverStream::new(
+            nt_top_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // Computational branch retained for the later NT coverage stage.
+    let nt_top_m8_for_coverage =
+        ReceiverStream::new(
+            nt_top_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // Durable WDL-equivalent artifact branch.
+    let nt_top_m8_for_file =
+        ReceiverStream::new(
+            nt_top_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_top_m8_path =
+        out_dir.join("gsnap.blast.top.m8");
+
+    let nt_top_m8_write_task =
+        write_byte_stream_to_file(
+            &nt_top_m8_path,
+            nt_top_m8_for_file,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "long_read_nt_top_m8",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(nt_top_m8_write_task);
+
+
+    // =====================================================================
+    // Fan out FindTopHitsNR output.
+    //
+    // WDL FindTopHitsNR.nt_top_m8 has:
+    //
+    //   1. SummarizeHitsNR
+    //   2. durable rapsearch2.blast.top.m8
+    //
+    // Unlike NT, there is no additional coverage consumer at this point.
+    // =====================================================================
+
+    let (
+        nr_top_m8_streams,
+        nr_top_m8_router_done_rx,
+    ) = fanout_to_channels(
+        nr_top_m8_stream,
+        2,
+        "long_read_nr_top_m8",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(nr_top_m8_router_done_rx);
+
+    let mut nr_top_m8_streams =
+        nr_top_m8_streams.into_iter();
+
+
+    // Computational branch for SummarizeHitsNR.
+    let nr_top_m8_for_summarize =
+        ReceiverStream::new(
+            nr_top_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // Durable WDL-equivalent artifact branch.
+    let nr_top_m8_for_file =
+        ReceiverStream::new(
+            nr_top_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nr_top_m8_path =
+        out_dir.join("rapsearch2.blast.top.m8");
+
+    let nr_top_m8_write_task =
+        write_byte_stream_to_file(
+            &nr_top_m8_path,
+            nr_top_m8_for_file,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "long_read_nr_top_m8",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(nr_top_m8_write_task);
+
+
+    // =====================================================================
+    // Prepare long-read SummarizeHits shared state.
+    //
+    // reads_to_contigs_metadata was already awaited immediately after
+    // RunReadsToContigs.
+    //
+    // contig_to_reads was collected directly from the same sequential SAM
+    // records used to create reads_to_contigs.tsv:
+    //
+    //     contig ID -> [read ID, read ID, ...]
+    //
+    // Moving it here is safe because run() has already finished using the
+    // other ReadsToContigsMetadata fields for RemoveUnmappedContigs and
+    // GenerateContigStats.
+    //
+    // This replaces the WDL filesystem dependency:
+    //
+    //     RunReadsToContigs.reads_to_contigs_tsv
+    //
+    // with the equivalent in-memory representation.
+    // =====================================================================
+
+    let contig_to_reads =
+        Arc::new(
+            reads_to_contigs_metadata.contig_to_reads
+        );
+
+
+    // Legacy long-read WDL:
+    //
+    //     SummarizeHitsNT.min_alignment_length = min_read_length
+    //     SummarizeHitsNR.min_alignment_length = min_read_length
+    //
+    // workflow default:
+    //
+    //     Int min_read_length = 36
+    //
+    let min_alignment_length =  config.args.min_alignment_length;
+
+    // Build filter
+    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
+    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
+    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
+
+    let should_keep_filter = Arc::new(
+        build_should_keep_filter(
+            deuterostome_path,
+            taxon_whitelist_path,
+            taxon_blacklist_path,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(e))?,
+    );
+
+
+    let (lineage_map, acc2taxid_map) = taxonomy_handle.await??;
+
+
+
+    // =====================================================================
+    // SummarizeHitsNT / SummarizeHitsNR
+    //
+    // Both FindTopHits producers now have active consumers:
+    //
+    //     get_top_m8_nt
+    //          ↓
+    //     nt_top_m8_for_summarize
+    //          ↓
+    //     summarize_contig_hits("nt")
+    //
+    //     get_top_m8_nr
+    //          ↓
+    //     nr_top_m8_for_summarize
+    //          ↓
+    //     summarize_contig_hits("nr")
+    //
+    // The long-read summarizer propagates contig hits back to the reads
+    // belonging to each contig and emits paired:
+    //
+    //     ReducedRead.dedup   = m8_reassigned_{nt,nr}.tab row
+    //     ReducedRead.summary = hitsummary2 row
+    //
+    // contig_to_reads is the in-memory replacement for
+    // reads_to_contigs.tsv.
+    // =====================================================================
+
+    let nt_summarize_hits_fut = summarize_contig_hits(
+        nt_top_m8_for_summarize,
+        "nt",
+        contig_to_reads.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
+        should_keep_filter.clone(),
+        min_alignment_length,
+        config.clone(),
+    );
+
+    let nr_summarize_hits_fut = summarize_contig_hits(
+        nr_top_m8_for_summarize,
+        "nr",
+        contig_to_reads.clone(),
+        lineage_map.clone(),
+        acc2taxid_map.clone(),
+        should_keep_filter.clone(),
+        min_alignment_length,
+        config.clone(),
+    );
+
+
+    // Install both consumers before awaiting the FindTopHits producers.
+    //
+    // This is required because get_top_m8_nt/get_top_m8_nr emit into
+    // bounded channels. The summarize tasks must be draining those channels
+    // while the top-hit tasks complete.
+    let (
+        (nt_reassigned_pairs, nt_summarize_hits_task),
+        (nr_reassigned_pairs, nr_summarize_hits_task),
+    ) = tokio::try_join!(
+    nt_summarize_hits_fut,
+    nr_summarize_hits_fut,
+)?;
+
+
+    // =====================================================================
+    // FindTopHits producers awaited
+    // =====================================================================
+
+    let (
+        nt_top_hits_result,
+        nr_top_hits_result,
+    ) = tokio::try_join!(
+    nt_top_hits_task,
+    nr_top_hits_task,
+)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "FindTopHits task panicked: {}",
+            e
+        ))
+        })?;
+
+    nt_top_hits_result
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "FindTopHitsNT failed: {}",
+            e
+        ))
+        })?;
+
+    nr_top_hits_result
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "FindTopHitsNR failed: {}",
+            e
+        ))
+        })?;
+
+    info!(
+    "[run] FindTopHitsNT and FindTopHitsNR completed successfully"
+);
+
+
+    info!(
+    "[run] SummarizeHitsNT and SummarizeHitsNR output streams installed"
+);
+
 
 
     // *******************
