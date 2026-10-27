@@ -43,6 +43,7 @@ use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte
                          choose_temp_dir};
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
                           fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord};
+use crate::utils::paf::paf_to_m8;
 use crate::utils::sambam::{filter_clipped_alignments, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
@@ -3458,16 +3459,127 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         let (
             nt_paf_stream,
-            nt_cleanup_tasks,
-            nt_cleanup_receivers,
+            mut nt_cleanup_tasks,
+            mut nt_cleanup_receivers,
         ) = nt_non_host_align(
             config.clone(),
             nt_alignment_input_path,
         )
             .await?;
 
-        Ok::<_, PipelineError>((
+
+        // ================================================================
+        // Branch 1 continues computationally into PAF -> M8.
+        // Branch 2 writes the durable PAF artifact.
+        // ================================================================
+
+        let (
+            nt_paf_streams,
+            nt_paf_done_rx,
+        ) = fanout_to_channels(
             nt_paf_stream,
+            2,
+            "nt_paf",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+
+        nt_cleanup_receivers.push(nt_paf_done_rx);
+
+        let mut nt_paf_streams = nt_paf_streams.into_iter();
+
+        let nt_paf_for_m8 =
+            ReceiverStream::new(
+                nt_paf_streams
+                    .next()
+                    .ok_or(PipelineError::EmptyStream)?,
+            );
+
+        let nt_paf_for_file =
+            ReceiverStream::new(
+                nt_paf_streams
+                    .next()
+                    .ok_or(PipelineError::EmptyStream)?,
+            );
+
+
+        let nt_paf_path =
+            out_dir.join("gsnap.paf");
+
+        let nt_paf_write_task =
+            write_byte_stream_to_file(
+                &nt_paf_path,
+                nt_paf_for_file,
+                config.clone(),
+                StreamDataType::JustBytes,
+                "nt_gsnap_paf",
+                false,
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(e.to_string())
+                })?;
+
+        nt_cleanup_tasks.push(nt_paf_write_task);
+
+
+        // ================================================================
+        // PAF -> BLAST M8.
+        //
+        // paf_to_m8() itself fans out its result:
+        //
+        //     branch 1 -> computational M8 stream
+        //     branch 2 -> durable gsnap.m8
+        // ================================================================
+
+        let nt_m8_path =
+            out_dir.join("gsnap.m8");
+
+        let (
+            nt_m8_stream,
+            mut m8_cleanup_tasks,
+            m8_cleanup_receivers,
+        ) = paf_to_m8(
+            config.clone(),
+            nt_paf_for_m8,
+            nt_m8_path,
+        )
+            .await?;
+
+        nt_cleanup_tasks.append(
+            &mut m8_cleanup_tasks,
+        );
+
+        nt_cleanup_receivers.extend(
+            m8_cleanup_receivers,
+        );
+
+
+        // ================================================================
+        // IMPORTANT:
+        //
+        // Do NOT sort here yet unless the next long-read WDL stage requires
+        // read-ID grouping.
+        //
+        // RunNTAlignment itself ends at gsnap.m8. Sorting belongs to the
+        // downstream semantic stage if required there.
+        // ================================================================
+
+        info!(
+        "[run] NT non-host alignment phase complete"
+    );
+
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+                Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+            ),
+            PipelineError,
+        >((
+            nt_m8_stream,
             nt_cleanup_tasks,
             nt_cleanup_receivers,
         ))
