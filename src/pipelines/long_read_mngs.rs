@@ -24,7 +24,8 @@ use crate::config::defs::{
     MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
     BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
     SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand,
-    NRAlignmentBackend, DIAMOND_TAG, DiamondSubcommand, Lineage, Taxid, ReducedRead
+    NRAlignmentBackend, DIAMOND_TAG, DiamondSubcommand, Lineage, Taxid, ReducedRead,
+    MIN_NORMAL_POSITIVE_DOUBLE
 };
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::align::{
@@ -33,7 +34,8 @@ use crate::utils::align::{
     ShardedMinimap2Config,
     run_diamond_single_file
 };
-use crate::utils::blast::{M8Record};
+use crate::utils::blast::{M8Record,  AggBucket, ContigSummaryEntry, SpeciesAlignmentResults,
+                          TaxonCount, build_taxon_counts_list};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::diamond::{diamond_index_prep};
 use crate::utils::command::fastp::FastpConfig;
@@ -53,7 +55,7 @@ use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseO
 use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::compute_buffer_size;
 use crate::utils::taxonomy::{get_top_m8_nt, get_top_m8_nr, load_lineage_and_acc2tax_maps,
-                             build_should_keep_filter};
+                             build_should_keep_filter, validate_taxid_lineage};
 
 
 struct ReadsToContigsOutputs {
@@ -3663,6 +3665,449 @@ async fn generate_unmapped_reads(
     })
 }
 
+async fn summarize_long_read_contigs<F>(
+    mut pairs: ReceiverStream<ReducedRead>,
+    db_type: &'static str,
+    read2contig: Arc<HashMap<String, String>>,
+    read_base_counts: Arc<HashMap<String, u64>>,
+    should_keep_filter: Arc<F>,
+    refined_counts_path: PathBuf,
+    contig_summary_path: PathBuf,
+) -> Result<(Vec<TaxonCount>, Vec<ContigSummaryEntry>), PipelineError>
+where
+    F: Fn(&[i32]) -> bool + Send + Sync + 'static,
+{
+    if !db_type.eq_ignore_ascii_case("nt")
+        && !db_type.eq_ignore_ascii_case("nr")
+    {
+        return Err(PipelineError::Other(anyhow!(
+            "summarize_long_read_contigs: unsupported db_type '{}'",
+            db_type
+        )));
+    }
+
+    let count_type = db_type.to_ascii_uppercase();
+
+    // -----------------------------------------------------------------
+    // Python generate_taxon_count_json_from_m8 aggregation.
+    //
+    // key = lineage suffix:
+    //     [species, genus, family]
+    //     [genus, family]
+    //     [family]
+    // -----------------------------------------------------------------
+
+    let mut taxon_agg: AHashMap<Vec<i32>, AggBucket> =
+        AHashMap::new();
+
+    // -----------------------------------------------------------------
+    // Python generate_taxon_summary state.
+    //
+    // Since read_dict={} and duplicate_cluster_sizes=None in
+    // generate_taxon_summary_from_hit_summary(), only added reads
+    // contribute and each contributes exactly one count.
+    // -----------------------------------------------------------------
+
+    let mut contig_to_lineage:
+        HashMap<String, [i32; 3]> =
+        HashMap::new();
+
+    let mut added_reads:
+        Vec<String> =
+        Vec::new();
+
+    let mut pairs_seen = 0u64;
+    let mut pairs_skipped = 0u64;
+
+    while let Some(pair) = pairs.next().await {
+        let summary = std::str::from_utf8(&pair.summary)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "summarize_long_read_contigs({}): invalid UTF-8 \
+                     in hit summary: {}",
+                    count_type,
+                    e
+                ))
+            })?
+            .trim_end();
+
+        if summary.is_empty() {
+            pairs_skipped += 1;
+            continue;
+        }
+
+        let fields: Vec<&str> =
+            summary.split('\t').collect();
+
+        // Long-read HitSummaryMerged:
+        //
+        //   0  read_id
+        //   1  level
+        //   2  taxid
+        //   3  accession_id
+        //   4  species_taxid
+        //   5  genus_taxid
+        //   6  family_taxid
+        //   7  contig_id
+        //   8  contig_accession_id
+        //   9  contig_species_taxid
+        //   10 contig_genus_taxid
+        //   11 contig_family_taxid
+        if fields.len() < 12 {
+            return Err(PipelineError::Other(anyhow!(
+                "summarize_long_read_contigs({}): expected >=12 \
+                 hit-summary fields, got {}",
+                count_type,
+                fields.len()
+            )));
+        }
+
+        let read_id = fields[0];
+
+        let hit_level: i32 =
+            fields[1].parse().unwrap_or(-1);
+
+        let hit_taxid: i32 =
+            fields[2].parse().unwrap_or(-1);
+
+        let species_taxid: i32 =
+            fields[4].parse().unwrap_or(-1);
+
+        let genus_taxid: i32 =
+            fields[5].parse().unwrap_or(-1);
+
+        let family_taxid: i32 =
+            fields[6].parse().unwrap_or(-1);
+
+        let summary_contig_id = fields[7];
+
+        let contig_species_taxid: i32 =
+            fields[9].parse().unwrap_or(-1);
+
+        let contig_genus_taxid: i32 =
+            fields[10].parse().unwrap_or(-1);
+
+        let contig_family_taxid: i32 =
+            fields[11].parse().unwrap_or(-1);
+
+        // =============================================================
+        // Contig-summary bookkeeping.
+        //
+        // Python:
+        //
+        //     contig_to_lineage[row["contig_id"]] = (...)
+        //     added_reads_dict[row["read_id"]] = 0
+        //
+        // Preserve that behavior, including "*".
+        // =============================================================
+
+        contig_to_lineage.insert(
+            summary_contig_id.to_string(),
+            [
+                contig_species_taxid,
+                contig_genus_taxid,
+                contig_family_taxid,
+            ],
+        );
+
+        added_reads.push(read_id.to_string());
+
+        // =============================================================
+        // Refined taxon counts.
+        // =============================================================
+
+        if hit_taxid <= 0 {
+            pairs_skipped += 1;
+            continue;
+        }
+
+        let m8_line =
+            std::str::from_utf8(&pair.dedup)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "summarize_long_read_contigs({}): invalid UTF-8 \
+                         in reassigned M8: {}",
+                        count_type,
+                        e
+                    ))
+                })?
+                .trim_end();
+
+        if m8_line.is_empty() {
+            pairs_skipped += 1;
+            continue;
+        }
+
+        let m8 = if db_type.eq_ignore_ascii_case("nt") {
+            M8Record::parse_line_nt(m8_line)
+        } else {
+            M8Record::parse_line_nr(m8_line)
+        }
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "summarize_long_read_contigs({}): invalid reassigned M8: {}",
+                count_type,
+                e
+            ))
+            })?;
+
+        // Python asserts the paired M8/hitsummary IDs match.
+        if m8.qname != read_id {
+            return Err(PipelineError::Other(anyhow!(
+                "summarize_long_read_contigs({}): \
+                 ReducedRead ID mismatch: m8={} hit={}",
+                count_type,
+                m8.qname,
+                read_id
+            )));
+        }
+
+        // summarize_contig_hits() has already resolved the lineage.
+        // Preserve the hit-summary lineage used by the legacy count path.
+        let raw_lineage =
+            [species_taxid, genus_taxid, family_taxid];
+
+        let cleaned =
+            validate_taxid_lineage(
+                &raw_lineage,
+                hit_taxid,
+                if hit_level > 0 {
+                    hit_level as u8
+                } else {
+                    0
+                },
+            );
+
+        if !should_keep_filter(&cleaned) {
+            pairs_skipped += 1;
+            continue;
+        }
+
+        let percent_identity = m8.pident;
+        let alignment_length = m8.alen as f64;
+
+        let mut e_value = m8.evalue;
+        if e_value <= MIN_NORMAL_POSITIVE_DOUBLE {
+            e_value = MIN_NORMAL_POSITIVE_DOUBLE;
+        }
+        let e_value_log10 = e_value.log10();
+
+        // Long-read WDL:
+        //
+        //     duplicate_cluster_sizes_path=None
+        //
+        // therefore cluster_size == 1.
+        let cluster_size = 1u64;
+
+        // Unlike the generic short-read function, legacy long reads pass:
+        //
+        //     read_to_base_count=read_to_base_count
+        //
+        // where this is the full sequence length from reads_to_contigs.tsv.
+        let base_count =
+            read_base_counts
+                .get(read_id)
+                .copied()
+                .unwrap_or(0);
+
+        let mut agg_key = cleaned;
+
+        while !agg_key.is_empty() {
+            let bucket =
+                taxon_agg
+                    .entry(agg_key.clone())
+                    .or_default();
+
+            bucket.nonunique_count += cluster_size;
+            bucket.unique_count += 1;
+            bucket.base_count += base_count * cluster_size;
+
+            bucket.sum_percent_identity +=
+                percent_identity;
+
+            bucket.sum_alignment_length +=
+                alignment_length;
+
+            bucket.sum_e_value +=
+                e_value_log10;
+
+            agg_key = agg_key[1..].to_vec();
+        }
+
+        pairs_seen += 1;
+    }
+
+    // ================================================================
+    // Finish refined counts.
+    //
+    // build_taxon_counts_list() already implements the Python lineage
+    // suffix → tax_level/taxid/count/DCR/statistics conversion.
+    // ================================================================
+
+    let refined_counts =
+        build_taxon_counts_list(
+            taxon_agg,
+            &count_type,
+        );
+
+    let refined_counts_json =
+        serde_json::to_vec_pretty(&refined_counts)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed serializing {} refined taxon counts: {}",
+                    count_type,
+                    e
+                ))
+            })?;
+
+    tokio::fs::write(
+        &refined_counts_path,
+        refined_counts_json,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed writing {} refined taxon counts {}: {}",
+                count_type,
+                refined_counts_path.display(),
+                e
+            ))
+        })?;
+
+    // ================================================================
+    // Finish contig summary.
+    //
+    // Exact active Python path:
+    //
+    //     generate_taxon_summary(
+    //         read_to_contig,
+    //         contig_to_lineage,
+    //         {},                 # read_dict
+    //         added_reads_dict,
+    //         ...,
+    //         duplicate_cluster_sizes_path=None,
+    //         use_min_contig_size=False,
+    //     )
+    //
+    // Therefore every retained added read contributes exactly one.
+    // ================================================================
+
+    let mut species_summary:
+        HashMap<i32, HashMap<String, u64>> =
+        HashMap::new();
+
+    let mut genus_summary:
+        HashMap<i32, HashMap<String, u64>> =
+        HashMap::new();
+
+    for read_id in added_reads {
+        let contig =
+            read2contig
+                .get(&read_id)
+                .map(String::as_str)
+                .unwrap_or("*");
+
+        let lineage =
+            contig_to_lineage
+                .get(contig)
+                .ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "summarize_long_read_contigs({}): \
+                         no contig lineage for read={} contig={}",
+                        count_type,
+                        read_id,
+                        contig
+                    ))
+                })?;
+
+        let species_taxid = lineage[0];
+        let genus_taxid = lineage[1];
+
+        if !should_keep_filter(
+            &[species_taxid, genus_taxid],
+        ) {
+            continue;
+        }
+
+        *species_summary
+            .entry(species_taxid)
+            .or_default()
+            .entry(contig.to_string())
+            .or_insert(0) += 1;
+
+        *genus_summary
+            .entry(genus_taxid)
+            .or_default()
+            .entry(contig.to_string())
+            .or_insert(0) += 1;
+    }
+
+    let mut contig_summary =
+        Vec::<ContigSummaryEntry>::with_capacity(
+            species_summary.len()
+                + genus_summary.len(),
+        );
+
+    // Python emits species first.
+    for (taxid, contig_counts) in species_summary {
+        contig_summary.push(ContigSummaryEntry {
+            taxid,
+            tax_level: 1,
+            count_type: count_type.clone(),
+            contig_counts,
+        });
+    }
+
+    // Then genus.
+    for (taxid, contig_counts) in genus_summary {
+        contig_summary.push(ContigSummaryEntry {
+            taxid,
+            tax_level: 2,
+            count_type: count_type.clone(),
+            contig_counts,
+        });
+    }
+
+    let contig_summary_json =
+        serde_json::to_vec_pretty(&contig_summary)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed serializing {} contig summary: {}",
+                    count_type,
+                    e
+                ))
+            })?;
+
+    tokio::fs::write(
+        &contig_summary_path,
+        contig_summary_json,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed writing {} contig summary {}: {}",
+                count_type,
+                contig_summary_path.display(),
+                e
+            ))
+        })?;
+
+    info!(
+        "[summarize_long_read_contigs:{}] complete: \
+         pairs={} skipped={} taxon_counts={} contig_summary_entries={}",
+        count_type,
+        pairs_seen,
+        pairs_skipped,
+        refined_counts.len(),
+        contig_summary.len(),
+    );
+
+    Ok((
+        refined_counts,
+        contig_summary,
+    ))
+}
+
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -5093,9 +5538,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // =====================================================================
 
     let contig_to_reads =
-        Arc::new(
-            reads_to_contigs_metadata.contig_to_reads
-        );
+        Arc::new(reads_to_contigs_metadata.contig_to_reads);
+
+    let read_base_counts =
+        Arc::new(reads_to_contigs_metadata.read_base_counts);
+
+    let read2contig =
+        Arc::new(read2contig);
 
 
     // Legacy long-read WDL:
@@ -5494,6 +5943,36 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         unmapped_stats.reads,
         unmapped_stats.bases
     );
+
+    let (
+        nt_summarize_contigs_result,
+        nr_summarize_contigs_result,
+    ) = tokio::join!(
+    summarize_long_read_contigs(
+        nt_pairs_for_summarize_contigs,
+        "nt",
+        read2contig.clone(),
+        read_base_counts.clone(),
+        should_keep_filter.clone(),
+        out_dir.join("refined_gsnap_counts_with_dcr.json"),
+        out_dir.join("gsnap_contig_summary.json"),
+    ),
+    summarize_long_read_contigs(
+        nr_pairs_for_summarize_contigs,
+        "nr",
+        read2contig.clone(),
+        read_base_counts.clone(),
+        should_keep_filter.clone(),
+        out_dir.join("refined_rapsearch2_counts_with_dcr.json"),
+        out_dir.join("rapsearch2_contig_summary.json"),
+    ),
+);
+
+    let (nt_refined_counts, nt_contig_summary) =
+        nt_summarize_contigs_result?;
+
+    let (nr_refined_counts, nr_contig_summary) =
+        nr_summarize_contigs_result?;
 
     // *******************
     // Temporary final stream drain for construction
