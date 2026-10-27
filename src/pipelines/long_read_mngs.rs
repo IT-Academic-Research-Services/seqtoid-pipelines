@@ -3822,7 +3822,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (
         (
-            nt_paf_stream,
+            nt_m8_stream,
             mut nt_non_host_cleanup_tasks,
             mut nt_non_host_cleanup_receivers,
         ),
