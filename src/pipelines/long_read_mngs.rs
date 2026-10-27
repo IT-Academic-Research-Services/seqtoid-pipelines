@@ -15,7 +15,7 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::fs::File as TokioFile;
 
 use crate::config::defs::{
@@ -46,7 +46,7 @@ use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
                           fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord};
 use crate::utils::paf::paf_to_m8;
-use crate::utils::sambam::{filter_clipped_alignments, generate_info_from_bam_stream};
+use crate::utils::sambam::{filter_clipped_alignments, generate_assembly_coverage, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
                             ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines};
@@ -756,6 +756,12 @@ async fn run_reads_to_contigs(
             HashMap<String, u64>,    // unweighted contig_stats
             HashMap<String, usize>,  // contig_unique_counts
         )>>,
+
+        // Completes after the coordinate-sorted reads-to-contigs BAM and
+        // its BAI have been written. GenerateCoverageStats synchronizes on
+        // this before adapting that durable BAM back into a byte stream for
+        // the unchanged shared coverage helper.
+        JoinHandle<anyhow::Result<(), anyhow::Error>>,
 
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
@@ -1626,7 +1632,9 @@ async fn run_reads_to_contigs(
         Ok::<(), anyhow::Error>(())
     });
 
-    cleanup_tasks.push(bam_index_artifact_task);
+    // Do not put bam_index_artifact_task in cleanup_tasks. Its completion
+    // is a real downstream dependency of GenerateCoverageStats and the handle
+    // is returned explicitly.
 
 
     // ================================================================
@@ -1948,6 +1956,7 @@ async fn run_reads_to_contigs(
         non_contig_fasta_out_stream,
         reads_to_contigs_metadata_task,
         contig_info_task,
+        bam_index_artifact_task,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -1962,6 +1971,10 @@ async fn remove_unmapped_contigs(
 ) -> Result<
     (
         ReceiverStream<ParseOutput>,
+        // Completion of the durable mapped_contigs.fasta write. The unchanged
+        // shared generate_assembly_coverage() helper accepts a FASTA path, so
+        // GenerateCoverageStats must synchronize on this artifact explicitly.
+        JoinHandle<anyhow::Result<(), anyhow::Error>>,
         Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
         Vec<tokio::sync::oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
     ),
@@ -2273,7 +2286,9 @@ async fn remove_unmapped_contigs(
                 PipelineError::IOError(e.to_string())
             })?;
 
-    cleanup_tasks.push(mapped_contigs_write_task);
+    // The write handle is returned separately because GenerateCoverageStats
+    // must wait for this specific artifact before calling the unchanged
+    // path-based shared coverage helper.
 
 
     // ================================================================
@@ -2286,10 +2301,115 @@ async fn remove_unmapped_contigs(
 
     Ok((
         mapped_contigs_out_stream,
+        mapped_contigs_write_task,
         cleanup_tasks,
         cleanup_receivers,
     ))
 }
+
+
+/// Long-read adapter for the shared assembly coverage implementation.
+///
+/// The WDL supplies reads_to_contigs.sam, but RunReadsToContigs already
+/// creates a coordinate-sorted BAM as a required durable output. Because
+/// generate_assembly_coverage() intentionally remains unchanged and consumes
+/// a BAM byte stream, reopen that existing BAM once and stream it into the
+/// shared implementation after both required artifacts are complete.
+async fn generate_long_read_coverage_stats(
+    config: Arc<RunConfig>,
+    reads_to_contigs_bam: PathBuf,
+    mapped_contigs_fasta: PathBuf,
+    coverage_json_path: PathBuf,
+    coverage_csv_path: PathBuf,
+) -> Result<(), PipelineError> {
+
+
+    // generate_assembly_coverage() has a legacy-compatible early return for
+    // mapped-contig FASTA files smaller than 50 bytes. In that case it never
+    // consumes its BAM input, so pass it an already-closed stream rather than
+    // starting a file-reader producer that could block on a bounded channel.
+    let mapped_contigs_size = tokio::fs::metadata(&mapped_contigs_fasta)
+        .await
+        .map_err(|e| PipelineError::IOError(format!(
+            "Failed to stat mapped-contigs FASTA {} for coverage: {}",
+            mapped_contigs_fasta.display(), e
+        )))?
+        .len();
+
+    if mapped_contigs_size < 50 {
+        let (empty_tx, empty_rx) = mpsc::channel::<ParseOutput>(1);
+        drop(empty_tx);
+
+        generate_assembly_coverage(
+            config,
+            ReceiverStream::new(empty_rx),
+            &mapped_contigs_fasta,
+            &coverage_json_path,
+            &coverage_csv_path,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+        return Ok(());
+    }
+
+    let file = TokioFile::open(&reads_to_contigs_bam)
+        .await
+        .map_err(|e| PipelineError::IOError(format!(
+            "Failed to open reads-to-contigs BAM {} for coverage: {}",
+            reads_to_contigs_bam.display(), e
+        )))?;
+
+    let (tx, rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+    let bam_path_for_reader = reads_to_contigs_bam.clone();
+
+    let bam_reader_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(file);
+        let mut buffer = vec![0u8; 1024 * 1024];
+
+        loop {
+            let n = reader.read(&mut buffer).await.map_err(|e| {
+                anyhow!(
+                    "Failed reading reads-to-contigs BAM {} for coverage: {}",
+                    bam_path_for_reader.display(), e
+                )
+            })?;
+
+            if n == 0 {
+                break;
+            }
+
+            tx.send(ParseOutput::Bytes(Bytes::copy_from_slice(&buffer[..n])))
+                .await
+                .map_err(|_| anyhow!(
+                    "GenerateCoverageStats BAM receiver dropped while reading {}",
+                    bam_path_for_reader.display()
+                ))?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    generate_assembly_coverage(
+        config,
+        ReceiverStream::new(rx),
+        &mapped_contigs_fasta,
+        &coverage_json_path,
+        &coverage_csv_path,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    bam_reader_task
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!(
+            "GenerateCoverageStats BAM reader task panicked: {}", e
+        )))?
+        .map_err(PipelineError::Other)?;
+
+    Ok(())
+}
+
 
 async fn nt_non_host_align(
     config: Arc<RunConfig>,
@@ -3746,6 +3866,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         non_contig_fasta_stream,
         reads_to_contigs_metadata_task,
         contig_info_task,
+        reads_to_contigs_bam_ready,
         reads_to_contigs_cleanup_tasks,
         reads_to_contigs_cleanup_receivers,
     ) = run_reads_to_contigs(
@@ -3789,6 +3910,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (
         mapped_contigs_fasta_stream,
+        mapped_contigs_fasta_ready,
         remove_unmapped_cleanup_tasks,
         remove_unmapped_cleanup_receivers,
     ) = remove_unmapped_contigs(
@@ -4865,6 +4987,56 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!(
     "[run] SummarizeHitsNT and SummarizeHitsNR output streams installed"
 );
+
+
+    // *******************
+    // GenerateCoverageStats
+    // *******************
+    //
+    // Legacy WDL inputs:
+    //
+    //     contigs_fasta   = RemoveUnmappedContigs.mapped_contigs_fasta
+    //     read_contig_sam = RunReadsToContigs.reads_to_contigs_sam
+    //
+    // The shared Rust implementation operates on a coordinate-sorted BAM
+    // stream plus the mapped-contigs FASTA path. RunReadsToContigs already
+    // produces the equivalent coordinate-sorted BAM artifact, so the wrapper
+    // above adapts that existing output without changing sambam.rs.
+
+    let (bam_ready, fasta_ready) = tokio::join!(
+        reads_to_contigs_bam_ready,
+        mapped_contigs_fasta_ready,
+    );
+
+    bam_ready
+        .map_err(|e| PipelineError::Other(anyhow!(
+            "reads-to-contigs BAM artifact task panicked: {}", e
+        )))?
+        .map_err(PipelineError::Other)?;
+
+    fasta_ready
+        .map_err(|e| PipelineError::Other(anyhow!(
+            "mapped-contigs FASTA writer task panicked: {}", e
+        )))?
+        .map_err(PipelineError::Other)?;
+
+
+    let coverage_json_path =
+        out_dir.join("contig_coverage.json");
+
+    let coverage_summary_csv_path =
+        out_dir.join("contig_coverage_summary.csv");
+
+    generate_long_read_coverage_stats(
+        config.clone(),
+        reads_to_contigs_outputs.reads_to_contigs_bam.clone(),
+        mapped_contigs_fasta_path.clone(),
+        coverage_json_path,
+        coverage_summary_csv_path,
+    )
+        .await?;
+
+    info!("[run] GenerateCoverageStats completed successfully");
 
 
 
