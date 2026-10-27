@@ -17,6 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, AsyncWriteExt};
 use tokio::fs::File as TokioFile;
+use dashmap::DashMap;
 
 use crate::config::defs::{
     PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
@@ -25,7 +26,7 @@ use crate::config::defs::{
     BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
     SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand,
     NRAlignmentBackend, DIAMOND_TAG, DiamondSubcommand, Lineage, Taxid, ReducedRead,
-    MIN_NORMAL_POSITIVE_DOUBLE
+    MIN_NORMAL_POSITIVE_DOUBLE, ClusterInfo
 };
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::align::{
@@ -35,7 +36,7 @@ use crate::utils::align::{
     run_diamond_single_file
 };
 use crate::utils::blast::{M8Record,  AggBucket, ContigSummaryEntry, SpeciesAlignmentResults,
-                          TaxonCount, build_taxon_counts_list};
+                          TaxonCount, build_taxon_counts_list, compute_merged_taxon_counts};
 use crate::utils::command::{check_versions, generate_cli};
 use crate::utils::command::diamond::{diamond_index_prep};
 use crate::utils::command::fastp::FastpConfig;
@@ -5973,6 +5974,74 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_refined_counts, nr_contig_summary) =
         nr_summarize_contigs_result?;
+
+    // *******************
+    // ComputeMergedTaxonCounts
+    // *******************
+    //
+    // Legacy WDL inputs:
+    //
+    //     nt_m8_reassigned
+    //     nt_hit_summary
+    //     nt_contig_summary_json
+    //
+    //     nr_m8_reassigned
+    //     nr_hit_summary
+    //     nr_contig_summary_json
+    //
+    //     lineage_db
+    //     deuterostome / whitelist / blacklist filters
+    //
+    // Rust keeps the reassigned M8 + hit-summary rows paired in ReducedRead,
+    // and SummarizeContigs has already returned the typed contig summaries.
+    // Therefore no intermediate artifacts need to be reopened.
+
+    let merged_m8_path =
+        out_dir.join("merged.m8");
+
+    let merged_hitsummary_path =
+        out_dir.join("merged.hitsummary2.tab");
+
+    let merged_taxon_counts_path =
+        out_dir.join("merged_taxon_counts_with_dcr.json");
+
+    let merged_contig_summary_path =
+        out_dir.join("merged_contig_summary.json");
+
+    // Long reads have no duplicate-cluster weighting.
+    // The shared implementation defaults missing reads to cluster size 1.
+    let long_read_duplicate_clusters =
+        Arc::new(DashMap::<String, ClusterInfo>::new());
+
+    let (
+        merged_taxon_counts,
+        merged_taxon_cleanup_tasks,
+    ) = compute_merged_taxon_counts(
+        config.clone(),
+
+        nt_pairs_for_merged_taxon_counts,
+        nt_contig_summary,
+
+        nr_pairs_for_merged_taxon_counts,
+        nr_contig_summary,
+
+        lineage_map.clone(),
+        should_keep_filter.clone(),
+        long_read_duplicate_clusters,
+
+        merged_m8_path,
+        merged_hitsummary_path,
+        merged_taxon_counts_path,
+        merged_contig_summary_path,
+    )
+        .await?;
+
+    cleanup_tasks.extend(merged_taxon_cleanup_tasks);
+
+    info!(
+    "[run] ComputeMergedTaxonCounts completed successfully: {} merged taxa",
+    merged_taxon_counts.len()
+);
 
     // *******************
     // Temporary final stream drain for construction
