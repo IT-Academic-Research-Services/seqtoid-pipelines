@@ -2199,7 +2199,7 @@ pub async fn compute_merged_taxon_counts(
     merged_hitsummary_path: PathBuf,
     merged_taxon_counts_path: PathBuf,
     merged_contig_summary_path: PathBuf,
-) -> Result<(Vec<TaxonCount>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+) -> Result<(Vec<TaxonCount>, Vec<ContigSummaryEntry>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
     let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
 
     // Refined HitSummary (7+ cols) in pair.summary:
@@ -2226,77 +2226,147 @@ pub async fn compute_merged_taxon_counts(
         ))
     }
 
-    fn hit_line_for_counts(fields: &[&str], source: &str) -> Option<Bytes> {
+    fn hit_line_for_counts(
+        fields: &[&str],
+        source: &str,
+    ) -> Option<Bytes> {
         if fields.len() < 7 {
             return None;
         }
+
         Some(Bytes::from(format!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], fields[6], source
         )))
     }
 
-    fn summary_fields(pair: &ReducedRead) -> Option<Vec<String>> {
+    fn summary_fields(
+        pair: &ReducedRead,
+    ) -> Option<Vec<String>> {
         let line = String::from_utf8_lossy(&pair.summary);
         let line = line.trim_end();
+
         if line.is_empty() {
             return None;
         }
-        Some(line.split('\t').map(|s| s.to_string()).collect())
+
+        Some(
+            line.split('\t')
+                .map(|s| s.to_string())
+                .collect(),
+        )
     }
 
     // ── step 1: index NR pairs (Python opens NR hitsummary first) ─────────
-    let mut nr_alignment_per_read: AHashMap<String, SpeciesAlignmentResults> = AHashMap::new();
-    let mut nr_pair_by_read: AHashMap<String, ReducedRead> = AHashMap::new();
-    let mut nr_hit_order: Vec<String> = Vec::new();
+
+    let mut nr_alignment_per_read:
+        AHashMap<String, SpeciesAlignmentResults> =
+        AHashMap::new();
+
+    let mut nr_pair_by_read:
+        AHashMap<String, ReducedRead> =
+        AHashMap::new();
+
+    let mut nr_hit_order: Vec<String> =
+        Vec::new();
 
     while let Some(pair) = nr_pairs.next().await {
         let Some(fields) = summary_fields(&pair) else {
             continue;
         };
-        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-        let Some((read_id, align)) = parse_alignment(&field_refs) else {
+
+        let field_refs: Vec<&str> =
+            fields.iter()
+                .map(|s| s.as_str())
+                .collect();
+
+        let Some((read_id, align)) =
+            parse_alignment(&field_refs)
+        else {
             continue;
         };
+
         nr_hit_order.push(read_id.clone());
-        nr_alignment_per_read.insert(read_id.clone(), align);
-        nr_pair_by_read.insert(read_id, pair);
+
+        nr_alignment_per_read.insert(
+            read_id.clone(),
+            align,
+        );
+
+        nr_pair_by_read.insert(
+            read_id,
+            pair,
+        );
     }
+
     info!(
         "[merged] NR index: {} alignment entries",
         nr_alignment_per_read.len()
     );
 
-    // Disk writers
-    let mut merged_m8_file = BufWriter::new(TokioFile::create(&merged_m8_path).await?);
-    let mut merged_hit_file = BufWriter::new(TokioFile::create(&merged_hitsummary_path).await?);
-    let (m8_write_tx, mut m8_write_rx) = mpsc::unbounded_channel::<Bytes>();
-    let (hit_write_tx, mut hit_write_rx) = mpsc::unbounded_channel::<Bytes>();
+    // ── durable merged M8 / hitsummary writers ────────────────────────────
+
+    let mut merged_m8_file =
+        BufWriter::new(
+            TokioFile::create(&merged_m8_path).await?
+        );
+
+    let mut merged_hit_file =
+        BufWriter::new(
+            TokioFile::create(&merged_hitsummary_path).await?
+        );
+
+    let (m8_write_tx, mut m8_write_rx) =
+        mpsc::unbounded_channel::<Bytes>();
+
+    let (hit_write_tx, mut hit_write_rx) =
+        mpsc::unbounded_channel::<Bytes>();
 
     cleanup_tasks.push(tokio::spawn(async move {
         while let Some(b) = m8_write_rx.recv().await {
-            merged_m8_file.write_all(&b).await?;
+            merged_m8_file
+                .write_all(&b)
+                .await?;
+
             if !b.ends_with(b"\n") {
-                merged_m8_file.write_all(b"\n").await?;
+                merged_m8_file
+                    .write_all(b"\n")
+                    .await?;
             }
         }
-        merged_m8_file.flush().await?;
+
+        merged_m8_file
+            .flush()
+            .await?;
+
         Ok::<(), anyhow::Error>(())
     }));
+
     cleanup_tasks.push(tokio::spawn(async move {
         while let Some(b) = hit_write_rx.recv().await {
-            merged_hit_file.write_all(&b).await?;
+            merged_hit_file
+                .write_all(&b)
+                .await?;
+
             if !b.ends_with(b"\n") {
-                merged_hit_file.write_all(b"\n").await?;
+                merged_hit_file
+                    .write_all(b"\n")
+                    .await?;
             }
         }
-        merged_hit_file.flush().await?;
+
+        merged_hit_file
+            .flush()
+            .await?;
+
         Ok::<(), anyhow::Error>(())
     }));
 
-    let (merged_pair_tx, merged_pair_rx) = mpsc::unbounded_channel::<ReducedRead>();
+    let (merged_pair_tx, merged_pair_rx) =
+        mpsc::unbounded_channel::<ReducedRead>();
 
     // ── step 2: NT pairs ──────────────────────────────────────────────────
+
     let mut nt_kept = 0u64;
     let mut nt_deferred_to_nr = 0u64;
     let mut seq = 0u64;
@@ -2305,34 +2375,74 @@ pub async fn compute_merged_taxon_counts(
         let Some(fields) = summary_fields(&pair) else {
             continue;
         };
-        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-        let Some((read_id, nt_align)) = parse_alignment(&field_refs) else {
+
+        let field_refs: Vec<&str> =
+            fields.iter()
+                .map(|s| s.as_str())
+                .collect();
+
+        let Some((read_id, nt_align)) =
+            parse_alignment(&field_refs)
+        else {
             continue;
         };
 
-        let nr_align = nr_alignment_per_read.get(&read_id);
-        let has_nt_contig = nt_align.contig.is_some();
-        let has_nr_contig = nr_align.and_then(|a| a.contig).is_some();
-        let has_nt_read = nt_align.read.is_some();
-        let has_nr_read = nr_align.and_then(|a| a.read).is_some();
+        let nr_align =
+            nr_alignment_per_read.get(&read_id);
 
-        // Exact Python predicate
-        if has_nt_contig || (!has_nr_contig && has_nt_read) {
-            let Some(hit_out) = hit_line_for_counts(&field_refs, "NT") else {
+        let has_nt_contig =
+            nt_align.contig.is_some();
+
+        let has_nr_contig =
+            nr_align
+                .and_then(|a| a.contig)
+                .is_some();
+
+        let has_nt_read =
+            nt_align.read.is_some();
+
+        let has_nr_read =
+            nr_align
+                .and_then(|a| a.read)
+                .is_some();
+
+        // Exact Python predicate.
+        if has_nt_contig
+            || (!has_nr_contig && has_nt_read)
+        {
+            let Some(hit_out) =
+                hit_line_for_counts(
+                    &field_refs,
+                    "NT",
+                )
+            else {
                 continue;
             };
-            let m8_bytes = Bytes::from(pair.dedup.clone());
-            let _ = m8_write_tx.send(m8_bytes);
-            let _ = hit_write_tx.send(hit_out.clone());
+
+            let m8_bytes =
+                Bytes::from(pair.dedup.clone());
+
+            let _ =
+                m8_write_tx.send(m8_bytes);
+
+            let _ =
+                hit_write_tx.send(hit_out.clone());
 
             seq += 1;
-            let _ = merged_pair_tx.send(ReducedRead {
-                seq,
-                dedup: pair.dedup,
-                summary: hit_out.to_vec(),
-                accession: pair.accession,
-            });
-            nr_alignment_per_read.remove(&read_id);
+
+            let _ =
+                merged_pair_tx.send(
+                    ReducedRead {
+                        seq,
+                        dedup: pair.dedup,
+                        summary: hit_out.to_vec(),
+                        accession: pair.accession,
+                    },
+                );
+
+            nr_alignment_per_read
+                .remove(&read_id);
+
             nt_kept += 1;
         } else if has_nr_contig || has_nr_read {
             nt_deferred_to_nr += 1;
@@ -2343,61 +2453,117 @@ pub async fn compute_merged_taxon_counts(
             );
         }
     }
+
     info!(
         "[merged] NT pass kept={} deferred_to_nr={}",
-        nt_kept, nt_deferred_to_nr
+        nt_kept,
+        nt_deferred_to_nr
     );
 
     // ── step 3: NR remaining in NR hit order ──────────────────────────────
+
     let mut nr_kept = 0u64;
+
     for read_id in &nr_hit_order {
-        if !nr_alignment_per_read.contains_key(read_id) {
+        if !nr_alignment_per_read
+            .contains_key(read_id)
+        {
             continue;
         }
-        let Some(pair) = nr_pair_by_read.remove(read_id) else {
-            warn!("[merged] NR hit {} missing pair — skip", read_id);
-            continue;
-        };
-        let Some(fields) = summary_fields(&pair) else {
-            continue;
-        };
-        let field_refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
-        let Some(hit_out) = hit_line_for_counts(&field_refs, "NR") else {
+
+        let Some(pair) =
+            nr_pair_by_read.remove(read_id)
+        else {
+            warn!(
+                "[merged] NR hit {} missing pair — skip",
+                read_id
+            );
+
             continue;
         };
 
-        let m8_bytes = Bytes::from(pair.dedup.clone());
-        let _ = m8_write_tx.send(m8_bytes);
-        let _ = hit_write_tx.send(hit_out.clone());
+        let Some(fields) =
+            summary_fields(&pair)
+        else {
+            continue;
+        };
+
+        let field_refs: Vec<&str> =
+            fields.iter()
+                .map(|s| s.as_str())
+                .collect();
+
+        let Some(hit_out) =
+            hit_line_for_counts(
+                &field_refs,
+                "NR",
+            )
+        else {
+            continue;
+        };
+
+        let m8_bytes =
+            Bytes::from(pair.dedup.clone());
+
+        let _ =
+            m8_write_tx.send(m8_bytes);
+
+        let _ =
+            hit_write_tx.send(hit_out.clone());
 
         seq += 1;
-        let _ = merged_pair_tx.send(ReducedRead {
-            seq,
-            dedup: pair.dedup,
-            summary: hit_out.to_vec(),
-            accession: pair.accession,
-        });
-        nr_alignment_per_read.remove(read_id);
+
+        let _ =
+            merged_pair_tx.send(
+                ReducedRead {
+                    seq,
+                    dedup: pair.dedup,
+                    summary: hit_out.to_vec(),
+                    accession: pair.accession,
+                },
+            );
+
+        nr_alignment_per_read
+            .remove(read_id);
+
         nr_kept += 1;
     }
+
     drop(m8_write_tx);
     drop(hit_write_tx);
     drop(merged_pair_tx);
-    info!("[merged] NR pass kept={}", nr_kept);
+
+    info!(
+        "[merged] NR pass kept={}",
+        nr_kept
+    );
 
     // ── taxon counts on merged pairs ─────────────────────────────────────
-    let merged_taxon_counts = generate_taxon_counts(
-        config.clone(),
-        UnboundedReceiverStream::new(merged_pair_rx),
-        duplicate_clusters,
-        should_keep_filter,
-        "merged_NT_NR".to_string(),
-        None,
+
+    let merged_taxon_counts =
+        generate_taxon_counts(
+            config.clone(),
+            UnboundedReceiverStream::new(
+                merged_pair_rx
+            ),
+            duplicate_clusters,
+            should_keep_filter,
+            "merged_NT_NR".to_string(),
+            None,
+        )
+            .await?;
+
+    let json =
+        serde_json::to_string_pretty(
+            &merged_taxon_counts
+        )?;
+
+    tokio::fs::write(
+        &merged_taxon_counts_path,
+        json,
     )
         .await?;
 
-    let json = serde_json::to_string_pretty(&merged_taxon_counts)?;
-    tokio::fs::write(&merged_taxon_counts_path, json).await?;
     info!(
         "Merged taxon counts generated ({} taxa) → {}",
         merged_taxon_counts.len(),
@@ -2405,43 +2571,81 @@ pub async fn compute_merged_taxon_counts(
     );
 
     // ── merge_contigs ────────────────────────────────────────────────────
-    let final_contigs = tokio::task::spawn_blocking(move || {
-        let mut nt_contig_names: HashSet<String> = HashSet::new();
-        let mut out: Vec<ContigSummaryEntry> =
-            Vec::with_capacity(nt_contig_summary.len() + nr_contig_summary.len());
 
-        for mut e in nt_contig_summary {
-            for name in e.contig_counts.keys() {
-                nt_contig_names.insert(name.clone());
+    let final_contigs =
+        tokio::task::spawn_blocking(move || {
+            let mut nt_contig_names:
+                HashSet<String> =
+                HashSet::new();
+
+            let mut out:
+                Vec<ContigSummaryEntry> =
+                Vec::with_capacity(
+                    nt_contig_summary.len()
+                        + nr_contig_summary.len()
+                );
+
+            for mut e in nt_contig_summary {
+                for name in e.contig_counts.keys() {
+                    nt_contig_names.insert(
+                        name.clone()
+                    );
+                }
+
+                e.count_type =
+                    "merged_NT_NR".to_string();
+
+                out.push(e);
             }
-            e.count_type = "merged_NT_NR".to_string();
-            out.push(e);
-        }
 
-        for mut e in nr_contig_summary {
-            e.contig_counts
-                .retain(|name, _| !nt_contig_names.contains(name));
-            if e.contig_counts.is_empty() {
-                continue;
+            for mut e in nr_contig_summary {
+                e.contig_counts.retain(
+                    |name, _| {
+                        !nt_contig_names
+                            .contains(name)
+                    },
+                );
+
+                if e.contig_counts.is_empty() {
+                    continue;
+                }
+
+                e.count_type =
+                    "merged_NT_NR".to_string();
+
+                out.push(e);
             }
-            e.count_type = "merged_NT_NR".to_string();
-            out.push(e);
-        }
 
-        out
-    })
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+            out
+        })
+            .await
+            .map_err(|e| {
+                PipelineError::Other(e.into())
+            })?;
 
-    let json = serde_json::to_string_pretty(&final_contigs)?;
-    tokio::fs::write(&merged_contig_summary_path, json).await?;
+    let json =
+        serde_json::to_string_pretty(
+            &final_contigs
+        )?;
+
+    tokio::fs::write(
+        &merged_contig_summary_path,
+        json,
+    )
+        .await?;
+
     info!(
         "Merged contig summary written ({} entries)",
         final_contigs.len()
     );
 
     info!("compute_merged_taxon_counts complete");
-    Ok((merged_taxon_counts, cleanup_tasks))
+
+    Ok((
+        merged_taxon_counts,
+        final_contigs,
+        cleanup_tasks,
+    ))
 }
 
 

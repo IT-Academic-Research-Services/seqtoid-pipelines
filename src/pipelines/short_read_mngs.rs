@@ -10830,7 +10830,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("assembly_combined_contig_summary.json"),
     );
 
-    let ((merged_taxon_counts, merged_cleanup_tasks), nt_refined_map, nr_refined_map) =
+    let ((merged_taxon_counts,_final_contigs, merged_cleanup_tasks), nt_refined_map, nr_refined_map) =
         tokio::try_join!(
         merged_fut,
         async {
