@@ -3641,36 +3641,168 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         // ================================================================
         // RunNRAlignment.
         //
+        //
         // Currently:
         //
         //   Single + Diamond  -> implemented
         //   Single + MMseqs   -> explicit not-implemented error
         //   Distributed       -> explicit not-implemented error
         //
-        // The dispatcher owns that policy, keeping run() backend-agnostic.
+        // Keep the empty-input behavior here because it belongs to the
+        // long-read RunNRAlignment semantics, not to the generic Diamond
+        // execution helper.
+        // ================================================================
+
+        let nr_input_is_empty = tokio::fs::metadata(&nr_input_path)
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed to stat NR input {}: {}",
+                    nr_input_path.display(),
+                    e
+                ))
+            })?
+            .len()
+            == 0;
+
+        let (
+            nr_m8_stream,
+            mut nr_cleanup_tasks,
+            mut nr_cleanup_receivers,
+            mut nr_alignment_temp_dirs,
+        ) = if nr_input_is_empty {
+            info!(
+            "[run] NR mapped-contig FASTA is empty; \
+             skipping NR alignment and producing empty diamond.m8"
+        );
+
+            // Dropping the sender immediately gives us a valid empty stream.
+            let (empty_tx, empty_rx) =
+                mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+            drop(empty_tx);
+
+            (
+                ReceiverStream::new(empty_rx),
+                Vec::<JoinHandle<anyhow::Result<(), anyhow::Error>>>::new(),
+                Vec::<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>::new(),
+                Vec::<TempDir>::new(),
+            )
+        } else {
+            let (
+                nr_m8_rx,
+                nr_cleanup_tasks,
+                nr_cleanup_receivers,
+                nr_alignment_temp_dirs,
+            ) = nr_non_host_align(
+                config.clone(),
+                nr_input_path,
+                sample_base.clone(),
+            )
+                .await?;
+
+            (
+                ReceiverStream::new(nr_m8_rx),
+                nr_cleanup_tasks,
+                nr_cleanup_receivers,
+                nr_alignment_temp_dirs,
+            )
+        };
+
+
+        // ================================================================
+        //
+        // Branch 1:
+        //     computational M8 stream for downstream processing
+        //
+        // Branch 2:
+        //     durable diamond.m8 artifact
+        //
+        // For the empty-input case, the clean empty stream naturally
+        // produces an empty diamond.m8.
         // ================================================================
 
         let (
-            nr_m8_rx,
-            nr_cleanup_tasks,
-            nr_cleanup_receivers,
-            mut nr_alignment_temp_dirs,
-        ) = nr_non_host_align(
-            config.clone(),
-            nr_input_path,
-            sample_base.clone(),
+            nr_m8_streams,
+            nr_m8_done_rx,
+        ) = fanout_to_channels(
+            nr_m8_stream,
+            2,
+            "nr_m8",
+            &config,
+            StreamDataType::JustBytes,
         )
-            .await?;
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
 
-        // Keep the materialized mapped-contig input alive for as long as
-        // downstream NR processing may need resources associated with this
-        // branch.
+        nr_cleanup_receivers.push(nr_m8_done_rx);
+
+        let mut nr_m8_streams =
+            nr_m8_streams.into_iter();
+
+        let nr_m8_out_stream =
+            ReceiverStream::new(
+                nr_m8_streams
+                    .next()
+                    .ok_or(PipelineError::EmptyStream)?,
+            );
+
+        let nr_m8_file_stream =
+            ReceiverStream::new(
+                nr_m8_streams
+                    .next()
+                    .ok_or(PipelineError::EmptyStream)?,
+            );
+
+
+        // ================================================================
+        // Durable diamond.m8.
+        //
+        // This is an artifact side branch. Downstream computation continues
+        // directly from nr_m8_out_stream and never reopens this file.
+        // ================================================================
+
+        let diamond_m8_path =
+            out_dir.join("diamond.m8");
+
+        let diamond_m8_write_task =
+            write_byte_stream_to_file(
+                &diamond_m8_path,
+                nr_m8_file_stream,
+                config.clone(),
+                StreamDataType::JustBytes,
+                "diamond_m8",
+                false,
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(e.to_string())
+                })?;
+
+        nr_cleanup_tasks.push(diamond_m8_write_task);
+
+
+        // ================================================================
+        // Preserve all NR scratch directories until final cleanup.
+        //
+        // nr_alignment_temp_dirs contains Diamond's scratch.
+        // nr_input_temp_dir contains the materialized mapped-contig FASTA.
+        // ================================================================
+
         nr_alignment_temp_dirs.push(nr_input_temp_dir);
 
         info!("[run] NR non-host alignment phase complete");
 
-        Ok::<_, PipelineError>((
-            ReceiverStream::new(nr_m8_rx),
+        Ok::<
+            (
+                ReceiverStream<ParseOutput>,
+                Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+                Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+                Vec<TempDir>,
+            ),
+            PipelineError,
+        >((
+            nr_m8_out_stream,
             nr_cleanup_tasks,
             nr_cleanup_receivers,
             nr_alignment_temp_dirs,
