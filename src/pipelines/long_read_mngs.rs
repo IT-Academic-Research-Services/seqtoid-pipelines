@@ -15,7 +15,7 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, AsyncWriteExt};
 use tokio::fs::File as TokioFile;
 
 use crate::config::defs::{
@@ -49,7 +49,7 @@ use crate::utils::paf::paf_to_m8;
 use crate::utils::sambam::{filter_clipped_alignments, generate_assembly_coverage, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
-                            ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines};
+                            ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines, ToBytes};
 use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::compute_buffer_size;
 use crate::utils::taxonomy::{get_top_m8_nt, get_top_m8_nr, load_lineage_and_acc2tax_maps,
@@ -70,6 +70,12 @@ struct ReadsToContigsMetadata {
     mapped_contig_ids: HashSet<String>,
     read_base_counts: HashMap<String, u64>,
     contig_to_reads: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UnmappedReadStats {
+    reads: u64,
+    bases: u64,
 }
 
 /// Validates the input FASTQ files and returns an interleaved stream of sequence records.
@@ -3415,6 +3421,248 @@ where
     ))
 }
 
+
+
+/// Native Rust equivalent of the long-read WDL UnmappedReads task.
+///
+/// Legacy semantics:
+///
+///   mapped_hits =
+///       IDs appearing in NT hit summary
+///       UNION
+///       IDs appearing in NR hit summary
+///
+///   for (read, contig) in reads_to_contigs:
+///       if read not in mapped_hits
+///          && contig not in mapped_hits:
+///           retain read
+///
+///   extract retained reads from the subsampled FASTQ and emit:
+///
+///       unmapped_reads.fastq
+///       unmapped_reads.count
+///       unmapped_bases.count
+///
+/// ReducedRead.summary contains the reassigned read ID in field 0 and the
+/// originating contig ID in field 7. Collecting both preserves the legacy
+/// read-or-contig mapped-hit test without reopening hit-summary files.
+async fn generate_unmapped_reads(
+    config: Arc<RunConfig>,
+    mut nt_pairs: ReceiverStream<ReducedRead>,
+    mut nr_pairs: ReceiverStream<ReducedRead>,
+    read2contig: &HashMap<String, String>,
+    subsampled_fastq_path: &PathBuf,
+    unmapped_fastq_path: &PathBuf,
+    unmapped_reads_count_path: &PathBuf,
+    unmapped_bases_count_path: &PathBuf,
+) -> Result<UnmappedReadStats, PipelineError> {
+
+    async fn collect_mapped_hits(
+        pairs: &mut ReceiverStream<ReducedRead>,
+        db_type: &'static str,
+    ) -> Result<HashSet<String>, PipelineError> {
+        let mut mapped_hits = HashSet::new();
+
+        while let Some(pair) = pairs.next().await {
+            let summary = std::str::from_utf8(&pair.summary)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Invalid UTF-8 in {} hit summary: {}",
+                        db_type,
+                        e
+                    ))
+                })?
+                .trim_end();
+
+            if summary.is_empty() {
+                continue;
+            }
+
+            let fields: Vec<&str> = summary.split('\t').collect();
+
+            if fields.len() < 8 {
+                return Err(PipelineError::Other(anyhow!(
+                    "Malformed {} hit summary: expected at least 8 fields, got {}",
+                    db_type,
+                    fields.len()
+                )));
+            }
+
+            // Field 0: reassigned read ID.
+            if !fields[0].is_empty() {
+                mapped_hits.insert(fields[0].to_owned());
+            }
+
+            // Field 7: originating contig ID, or "*" for a direct read hit.
+            if !fields[7].is_empty() && fields[7] != "*" {
+                mapped_hits.insert(fields[7].to_owned());
+            }
+        }
+
+        Ok(mapped_hits)
+    }
+
+    // Drain NT and NR concurrently so both fanout branches remain active.
+    let (nt_mapped_hits, nr_mapped_hits) = tokio::try_join!(
+        collect_mapped_hits(&mut nt_pairs, "NT"),
+        collect_mapped_hits(&mut nr_pairs, "NR"),
+    )?;
+
+    let mut mapped_hits = nt_mapped_hits;
+    mapped_hits.reserve(nr_mapped_hits.len());
+    mapped_hits.extend(nr_mapped_hits);
+
+    info!(
+        "[UnmappedReads] {} unique mapped read/contig IDs from NT + NR",
+        mapped_hits.len()
+    );
+
+    // Native replacement for the reads_to_contigs.tsv scan:
+    //
+    //     if read not in mapped_hits and contig not in mapped_hits:
+    //         unmapped_reads.add(read)
+    let mut unmapped_read_ids =
+        HashSet::<String>::with_capacity(read2contig.len());
+
+    for (read_id, contig_id) in read2contig {
+        if !mapped_hits.contains(read_id)
+            && !mapped_hits.contains(contig_id)
+        {
+            unmapped_read_ids.insert(read_id.clone());
+        }
+    }
+
+    info!(
+        "[UnmappedReads] {} reads selected for FASTQ extraction",
+        unmapped_read_ids.len()
+    );
+
+    // Parse the already-materialized subsampled FASTQ.
+    let input_file =
+        TokioFile::open(subsampled_fastq_path)
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed to open subsampled FASTQ {} for UnmappedReads: {}",
+                    subsampled_fastq_path.display(),
+                    e
+                ))
+            })?;
+
+    let fastq_rx =
+        parse_fastq(
+            BufReader::new(input_file),
+            &config,
+            StreamDataType::OntFastq,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to parse subsampled FASTQ for UnmappedReads: {}",
+                e
+            ))
+            })?;
+
+    let mut fastq_stream = ReceiverStream::new(fastq_rx);
+
+    let output_file =
+        TokioFile::create(unmapped_fastq_path)
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed to create {}: {}",
+                    unmapped_fastq_path.display(),
+                    e
+                ))
+            })?;
+
+    let mut writer = tokio::io::BufWriter::new(output_file);
+
+    let mut unmapped_reads: u64 = 0;
+    let mut unmapped_bases: u64 = 0;
+
+    while let Some(item) = fastq_stream.next().await {
+        let ParseOutput::Fastq(record) = item else {
+            return Err(PipelineError::Other(anyhow!(
+                "UnmappedReads expected parsed FASTQ input"
+            )));
+        };
+
+        if !unmapped_read_ids.contains(record.id()) {
+            continue;
+        }
+
+        let seq_len = record.seq().len() as u64;
+
+        // Use the repository's canonical FASTQ serialization.
+        let record_bytes =
+            record
+                .to_bytes()
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Failed to serialize unmapped FASTQ record {}: {}",
+                        record.id(),
+                        e
+                    ))
+                })?;
+
+        writer
+            .write_all(&record_bytes)
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed writing unmapped FASTQ record {}: {}",
+                    record.id(),
+                    e
+                ))
+            })?;
+
+        unmapped_reads += 1;
+        unmapped_bases += seq_len;
+    }
+
+    writer
+        .flush()
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed flushing {}: {}",
+                unmapped_fastq_path.display(),
+                e
+            ))
+        })?;
+
+    // Preserve the two filter_count-compatible WDL artifacts.
+    tokio::try_join!(
+        tokio::fs::write(
+            unmapped_reads_count_path,
+            format!("{}\n", unmapped_reads),
+        ),
+        tokio::fs::write(
+            unmapped_bases_count_path,
+            format!("{}\n", unmapped_bases),
+        ),
+    )
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed writing UnmappedReads count artifact: {}",
+                e
+            ))
+        })?;
+
+    info!(
+        "[UnmappedReads] complete: {} reads, {} bases -> {}",
+        unmapped_reads,
+        unmapped_bases,
+        unmapped_fastq_path.display()
+    );
+
+    Ok(UnmappedReadStats {
+        reads: unmapped_reads,
+        bases: unmapped_bases,
+    })
+}
+
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -4946,6 +5194,168 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // =====================================================================
+    // Fan out SummarizeHitsNT output.
+    //
+    // ReducedRead keeps the reassigned M8 row and corresponding hit-summary
+    // row together, so downstream stages that need either or both receive
+    // the same logical record.
+    //
+    // Branches:
+    //
+    //   1. UnmappedReads
+    //   2. SummarizeContigsNT
+    //   3. ComputeMergedTaxonCounts
+    //   4. GenerateAnnotatedFasta
+    //   5. GenerateTaxidFasta
+    //   6. GenerateCoverageViz
+    //   7. durable nt_m8_reassigned + nt_hit_summary artifacts
+    // =====================================================================
+
+    let (
+        nt_reassigned_streams,
+        nt_reassigned_router_done_rx,
+    ) = fanout_to_channels(
+        nt_reassigned_pairs,
+        7,
+        "long_read_nt_reassigned_pairs",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(nt_reassigned_router_done_rx);
+
+    let mut nt_reassigned_streams =
+        nt_reassigned_streams.into_iter();
+
+    let nt_pairs_for_unmapped_reads =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_pairs_for_summarize_contigs =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_pairs_for_merged_taxon_counts =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_pairs_for_annotated_fasta =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_pairs_for_taxid_fasta =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_pairs_for_coverage_viz =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_pairs_for_artifacts =
+        ReceiverStream::new(
+            nt_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // =====================================================================
+    // Fan out SummarizeHitsNR output.
+    //
+    // Branches:
+    //
+    //   1. UnmappedReads
+    //   2. SummarizeContigsNR
+    //   3. ComputeMergedTaxonCounts
+    //   4. GenerateAnnotatedFasta
+    //   5. GenerateTaxidFasta
+    //   6. durable nr_m8_reassigned + nr_hit_summary artifacts
+    //
+    // NR has no GenerateCoverageViz consumer.
+    // =====================================================================
+
+    let (
+        nr_reassigned_streams,
+        nr_reassigned_router_done_rx,
+    ) = fanout_to_channels(
+        nr_reassigned_pairs,
+        6,
+        "long_read_nr_reassigned_pairs",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(nr_reassigned_router_done_rx);
+
+    let mut nr_reassigned_streams =
+        nr_reassigned_streams.into_iter();
+
+    let nr_pairs_for_unmapped_reads =
+        ReceiverStream::new(
+            nr_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nr_pairs_for_summarize_contigs =
+        ReceiverStream::new(
+            nr_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nr_pairs_for_merged_taxon_counts =
+        ReceiverStream::new(
+            nr_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nr_pairs_for_annotated_fasta =
+        ReceiverStream::new(
+            nr_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nr_pairs_for_taxid_fasta =
+        ReceiverStream::new(
+            nr_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nr_pairs_for_artifacts =
+        ReceiverStream::new(
+            nr_reassigned_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // =====================================================================
     // FindTopHits producers awaited
     // =====================================================================
 
@@ -5039,6 +5449,51 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("[run] GenerateCoverageStats completed successfully");
 
 
+    // *******************
+    // UnmappedReads
+    // *******************
+    //
+    // Legacy WDL inputs:
+    //
+    //     input_file           = RunSubsampling.subsampled_fastq
+    //     nt_hit_summary       = SummarizeHitsNT.nt_hit_summary
+    //     nr_hit_summary       = SummarizeHitsNR.nr_hit_summary
+    //     reads_to_contigs_tsv = RunReadsToContigs.reads_to_contigs_tsv
+    //
+    // Rust equivalents:
+    //
+    //     subsampled_fastq_path
+    //     nt_pairs_for_unmapped_reads
+    //     nr_pairs_for_unmapped_reads
+    //     read2contig
+    //
+
+    let unmapped_fastq_path =
+        out_dir.join("unmapped_reads.fastq");
+
+    let unmapped_reads_count_path =
+        out_dir.join("unmapped_reads.count");
+
+    let unmapped_bases_count_path =
+        out_dir.join("unmapped_bases.count");
+
+    let unmapped_stats = generate_unmapped_reads(
+        config.clone(),
+        nt_pairs_for_unmapped_reads,
+        nr_pairs_for_unmapped_reads,
+        &read2contig,
+        &subsampled_fastq_path,
+        &unmapped_fastq_path,
+        &unmapped_reads_count_path,
+        &unmapped_bases_count_path,
+    )
+        .await?;
+
+    info!(
+        "[run] UnmappedReads completed successfully: {} reads, {} bases",
+        unmapped_stats.reads,
+        unmapped_stats.bases
+    );
 
     // *******************
     // Temporary final stream drain for construction
