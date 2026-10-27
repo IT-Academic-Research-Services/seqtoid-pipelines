@@ -14,21 +14,25 @@ use tokio::task::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::fs::File as TokioFile;
 
 use crate::config::defs::{
     PipelineError, RunConfig, PairingMode, ReadStats, StreamDataType,
     ExecutionMode,
     MINIMAP2_TAG, KALLISTO_TAG, SPADES_TAG, MAKEBLASTDB_TAG, BLASTN_TAG,
     BLASTX_TAG, SORT_TAG, SAMTOOLS_TAG, FASTP_TAG, HISAT2_TAG,
-    SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand
+    SamtoolsSubcommand, FLYE_TAG, PIGZ_TAG, SEQKIT_TAG, SeqkitSubcommand,
+    NRAlignmentBackend, DIAMOND_TAG, DiamondSubcommand
 };
 use crate::cli::args::{Technology, LibraryType};
 use crate::utils::align::{
     sharded_minimap2_align,
     Minimap2Preset,
     ShardedMinimap2Config,
+    run_diamond_single_file
 };
 use crate::utils::command::{check_versions, generate_cli};
+use crate::utils::command::diamond::{diamond_index_prep};
 use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::minimap2::{Minimap2Config};
 use crate::utils::command::samtools::{SamtoolsConfig};
@@ -42,7 +46,7 @@ use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
 use crate::utils::sambam::{filter_clipped_alignments, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
-                            ChannelReader, parse_fastq, spawn_cmd, y_junction};
+                            ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines};
 use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::compute_buffer_size;
 
@@ -2502,6 +2506,224 @@ async fn prepare_nt_alignment_inputs(
     ))
 }
 
+
+async fn nr_non_host_align(
+    config: Arc<RunConfig>,
+    assembled_reads_fa: PathBuf,
+    _sample_id: String,
+) -> Result<
+    (
+        mpsc::Receiver<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<TempDir>,
+    ),
+    PipelineError,
+> {
+    match config.execution_mode {
+        ExecutionMode::Single => {
+            match config.alignment_backend {
+                NRAlignmentBackend::Diamond => {
+                    diamond_non_host_align(
+                        config,
+                        assembled_reads_fa,
+                    )
+                        .await
+                }
+
+                NRAlignmentBackend::MmseqsCpu => {
+                    Err(PipelineError::Other(anyhow!(
+                        "MMseqs2 CPU NR alignment is not yet implemented \
+                         for the long-read pipeline"
+                    )))
+                }
+
+                NRAlignmentBackend::MmseqsGpu => {
+                    Err(PipelineError::Other(anyhow!(
+                        "MMseqs2 GPU NR alignment is not yet implemented \
+                         for the long-read pipeline"
+                    )))
+                }
+            }
+        }
+
+        ExecutionMode::Distributed => {
+            Err(PipelineError::Other(anyhow!(
+                "Distributed NR alignment is not yet implemented \
+                 for the long-read pipeline"
+            )))
+        }
+    }
+}
+
+
+async fn diamond_non_host_align(
+    config: Arc<RunConfig>,
+    assembled_reads_fa: PathBuf,
+) -> Result<
+    (
+        mpsc::Receiver<ParseOutput>,
+        Vec<JoinHandle<Result<(), anyhow::Error>>>,
+        Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<TempDir>,
+    ),
+    PipelineError,
+> {
+    let mut cleanup_tasks = Vec::new();
+    let cleanup_receivers = Vec::new();
+
+    // ================================================================
+    // Diamond scratch directory.
+    // ================================================================
+
+    let temp_dir = choose_temp_dir(
+        100_000_000_000,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        true,
+    )
+        .await?;
+
+
+    // ================================================================
+    // Resolve the prebuilt Diamond NR database.
+    //
+    // For the current Rust pipeline this is expected to be the complete
+    // prebuilt .dmnd reference, e.g.
+    //
+    //     diamond_07_22_2026.dmnd
+    //
+    // diamond_index_prep() already handles the configured reference
+    // path and returns the prefix expected by Diamond.
+    // ================================================================
+
+    let diamond_db = config
+        .args
+        .diamond_db
+        .clone()
+        .ok_or(PipelineError::MissingArgument(
+            "diamond_db required for long-read NR alignment".into(),
+        ))?;
+
+    let (db_prefix, prep_tasks) =
+        diamond_index_prep(
+            Some(diamond_db),
+            "long_read_non_host",
+        )
+            .await?;
+
+    cleanup_tasks.extend(prep_tasks);
+
+
+    // ================================================================
+    // Resource allocation.
+    //
+    // Preserve the same single-node policy used by short reads.
+    // ================================================================
+
+    let available_ram_gb =
+        config.available_ram as f64 / 1_000_000_000.0;
+
+    let threads = if available_ram_gb < 64.0 {
+        config
+            .thread_allocation(DIAMOND_TAG, None)
+            .min(6)
+            .max(1)
+    } else {
+        config.thread_allocation(DIAMOND_TAG, None)
+    };
+
+    info!(
+        "Long-read Diamond NR alignment: \
+         threads={}, query={}, db={}, tmpdir={}",
+        threads,
+        assembled_reads_fa.display(),
+        db_prefix.display(),
+        temp_dir.path().display(),
+    );
+
+
+    // ================================================================
+    // Build Diamond blastx configuration.
+    //
+    // The shared builder supplies the existing SeqtoID Diamond policy:
+    //
+    //     blastx
+    //     --mid-sensitive
+    //     --block-size <resource-derived>
+    //     -c <resource-derived>
+    //     -f 6
+    //     --tmpdir ...
+    //     --query assembled_reads_fa
+    //     --unal 0
+    //
+    // This is intentionally the same shared command construction used
+    // by short-read single-node NR alignment.
+    // ================================================================
+
+    let diamond_config =
+        crate::utils::command::diamond::build_diamond_config(
+            db_prefix,
+            assembled_reads_fa,
+            temp_dir.path().to_path_buf(),
+            threads,
+            config.available_ram,
+            None,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: DIAMOND_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+
+    // ================================================================
+    // Run Diamond.
+    //
+    // run_diamond_single_file() writes the completed M8 into temp_dir
+    // and returns its path.
+    // ================================================================
+
+    let nr_m8_path =
+        run_diamond_single_file(
+            config.clone(),
+            diamond_config,
+            &temp_dir,
+            "nr",
+        )
+            .await?;
+
+
+    // ================================================================
+    // Reopen completed M8 as the computational stream.
+    //
+    // Diamond is inherently file-backed here, so unlike minimap2 there
+    // is no benefit to pretending this boundary is streaming.
+    // ================================================================
+
+    let m8_file = TokioFile::open(&nr_m8_path)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(e.to_string())
+        })?;
+
+    let m8_rx = parse_lines(
+        m8_file,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+
+    Ok((
+        m8_rx,
+        cleanup_tasks,
+        cleanup_receivers,
+        vec![temp_dir],
+    ))
+}
 
 /// The main entry point for the long-read metagenomic NGS (mNGS) pipeline.
 ///
