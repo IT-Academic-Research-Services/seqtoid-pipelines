@@ -6325,6 +6325,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(generate_taxid_load_nr_task);
     cleanup_tasks.push(generate_taxid_main_task);
 
+    //in long reads taxid_combined_rx is not used, so drain it.
+    let taxid_combined_drain_task = tokio::spawn(async move {
+        let mut stream = ReceiverStream::new(taxid_combined_rx);
+
+        while stream.next().await.is_some() {}
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(taxid_combined_drain_task);
 
     // *******************
     // GenerateTaxidLocator
