@@ -5807,6 +5807,70 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         );
 
 
+    let nt_m8_reassigned_path =
+        out_dir.join("m8_reassigned_nt.tab");
+
+    let nt_hit_summary_path =
+        out_dir.join("gsnap.hitsummary2.tab");
+
+    let nt_artifact_task = {
+        let mut pairs = nt_pairs_for_artifacts;
+
+        tokio::spawn(async move {
+            let m8_file =
+                tokio::fs::File::create(&nt_m8_reassigned_path).await?;
+            let hit_file =
+                tokio::fs::File::create(&nt_hit_summary_path).await?;
+
+            let mut m8_writer = tokio::io::BufWriter::new(m8_file);
+            let mut hit_writer = tokio::io::BufWriter::new(hit_file);
+
+            while let Some(pair) = pairs.next().await {
+                m8_writer.write_all(&pair.dedup).await?;
+                hit_writer.write_all(&pair.summary).await?;
+            }
+
+            m8_writer.flush().await?;
+            hit_writer.flush().await?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    cleanup_tasks.push(nt_artifact_task);
+
+    let nr_m8_reassigned_path =
+        out_dir.join("m8_reassigned_nr.tab");
+
+    let nr_hit_summary_path =
+        out_dir.join("rapsearch2.hitsummary2.tab");
+
+    let nr_artifact_task = {
+        let mut pairs = nr_pairs_for_artifacts;
+
+        tokio::spawn(async move {
+            let m8_file =
+                tokio::fs::File::create(&nr_m8_reassigned_path).await?;
+            let hit_file =
+                tokio::fs::File::create(&nr_hit_summary_path).await?;
+
+            let mut m8_writer = tokio::io::BufWriter::new(m8_file);
+            let mut hit_writer = tokio::io::BufWriter::new(hit_file);
+
+            while let Some(pair) = pairs.next().await {
+                m8_writer.write_all(&pair.dedup).await?;
+                hit_writer.write_all(&pair.summary).await?;
+            }
+
+            m8_writer.flush().await?;
+            hit_writer.flush().await?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    cleanup_tasks.push(nr_artifact_task);
+
     // =====================================================================
     // FindTopHits producers awaited
     // =====================================================================
