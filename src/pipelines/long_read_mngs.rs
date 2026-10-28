@@ -49,7 +49,8 @@ use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir, resolve_optional_path, };
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
                           fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord,
-                          generate_annotated_fasta_stream, collect_hit_summary_to_accession_map_concurrent};
+                          generate_annotated_fasta_stream, collect_hit_summary_to_accession_map_concurrent,
+                          generate_taxid_fasta, generate_taxid_locator};
 use crate::utils::paf::paf_to_m8;
 use crate::utils::sambam::{filter_clipped_alignments, generate_assembly_coverage, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
@@ -6228,6 +6229,37 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(generate_annotated_cleanup_tasks);
     cleanup_receivers.extend(generate_annotated_cleanup_receivers);
+
+
+    // *******************
+    // GenerateTaxidFasta
+    // *******************
+
+    let (
+        taxid_mapped_rx,
+        taxid_combined_rx,
+        generate_taxid_load_nt_task,
+        generate_taxid_load_nr_task,
+        generate_taxid_main_task,
+    ) = generate_taxid_fasta(
+        config.clone(),
+        ReceiverStream::new(mapped_rx),
+        ReceiverStream::new(generic_unidentified_rx),
+        nt_pairs_for_taxid_fasta,
+        nr_pairs_for_taxid_fasta,
+        lineage_map.clone(),
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "GenerateTaxidFasta failed: {}",
+        e
+    ))
+        })?;
+
+    cleanup_tasks.push(generate_taxid_load_nt_task);
+    cleanup_tasks.push(generate_taxid_load_nr_task);
+    cleanup_tasks.push(generate_taxid_main_task);
 
     // *******************
     // Temporary final stream drain for construction
