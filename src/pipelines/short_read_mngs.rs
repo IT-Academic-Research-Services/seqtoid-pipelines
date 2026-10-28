@@ -9966,7 +9966,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nt_pair_rxs, nt_pairs_done_rx) = fanout_to_channels(
         nt_pairs,
-        5,
+        6,
         "nt_pairs",
         &config,
         StreamDataType::JustBytes,
@@ -10006,6 +10006,75 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .next()
             .ok_or(PipelineError::EmptyStream)?,
     );
+    let nt_pairs_artifact = ReceiverStream::new(
+        nt_pair_rxs
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    
+    let (nt_deduped_tx, nt_deduped_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    let (nt_hitsummary_tx, nt_hitsummary_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    let nt_artifact_split_task = tokio::spawn(async move {
+        let mut pairs = nt_pairs_artifact;
+
+        while let Some(pair) = pairs.next().await {
+            nt_deduped_tx
+                .send(ParseOutput::Bytes(Bytes::from(pair.dedup)))
+                .await
+                .map_err(|_| anyhow!(
+                "gsnap.deduped.m8 artifact receiver dropped"
+            ))?;
+
+            nt_hitsummary_tx
+                .send(ParseOutput::Bytes(Bytes::from(pair.summary)))
+                .await
+                .map_err(|_| anyhow!(
+                "gsnap.hitsummary.tab artifact receiver dropped"
+            ))?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(nt_artifact_split_task);
+
+    let nt_deduped_path =
+        out_dir.join("gsnap.deduped.m8");
+
+    let nt_hitsummary_path =
+        out_dir.join("gsnap.hitsummary.tab");
+
+    let nt_deduped_write_task =
+        write_byte_stream_to_file(
+            &nt_deduped_path,
+            ReceiverStream::new(nt_deduped_rx),
+            config.clone(),
+            StreamDataType::JustBytes,
+            "gsnap_deduped_m8",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let nt_hitsummary_write_task =
+        write_byte_stream_to_file(
+            &nt_hitsummary_path,
+            ReceiverStream::new(nt_hitsummary_rx),
+            config.clone(),
+            StreamDataType::JustBytes,
+            "gsnap_hitsummary",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(nt_deduped_write_task);
+    cleanup_tasks.push(nt_hitsummary_write_task);
 
     info!("[run] NT pair wiring complete");
     info!("[run] nt_pairs_taxon      -> generate_taxon_counts");
@@ -10013,6 +10082,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("[run] nt_pairs_initial    -> collect_hit_summary / initial annotate maps");
     info!("[run] nt_pairs_blast      -> blast_contigs");
     info!("[run] nt_pairs_taxid      -> generate_taxid_fasta (experimental)");
+    info!("[run] nt_pairs_artifact      -> generate_taxid_fasta (experimental)");
 
     let nt_hit_summary_handle = tokio::spawn({
         let config = config.clone();
