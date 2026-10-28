@@ -6557,7 +6557,84 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(generate_taxid_load_nr_task);
     cleanup_tasks.push(generate_taxid_main_task);
 
-    //in long reads taxid_combined_rx is not used, so drain it.
+
+    // =====================================================================
+    //
+    // taxid_mapped_rx:
+    //     branch 1 -> GenerateTaxidLocator
+    //     branch 2 -> refined_taxid_annot.fasta
+    //
+    // taxid_combined_rx has no long-read WDL consumer and remains a
+    // deliberate concurrent drain.
+    // =====================================================================
+
+    let (
+        taxid_mapped_streams,
+        taxid_mapped_router_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(taxid_mapped_rx),
+        2,
+        "long_read_taxid_mapped",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(taxid_mapped_router_done_rx);
+
+    let mut taxid_mapped_streams =
+        taxid_mapped_streams.into_iter();
+
+    let taxid_mapped_for_locator =
+        taxid_mapped_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let taxid_mapped_for_artifact =
+        ReceiverStream::new(
+            taxid_mapped_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // =====================================================================
+    // Durable GenerateTaxidFasta artifact.
+    // =====================================================================
+
+    let refined_taxid_annot_path =
+        out_dir.join("refined_taxid_annot.fasta");
+
+    let refined_taxid_annot_write_task =
+        write_byte_stream_to_file(
+            &refined_taxid_annot_path,
+            taxid_mapped_for_artifact,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "refined_taxid_annot_fasta",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(refined_taxid_annot_write_task);
+
+
+    // =====================================================================
+    // The shared helper also emits a combined stream containing:
+    //
+    //     mapped taxid-annotated records
+    //     +
+    //     conformed unidentified records
+    //
+    // The long-read WDL has no consumer for this shared-helper-only output.
+    // Drain it concurrently so the bounded channel cannot backpressure
+    // generate_taxid_fasta().
+    // =====================================================================
+
     let taxid_combined_drain_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(taxid_combined_rx);
 
@@ -6574,7 +6651,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (_taxid_locator_outputs, _, _) = generate_taxid_locator(
         config.clone(),
-        taxid_mapped_rx,
+        taxid_mapped_for_locator,
         out_dir.clone(),
     )
         .await
