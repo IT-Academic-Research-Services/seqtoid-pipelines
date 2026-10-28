@@ -2351,9 +2351,13 @@ async fn dedup(
     out_dir: PathBuf,
 ) -> Result<
     (
-        ReceiverStream<ParseOutput>,                       // uniques stream
-        oneshot::Receiver<u64>,                            // unique count rx
-        Arc<DashMap<String, ClusterInfo>>,                 // duplicate_clusters
+        ReceiverStream<ParseOutput>, // uniques stream
+        oneshot::Receiver<u64>,      // unique count rx
+
+        // Completes after all dedup workers have finished and returns the
+        // complete duplicate-cluster map.
+        JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>>,
+
         Vec<JoinHandle<Result<(), anyhow::Error>>>,        // cleanup tasks
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>, // cleanup rx
     ),
@@ -2371,21 +2375,33 @@ async fn dedup(
         config.max_cores,
         4, // min 4 workers
     );
+
     let num_shards = (num_workers * 16).max(1024);
 
-    let shards: Vec<Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>> =
-        (0..num_shards)
-            .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
-            .collect();
+    let shards: Vec<
+        Arc<Mutex<ahash::AHashMap<u64, (String, u64, Vec<String>)>>>,
+    > = (0..num_shards)
+        .map(|_| Arc::new(Mutex::new(ahash::AHashMap::new())))
+        .collect();
 
     let total_count = Arc::new(AtomicU64::new(0));
     let unique_count_atomic = Arc::new(AtomicU64::new(0));
 
-    // Channel for writing clusters.csv incrementally
+    // -----------------------------------------------------------------
+    // clusters.csv
+    //
+    // This consumer is installed immediately. Workers may therefore
+    // write cluster membership records without waiting for dedup() to
+    // return.
+    // -----------------------------------------------------------------
+
     let (csv_tx, csv_rx) =
-        mpsc::channel::<(String, String)>(config.base_buffer_size * num_workers);
+        mpsc::channel::<(String, String)>(
+            config.base_buffer_size * num_workers,
+        );
 
     let csv_path = out_dir.join("clusters.csv");
+
     let csv_task = tokio::spawn(async move {
         let mut file = BufWriter::new(
             TokioFile::create(&csv_path)
@@ -2398,194 +2414,332 @@ async fn dedup(
             .context("CSV header write failed")?;
 
         let mut rx = csv_rx;
+
         while let Some((rep, member)) = rx.recv().await {
-            file.write_all(format!("{},{}\n", rep, member).as_bytes())
+            file.write_all(
+                format!("{},{}\n", rep, member).as_bytes(),
+            )
                 .await
                 .context("CSV write failed")?;
         }
 
-        file.flush().await.context("CSV flush failed")?;
+        file.flush()
+            .await
+            .context("CSV flush failed")?;
+
         Ok(())
     });
+
     cleanup_tasks.push(csv_task);
 
+    // -----------------------------------------------------------------
+    // Unique-read output.
+    //
+    // This is the bounded computational channel that must be returned
+    // while its producers are still running.
+    // -----------------------------------------------------------------
+
     let (uniques_tx, uniques_rx) =
-        mpsc::channel::<ParseOutput>(config.base_buffer_size * num_workers);
+        mpsc::channel::<ParseOutput>(
+            config.base_buffer_size * num_workers,
+        );
 
-    let uniques_tx = Arc::new(tokio::sync::Mutex::new(uniques_tx));
+    let uniques_tx =
+        Arc::new(tokio::sync::Mutex::new(uniques_tx));
 
-    let mut worker_handles: Vec<JoinHandle<Result<(), anyhow::Error>>> =
+    // -----------------------------------------------------------------
+    // Dedup workers.
+    // -----------------------------------------------------------------
+
+    let mut worker_handles:
+        Vec<JoinHandle<Result<(), anyhow::Error>>> =
         Vec::with_capacity(num_workers);
 
-    let worker_txs: Vec<mpsc::Sender<ParseOutput>> = (0..num_workers)
-        .map(|_| {
-            let (tx, rx) = mpsc::channel(config.base_buffer_size);
+    let worker_txs: Vec<mpsc::Sender<ParseOutput>> =
+        (0..num_workers)
+            .map(|_| {
+                let (tx, rx) =
+                    mpsc::channel(config.base_buffer_size);
 
-            let csv_tx_clone = csv_tx.clone();
-            let uniques_tx_clone = uniques_tx.clone();
+                let csv_tx_clone = csv_tx.clone();
+                let uniques_tx_clone = uniques_tx.clone();
 
-            let handle = tokio::spawn(dedup_worker(
-                rx,
-                shards.clone(),
-                uniques_tx_clone,
-                csv_tx_clone,
-                paired,
-                prefix_len,
-                total_count.clone(),
-                unique_count_atomic.clone(),
-            ));
+                let handle = tokio::spawn(dedup_worker(
+                    rx,
+                    shards.clone(),
+                    uniques_tx_clone,
+                    csv_tx_clone,
+                    paired,
+                    prefix_len,
+                    total_count.clone(),
+                    unique_count_atomic.clone(),
+                ));
 
-            worker_handles.push(handle);
-            tx
-        })
-        .collect();
+                worker_handles.push(handle);
 
-    // Distributor: round-robin complete pairs to workers.
+                tx
+            })
+            .collect();
+
+    // The original uniques sender is no longer needed. Each worker owns
+    // its own Arc clone. Once all workers finish, the final sender is
+    // dropped and uniques_rx receives clean EOF.
+    drop(uniques_tx);
+
+    let (count_tx, count_rx) =
+        oneshot::channel::<u64>();
+
+    // -----------------------------------------------------------------
+    // Coordinator / finalizer.
     //
-    // The input remains interleaved:
-    //   R1, R2, R1, R2, ...
+    // CRITICAL LIFECYCLE RULE:
     //
-    // We validate the pair before sending either record to a worker.
-    let mut stream = ReceiverStream::new(input_stream);
-    let mut i = 0usize;
+    // Do not perform distribution or worker joins synchronously inside
+    // dedup(). Both can ultimately block behind the bounded uniques
+    // channel.
+    //
+    // Returning uniques_rx immediately allows the caller to install
+    // subsample_uniform_reservoir() as its concurrent consumer.
+    // -----------------------------------------------------------------
 
-    if paired {
-        while let Some(r1_item) = stream.next().await {
-            let r1 = match r1_item {
-                ParseOutput::Fastq(rec) => rec,
-                _ => {
-                    return Err(PipelineError::InvalidFastqFormat(
-                        "Unexpected non-FASTQ item in paired dedup input".to_string(),
+    let dedup_finalize_task = tokio::spawn(async move {
+        let mut stream =
+            ReceiverStream::new(input_stream);
+
+        let mut i = 0usize;
+
+        // -------------------------------------------------------------
+        // Distributor: round-robin complete pairs to workers.
+        //
+        // The input remains interleaved:
+        //
+        //   R1, R2, R1, R2, ...
+        //
+        // Validate each pair before sending either record to a worker.
+        // -------------------------------------------------------------
+
+        if paired {
+            while let Some(r1_item) = stream.next().await {
+                let r1 = match r1_item {
+                    ParseOutput::Fastq(rec) => rec,
+
+                    _ => {
+                        return Err(anyhow!(
+                            "Unexpected non-FASTQ item in paired dedup input"
+                        ));
+                    }
+                };
+
+                let r2_item =
+                    stream.next().await.ok_or_else(|| {
+                        anyhow!(
+                            "Missing R2 in paired dedup stream"
+                        )
+                    })?;
+
+                let r2 = match r2_item {
+                    ParseOutput::Fastq(rec) => rec,
+
+                    _ => {
+                        return Err(anyhow!(
+                            "Unexpected non-FASTQ R2 item in paired dedup input"
+                        ));
+                    }
+                };
+
+                if r1.id() != r2.id() {
+                    return Err(anyhow!(
+                        "Mismatched pair IDs: R1={}, R2={}",
+                        r1.id(),
+                        r2.id()
                     ));
                 }
-            };
 
-            let r2_item = stream.next().await.ok_or_else(|| {
-                PipelineError::InvalidFastqFormat(
-                    "Missing R2 in paired stream".to_string(),
-                )
-            })?;
+                let worker_tx =
+                    &worker_txs[i % num_workers];
 
-            let r2 = match r2_item {
-                ParseOutput::Fastq(rec) => rec,
-                _ => {
-                    return Err(PipelineError::InvalidFastqFormat(
-                        "Unexpected non-FASTQ R2 item in paired dedup input".to_string(),
-                    ));
-                }
-            };
+                worker_tx
+                    .send(ParseOutput::Fastq(r1))
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "Send R1 to dedup worker failed: {}",
+                            e
+                        )
+                    })?;
 
-            if r1.id() != r2.id() {
-                return Err(PipelineError::InvalidFastqFormat(format!(
-                    "Mismatched pair IDs: R1={}, R2={}",
-                    r1.id(),
-                    r2.id()
-                )));
+                worker_tx
+                    .send(ParseOutput::Fastq(r2))
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "Send R2 to dedup worker failed: {}",
+                            e
+                        )
+                    })?;
+
+                i += 1;
             }
+        } else {
+            while let Some(item) = stream.next().await {
+                let worker_tx =
+                    &worker_txs[i % num_workers];
 
-            let worker_tx = &worker_txs[i % num_workers];
+                worker_tx
+                    .send(item)
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                            "Send to dedup worker failed: {}",
+                            e
+                        )
+                    })?;
 
-            worker_tx
-                .send(ParseOutput::Fastq(r1))
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("Send R1 failed: {}", e)))?;
-
-            worker_tx
-                .send(ParseOutput::Fastq(r2))
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("Send R2 failed: {}", e)))?;
-
-            i += 1;
+                i += 1;
+            }
         }
-    } else {
-        while let Some(item) = stream.next().await {
-            let worker_tx = &worker_txs[i % num_workers];
 
-            worker_tx
-                .send(item)
+        // Input is exhausted. Close every worker input channel.
+        drop(worker_txs);
+
+        // -------------------------------------------------------------
+        // Workers can now finish.
+        //
+        // This wait is safe because uniques_rx has already been returned
+        // from dedup() and the caller has installed its consumer.
+        // -------------------------------------------------------------
+
+        for handle in worker_handles {
+            handle
                 .await
-                .map_err(|e| PipelineError::Other(anyhow!("Send failed: {}", e)))?;
-
-            i += 1;
+                .map_err(|e| {
+                    anyhow!(
+                        "Dedup worker join failed: {}",
+                        e
+                    )
+                })?
+                .context("Dedup worker error")?;
         }
-    }
 
-    drop(worker_txs);
+        // All worker-owned csv_tx clones are gone now. Drop the
+        // coordinator's original sender so clusters.csv receives EOF.
+        drop(csv_tx);
 
-    for handle in worker_handles {
-        handle
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("Worker join failed: {}", e)))?
-            .context("Worker error")?;
-    }
+        // -------------------------------------------------------------
+        // Build the complete duplicate-cluster map.
+        //
+        // Workers are finished, so the shards are now immutable.
+        // -------------------------------------------------------------
 
-    // Drop csv_tx to close csv_rx.
-    drop(csv_tx);
-
-    // Build duplicate_clusters from shards (rep_id -> ClusterInfo)
-    let duplicate_clusters = Arc::new(DashMap::with_capacity(num_shards));
-
-    for shard in &shards {
-        let guard = shard
-            .lock()
-            .map_err(|e| PipelineError::Other(anyhow!("Shard lock poisoned: {}", e)))?;
-
-        for (_, (rep_id, size, members)) in guard.iter() {
-            duplicate_clusters.insert(
-                rep_id.clone(),
-                ClusterInfo {
-                    size: *size,
-                    members: members.clone(),
-                },
+        let duplicate_clusters =
+            Arc::new(
+                DashMap::with_capacity(num_shards),
             );
+
+        for shard in &shards {
+            let guard = shard
+                .lock()
+                .map_err(|e| {
+                    anyhow!(
+                        "Shard lock poisoned: {}",
+                        e
+                    )
+                })?;
+
+            for (_, (rep_id, size, members)) in guard.iter() {
+                duplicate_clusters.insert(
+                    rep_id.clone(),
+                    ClusterInfo {
+                        size: *size,
+                        members: members.clone(),
+                    },
+                );
+            }
         }
-    }
 
-    // Write duplicate_cluster_sizes.tsv
-    let tsv_path = out_dir.join("duplicate_cluster_sizes.tsv");
-    let duplicate_clusters_clone = duplicate_clusters.clone();
+        // -------------------------------------------------------------
+        // duplicate_cluster_sizes.tsv
+        //
+        // Preserve the existing artifact, but write it here after the
+        // cluster map is complete.
+        // -------------------------------------------------------------
 
-    let tsv_task = tokio::spawn(async move {
+        let tsv_path =
+            out_dir.join("duplicate_cluster_sizes.tsv");
+
         let mut file = BufWriter::new(
             TokioFile::create(&tsv_path)
                 .await
-                .context("Failed to create duplicate_cluster_sizes.tsv")?,
+                .context(
+                    "Failed to create duplicate_cluster_sizes.tsv",
+                )?,
         );
 
-        file.write_all(b"representative read id\tcluster size\n")
+        file.write_all(
+            b"representative read id\tcluster size\n",
+        )
             .await
             .context("TSV header write failed")?;
 
-        for entry in duplicate_clusters_clone.iter() {
+        for entry in duplicate_clusters.iter() {
             let (rep_id, info) = entry.pair();
 
-            file.write_all(format!("{}\t{}\n", rep_id, info.size).as_bytes())
+            file.write_all(
+                format!(
+                    "{}\t{}\n",
+                    rep_id,
+                    info.size
+                )
+                    .as_bytes(),
+            )
                 .await
                 .context("TSV write failed")?;
         }
 
-        file.flush().await.context("TSV flush failed")?;
-        Ok(())
+        file.flush()
+            .await
+            .context("TSV flush failed")?;
+
+        // -------------------------------------------------------------
+        // Publish the final unique count.
+        // -------------------------------------------------------------
+
+        let unique_count =
+            unique_count_atomic.load(
+                AtomicOrdering::Relaxed,
+            );
+
+        count_tx
+            .send(unique_count)
+            .map_err(|_| {
+                anyhow!(
+                    "Unique count receiver dropped"
+                )
+            })?;
+
+        info!(
+            "Dedup complete: {} total records, {} unique clusters",
+            total_count.load(AtomicOrdering::Relaxed),
+            unique_count
+        );
+
+        Ok::<
+            Arc<DashMap<String, ClusterInfo>>,
+            anyhow::Error,
+        >(duplicate_clusters)
     });
-    cleanup_tasks.push(tsv_task);
 
-    let unique_count = unique_count_atomic.load(AtomicOrdering::Relaxed);
-
-    let (count_tx, count_rx) = oneshot::channel();
-    count_tx
-        .send(unique_count)
-        .map_err(|_| PipelineError::Other(anyhow!("Unique count send failed")))?;
-
-    info!(
-        "Dedup complete: {} total records, {} unique clusters",
-        total_count.load(AtomicOrdering::Relaxed),
-        unique_count
-    );
+    // -----------------------------------------------------------------
+    // Return immediately.
+    //
+    // The caller can now consume uniques_rx concurrently with the
+    // distributor/workers above.
+    // -----------------------------------------------------------------
 
     Ok((
         ReceiverStream::new(uniques_rx),
         count_rx,
-        duplicate_clusters,
+        dedup_finalize_task,
         cleanup_tasks,
         cleanup_receivers,
     ))
@@ -9257,7 +9411,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         dedup_stream,
         dedup_count_rx,
-        duplicate_clusters,
+        dedup_finalize_task,
         mut dedup_cleanup_tasks,
         mut dedup_cleanup_receivers,
     ) = dedup(
@@ -9377,6 +9531,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             Ok::<(), anyhow::Error>(())
         },
     )?;
+
+    let duplicate_clusters = dedup_finalize_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Dedup finalization task panicked: {}",
+            e
+        ))
+        })?
+        .map_err(PipelineError::Other)?;
 
     for rx in hisat2_cleanup_receivers {
         rx.await??;
