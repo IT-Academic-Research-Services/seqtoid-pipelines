@@ -4327,7 +4327,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         )
             .await
     });
-    
+
 
     // *******************
     // Subsampling Stage
@@ -6508,6 +6508,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Results retrieval
     // *******************
 
+    let validation_qc_out_dir = out_dir.clone();
+    let host_filter_out_dir = out_dir.clone();
+    let human_filter_out_dir = out_dir.clone();
+
     let validation_and_qc_fut = async move {
         let stats = join_with_error_handling(val_count_task).await?;
 
@@ -6542,6 +6546,39 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         qc_stats.bases
     );
 
+        tokio::try_join!(
+            tokio::fs::write(
+                validation_qc_out_dir.join("original_reads.count"),
+                format!("{}\n", stats.raw_reads),
+            ),
+            tokio::fs::write(
+                validation_qc_out_dir.join("original_bases.count"),
+                format!("{}\n", stats.raw_bases),
+            ),
+            tokio::fs::write(
+                validation_qc_out_dir.join("validated_reads.count"),
+                format!("{}\n", stats.validated),
+            ),
+            tokio::fs::write(
+                validation_qc_out_dir.join("validated_bases.count"),
+                format!("{}\n", stats.validated_bases),
+            ),
+            tokio::fs::write(
+                validation_qc_out_dir.join("quality_filtered_reads.count"),
+                format!("{}\n", qc_stats.reads),
+            ),
+            tokio::fs::write(
+                validation_qc_out_dir.join("quality_filtered_bases.count"),
+                format!("{}\n", qc_stats.bases),
+            ),
+        )
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed writing validation/QC count artifact: {}",
+                    e
+                ))
+            })?;
+
         Ok::<_, PipelineError>((stats, qc_stats))
     };
 
@@ -6561,6 +6598,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         stats.bases
     );
 
+        tokio::try_join!(
+            tokio::fs::write(
+                host_filter_out_dir.join("host_filtered_reads.count"),
+                format!("{}\n", stats.reads),
+            ),
+            tokio::fs::write(
+                host_filter_out_dir.join("host_filtered_bases.count"),
+                format!("{}\n", stats.bases),
+            ),
+        )
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed writing host-filter count artifact: {}",
+                    e
+                ))
+            })?;
+
         Ok::<_, PipelineError>(stats)
     };
 
@@ -6579,6 +6633,23 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         stats.reads,
         stats.bases
     );
+
+        tokio::try_join!(
+            tokio::fs::write(
+                human_filter_out_dir.join("human_filtered_reads.count"),
+                format!("{}\n", stats.reads),
+            ),
+            tokio::fs::write(
+                human_filter_out_dir.join("human_filtered_bases.count"),
+                format!("{}\n", stats.bases),
+            ),
+        )
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed writing human-filter count artifact: {}",
+                    e
+                ))
+            })?;
 
         Ok::<_, PipelineError>(stats)
     };
