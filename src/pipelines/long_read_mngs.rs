@@ -14,7 +14,7 @@ use log::{debug, info, warn};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::task::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader, AsyncWriteExt};
 use tokio::fs::File as TokioFile;
 use dashmap::DashMap;
@@ -46,6 +46,7 @@ use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::command::flye::FlyeConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
+use crate::utils::coverage_viz::generate_coverage_viz;
 use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir, resolve_optional_path, };
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
                           fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord,
@@ -4772,7 +4773,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         })
     };
 
-    cleanup_tasks.push(contig_stats_write_task);
 
 
     let contig_base_counts_write_task = {
@@ -5893,7 +5893,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         reads_to_contigs_outputs.reads_to_contigs_bam.clone(),
         mapped_contigs_fasta_path.clone(),
-        coverage_json_path,
+        coverage_json_path.clone(),
         coverage_summary_csv_path,
     )
         .await?;
@@ -6275,6 +6275,111 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .map_err(|e| {
             PipelineError::Other(anyhow!(
         "GenerateTaxidLocator failed: {}",
+        e
+    ))
+        })?;
+
+
+    // *******************
+    // GenerateCoverageViz
+    // *******************
+
+    contig_stats_write_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
+
+    let nt_info_db_path = config
+        .args
+        .nt_info_tab
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("nt_info.tab"));
+
+
+    // Adapt the paired SummarizeHitsNT output into the two byte streams
+    // expected by the shared coverage-viz implementation:
+    //
+    //   summary -> refined_gsnap_hitsummary2_tab
+    //   dedup   -> gsnap_deduped_m8
+    //
+    let (hit_summary_for_viz, m8_reassigned_for_viz) = {
+        let mut pairs = nt_pairs_for_coverage_viz;
+
+        let (hit_tx, hit_rx) = mpsc::channel(65_536);
+        let (m8_tx, m8_rx) = mpsc::channel(65_536);
+
+        let adapter_task = tokio::spawn(async move {
+            while let Some(pair) = pairs.next().await {
+                hit_tx
+                    .send(ParseOutput::Bytes(Bytes::from(pair.summary)))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                        "GenerateCoverageViz hit-summary receiver dropped"
+                    )
+                    })?;
+
+                m8_tx
+                    .send(ParseOutput::Bytes(Bytes::from(pair.dedup)))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                        "GenerateCoverageViz reassigned-M8 receiver dropped"
+                    )
+                    })?;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        cleanup_tasks.push(adapter_task);
+
+        (hit_rx, m8_rx)
+    };
+
+
+    // generate_coverage_viz currently expects the top-M8 input as an
+    // UnboundedReceiverStream. Adapt the existing bounded computational
+    // branch without reopening the durable gsnap.blast.top.m8 artifact.
+    let (top_m8_tx, top_m8_rx) = mpsc::unbounded_channel();
+
+    let top_m8_adapter_task = tokio::spawn(async move {
+        let mut stream = nt_top_m8_for_coverage;
+
+        while let Some(item) = stream.next().await {
+            top_m8_tx
+                .send(item)
+                .map_err(|_| {
+                    anyhow!(
+                    "GenerateCoverageViz top-M8 receiver dropped"
+                )
+                })?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(top_m8_adapter_task);
+
+
+    generate_coverage_viz(
+        ReceiverStream::new(hit_summary_for_viz),
+        UnboundedReceiverStream::new(top_m8_rx),
+        coverage_json_path.clone(),
+        contig_stats_path.clone(),
+        flye_assembly_path.clone(),
+        ReceiverStream::new(m8_reassigned_for_viz),
+        nt_info_db_path,
+        out_dir.clone(),
+        None,
+        None,
+        None,
+        false,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "GenerateCoverageViz failed: {}",
         e
     ))
         })?;
