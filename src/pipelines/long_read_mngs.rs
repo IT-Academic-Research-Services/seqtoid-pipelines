@@ -46,14 +46,15 @@ use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
 use crate::utils::command::flye::FlyeConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
-use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir, resolve_optional_path};
+use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte_stream_to_file, choose_temp_dir, resolve_optional_path, };
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
-                          fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord};
+                          fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord,
+                          generate_annotated_fasta_stream, collect_hit_summary_to_accession_map_concurrent};
 use crate::utils::paf::paf_to_m8;
 use crate::utils::sambam::{filter_clipped_alignments, generate_assembly_coverage, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
                             stream_to_cmd, parse_child_output, ChildStream, ParseMode,
-                            ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines, ToBytes};
+                            ChannelReader, parse_fastq, spawn_cmd, y_junction, parse_lines, ToBytes, parse_fasta};
 use crate::utils::subsample::subsample_uniform_reservoir;
 use crate::utils::system::compute_buffer_size;
 use crate::utils::taxonomy::{get_top_m8_nt, get_top_m8_nr, load_lineage_and_acc2tax_maps,
@@ -4386,7 +4387,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    cleanup_tasks.push(pre_assembly_fasta_write_task);
 
 
     // Materialize the subsampled FASTQ into scratch.
@@ -6172,6 +6172,62 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     combined_contig_summary.len(),
     combined_contig_summary_path.display(),
 );
+
+
+    // *******************
+    // GenerateAnnotatedFASTA
+    // *******************
+
+    // Build the small accession maps for NT/NR in parallel
+    let (nt_pairs_map, nr_pairs_map) = tokio::try_join!(
+        collect_hit_summary_to_accession_map_concurrent(config.clone(), nt_pairs_for_annotated_fasta),
+        collect_hit_summary_to_accession_map_concurrent(config.clone(), nr_pairs_for_annotated_fasta)
+    )?;
+
+    pre_assembly_fasta_write_task
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))??;
+
+    let pre_assembly_file = tokio::fs::File::open(&pre_assembly_fasta_path)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Failed to open pre-assembly FASTA {}: {}",
+            pre_assembly_fasta_path.display(),
+            e
+        ))
+        })?;
+
+    let pre_assembly_rx = parse_fasta(
+        pre_assembly_file,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "Failed to parse pre-assembly FASTA: {}",
+        e
+    ))
+        })?;
+
+    let pre_assembly_stream = ReceiverStream::new(pre_assembly_rx);
+
+    let (
+        mapped_rx,
+        generic_unidentified_rx,
+        generate_annotated_cleanup_tasks,
+        generate_annotated_cleanup_receivers,
+    ) = generate_annotated_fasta_stream(
+        config.clone(),
+        pre_assembly_stream,
+        nt_pairs_map,
+        nr_pairs_map,
+    )
+        .await?;
+
+    cleanup_tasks.extend(generate_annotated_cleanup_tasks);
+    cleanup_receivers.extend(generate_annotated_cleanup_receivers);
 
     // *******************
     // Temporary final stream drain for construction
