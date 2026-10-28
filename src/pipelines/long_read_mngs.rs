@@ -6340,7 +6340,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // GenerateTaxidLocator
     // *******************
 
-    let (taxid_locator_outputs, _, _) = generate_taxid_locator(
+    let (_taxid_locator_outputs, _, _) = generate_taxid_locator(
         config.clone(),
         taxid_mapped_rx,
         out_dir.clone(),
@@ -6457,20 +6457,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         e
     ))
         })?;
-
-    // *******************
-    // Temporary final stream drain for construction
-    // *******************
-
-
-    // let mut final_temp_drain_stream = nt_alignment_input_stream;
-    //
-    // let final_temp_drain_task = tokio::spawn(async move {
-    //     while final_temp_drain_stream.next().await.is_some() {}
-    //     Ok::<(), anyhow::Error>(())
-    // });
-    //
-    // cleanup_tasks.push(final_temp_drain_task);
 
 
     // *******************
