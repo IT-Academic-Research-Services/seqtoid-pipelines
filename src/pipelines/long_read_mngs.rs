@@ -4463,7 +4463,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         assembly_temp_dir.path().join("temp_flye_out");
 
     let subsampled_fastq_path =
-        assembly_temp_dir.path().join("subsampled.fastq");
+        out_dir.join("sample.subsampled.fastq");
 
     final_temp_dirs.push(assembly_temp_dir);
 
