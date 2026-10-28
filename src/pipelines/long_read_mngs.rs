@@ -4266,7 +4266,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     final_temp_dirs.extend(human_temp_dir);
 
     // Human filter output remains raw FASTQ bytes through both minimap2 stages.
-    // Parse only once here because reservoir sampling operates on FASTQ records.
+    // Parse only once here because both ReadLengthMetrics and reservoir sampling
+    // operate on FASTQ records.
     let human_filtered_byte_reader =
         ChannelReader::new(human_filter_out_stream.into_inner());
 
@@ -4276,13 +4277,57 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::OntFastq,
     )
         .await
-        .map_err(|e| PipelineError::Other(anyhow!(
-    "Failed to parse human-filtered FASTQ stream: {}",
-    e
-)))?;
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "Failed to parse human-filtered FASTQ stream: {}",
+        e
+    ))
+        })?;
 
     let human_filtered_fastq_stream =
         ReceiverStream::new(human_filtered_fastq_rx);
+
+
+    // *******************
+    // ReadLengthMetrics fanout
+    // *******************
+
+    let (
+        human_filtered_streams,
+        human_filtered_router_done_rx,
+    ) = fanout_to_channels(
+        human_filtered_fastq_stream,
+        2,
+        "human_filtered_read_length_metrics",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(human_filtered_router_done_rx);
+
+    let mut human_filtered_streams =
+        human_filtered_streams.into_iter();
+
+    let human_filtered_for_subsampling =
+        human_filtered_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let human_filtered_for_read_length_metrics =
+        human_filtered_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let read_length_metrics_task = tokio::spawn(async move {
+        stream_record_counter(
+            human_filtered_for_read_length_metrics,
+            false,
+        )
+            .await
+    });
+    
 
     // *******************
     // Subsampling Stage
@@ -4297,7 +4342,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         subsample_task,
     ) = subsample_uniform_reservoir(
         config.clone(),
-        human_filtered_fastq_stream.into_inner(),
+        human_filtered_for_subsampling,
         config.args.max_subsample as u64,
         false,
     )
@@ -6500,11 +6545,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Ok::<_, PipelineError>((stats, qc_stats))
     };
 
-
     let host_filter_stats_fut = async move {
         let stats = host_filter_stats
             .await
-            .map_err(|e| PipelineError::Other(anyhow!("Host filter stats channel failed: {}", e)))?;
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Host filter stats channel failed: {}",
+                e
+            ))
+            })?;
 
         info!(
         "Host filter: {} reads, {} bases",
@@ -6518,7 +6567,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let human_filter_stats_fut = async move {
         let stats = human_filter_stats
             .await
-            .map_err(|e| PipelineError::Other(anyhow!("Human filter stats channel failed: {}", e)))?;
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Human filter stats channel failed: {}",
+                e
+            ))
+            })?;
 
         info!(
         "Human filter: {} reads, {} bases",
@@ -6529,8 +6583,39 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Ok::<_, PipelineError>(stats)
     };
 
-    let subsample_counts_fut = async move {
+    let read_length_metrics_fut = async move {
+        let stats = read_length_metrics_task
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "ReadLengthMetrics task panicked: {}",
+                e
+            ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "ReadLengthMetrics failed: {}",
+                e
+            ))
+            })?;
 
+        info!(
+        "Read length metrics: {} reads, {} bases, mean {:.2}, min {}, max {}, median {:.2}, mode {}, stddev {:.2}, MAD {:.2}",
+        stats.reads,
+        stats.bases,
+        stats.mean,
+        stats.min,
+        stats.max,
+        stats.median,
+        stats.mode,
+        stats.std_deviation,
+        stats.mean_absolute_deviation,
+    );
+
+        Ok::<_, PipelineError>(stats)
+    };
+
+    let subsample_counts_fut = async move {
         let subsample_count = subsample_count_rx
             .await
             .map_err(|e| {
@@ -6540,29 +6625,30 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ))
             })?;
 
-
         info!(
         "Subsampled reads (pairs counted separately): {}",
         subsample_count
     );
 
-        Ok::<_, PipelineError>((
-            subsample_count,
-        ))
+        Ok::<_, PipelineError>((subsample_count,))
     };
 
-
     let (
-        (_validation_stats, _qc_stats), _host_filter_stats,
+        (_validation_stats, _qc_stats),
+        _host_filter_stats,
         human_filtered_stats,
+        read_length_metrics,
         _subsample_stats,
     ) = tokio::try_join!(
-    validation_and_qc_fut, host_filter_stats_fut,
+    validation_and_qc_fut,
+    host_filter_stats_fut,
     human_filter_stats_fut,
-    subsample_counts_fut
+    read_length_metrics_fut,
+    subsample_counts_fut,
 )?;
 
     info!("Human filtered stats: {:?}", human_filtered_stats);
+    info!("Read length metrics: {:?}", read_length_metrics);
 
     // *******************
     // Cleanup
