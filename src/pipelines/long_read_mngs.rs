@@ -6570,6 +6570,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_filter_out_dir = out_dir.clone();
     let human_filter_out_dir = out_dir.clone();
     let subsample_out_dir = out_dir.clone();
+    let read_length_metrics_out_dir = out_dir.clone();
 
     let validation_and_qc_fut = async move {
         let stats = join_with_error_handling(val_count_task).await?;
@@ -6741,6 +6742,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         stats.std_deviation,
         stats.mean_absolute_deviation,
     );
+
+        let read_length_metrics_json = serde_json::json!({
+        "read_length_median": stats.median,
+        "read_length_mode": stats.mode,
+        "read_length_absolute_deviation": stats.mean_absolute_deviation,
+        "read_length_min": stats.min,
+        "read_length_max": stats.max,
+        "read_length_mean": stats.mean,
+        "read_length_standard_deviation": stats.std_deviation,
+    });
+
+        tokio::fs::write(
+            read_length_metrics_out_dir.join("read_length_metrics.json"),
+            serde_json::to_vec(&read_length_metrics_json)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                    "Failed serializing read_length_metrics.json: {}",
+                    e
+                ))
+                })?,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed writing read_length_metrics.json: {}",
+                    e
+                ))
+            })?;
 
         Ok::<_, PipelineError>(stats)
     };
