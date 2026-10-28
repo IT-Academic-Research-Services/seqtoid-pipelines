@@ -6227,8 +6227,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // operates directly on the typed computational results rather than reopening
     // the three JSON artifacts.
 
+
+    let assembly_out_dir =
+        out_dir.join("assembly");
+
+    tokio::fs::create_dir_all(&assembly_out_dir)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to create assembly output directory {}: {}",
+                assembly_out_dir.display(),
+                e
+            ))
+        })?;
+
     let taxon_counts_path =
-        out_dir.join("taxon_counts.json");
+        assembly_out_dir.join("refined_taxon_counts_with_dcr.json");
 
     let (
         _taxon_counts_path,
@@ -6247,28 +6261,17 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ))
         })?;
 
-    // taxon_counts.json is a durable artifact. The computational inputs have
-    // already been consumed into the serialized payload, so its filesystem write
-    // does not need to block construction of downstream stages.
+    // refined_taxon_counts_with_dcr.json is a durable artifact. The computational
+    // inputs have already been consumed into the serialized payload, so its
+    // filesystem write does not need to block construction of downstream stages.
     cleanup_tasks.push(taxon_counts_write_task);
 
     info!(
-    "[run] CombineTaxonCounts completed; taxon_counts.json write started"
+    "[run] CombineTaxonCounts completed; \
+     assembly/refined_taxon_counts_with_dcr.json write started"
 );
 
 
-    let assembly_out_dir =
-        out_dir.join("assembly");
-
-    tokio::fs::create_dir_all(&assembly_out_dir)
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "Failed to create assembly output directory {}: {}",
-                assembly_out_dir.display(),
-                e
-            ))
-        })?;
 
     // *******************
     // CombineJson
