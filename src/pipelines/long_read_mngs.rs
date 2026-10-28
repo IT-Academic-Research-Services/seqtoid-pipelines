@@ -6652,7 +6652,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (_taxid_locator_outputs, _, _) = generate_taxid_locator(
         config.clone(),
         taxid_mapped_for_locator,
-        out_dir.clone(),
+        assembly_out_dir.clone(),
     )
         .await
         .map_err(|e| {
