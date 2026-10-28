@@ -4266,10 +4266,67 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     final_temp_dirs.extend(human_temp_dir);
 
     // Human filter output remains raw FASTQ bytes through both minimap2 stages.
-    // Parse only once here because both ReadLengthMetrics and reservoir sampling
-    // operate on FASTQ records.
+    //
+    // Fan out the raw FASTQ byte stream before parsing:
+    //
+    //   1. computational branch -> parse_fastq -> ReadLengthMetrics/subsampling
+    //   2. artifact branch      -> sample.humanfiltered.fastq
+    //
+    // This preserves the existing computational path and avoids an unnecessary
+    // FASTQ parse/serialize cycle for the durable WDL output artifact.
+    let (
+        human_filter_byte_streams,
+        human_filter_byte_router_done_rx,
+    ) = fanout_to_channels(
+        human_filter_out_stream,
+        2,
+        "human_filter_output",
+        &config,
+        StreamDataType::OntFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(human_filter_byte_router_done_rx);
+
+    let mut human_filter_byte_streams =
+        human_filter_byte_streams.into_iter();
+
+    let human_filtered_for_computation =
+        ReceiverStream::new(
+            human_filter_byte_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let human_filtered_for_artifact =
+        ReceiverStream::new(
+            human_filter_byte_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let human_filter_fastq_path =
+        out_dir.join("sample.humanfiltered.fastq");
+
+    let human_filter_fastq_write_task =
+        write_byte_stream_to_file(
+            &human_filter_fastq_path,
+            human_filtered_for_artifact,
+            config.clone(),
+            StreamDataType::OntFastq,
+            "human_filter_fastq",
+            false,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(human_filter_fastq_write_task);
+
+    // Parse only the computational branch. ReadLengthMetrics and reservoir
+    // sampling continue to receive structured FASTQ records exactly as before.
     let human_filtered_byte_reader =
-        ChannelReader::new(human_filter_out_stream.into_inner());
+        ChannelReader::new(human_filtered_for_computation.into_inner());
 
     let human_filtered_fastq_rx = parse_fastq(
         human_filtered_byte_reader,
