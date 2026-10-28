@@ -6536,10 +6536,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // =====================================================================
 
     let annotated_fasta_path =
-        out_dir.join("sample.annotated.fasta");
+        out_dir.join("refined_annotated_merged.fa");
 
     let unidentified_fasta_path =
-        out_dir.join("sample.unidentified.fasta");
+        out_dir.join("refined_unidentified.fa");
 
 
     let annotated_fasta_write_task =
