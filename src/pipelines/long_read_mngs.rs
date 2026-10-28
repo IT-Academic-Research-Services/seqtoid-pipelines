@@ -5353,6 +5353,52 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
 
+
+    // =====================================================================
+    // Fan out the original NT M8 stream.
+    //
+    // WDL consumers of RunNTAlignment.nt_m8:
+    //
+    //   1. FindTopHitsNT
+    //   2. GenerateCoverageViz as gsnap_deduped_m8
+    //
+    // GenerateCoverageViz specifically requires the original NT alignment
+    // rather than the reassigned M8 emitted later by SummarizeHitsNT.
+    // =====================================================================
+
+    let (
+        nt_m8_streams,
+        nt_m8_router_done_rx,
+    ) = fanout_to_channels(
+        nt_m8_stream,
+        2,
+        "long_read_nt_m8",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(nt_m8_router_done_rx);
+
+    let mut nt_m8_streams =
+        nt_m8_streams.into_iter();
+
+    let nt_m8_for_find_top_hits =
+        ReceiverStream::new(
+            nt_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+    let nt_m8_for_coverage_viz =
+        ReceiverStream::new(
+            nt_m8_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
     // ---------------------------------------------------------------------
     // Transfer branch-owned resources to run-level cleanup.
     // ---------------------------------------------------------------------
@@ -5406,7 +5452,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         let nt_top_hits_task = tokio::spawn(async move {
             get_top_m8_nt(
-                nt_m8_stream,
+                nt_m8_for_find_top_hits,
                 nt_top_m8_tx,
                 1,
                 0,
@@ -5819,7 +5865,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .ok_or(PipelineError::EmptyStream)?,
         );
 
-    let nt_pairs_for_coverage_viz =
+    let nt_pairs_for_coverage_viz_hit_summary =
         ReceiverStream::new(
             nt_reassigned_streams
                 .next()
@@ -6682,35 +6728,29 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .unwrap_or_else(|| PathBuf::from("nt_info.tab"));
 
 
-    // Adapt the paired SummarizeHitsNT output into the two byte streams
-    // expected by the shared coverage-viz implementation:
-    //
-    //   summary -> refined_gsnap_hitsummary2_tab
-    //   dedup   -> gsnap_deduped_m8
-    //
-    let (hit_summary_for_viz, m8_reassigned_for_viz) = {
-        let mut pairs = nt_pairs_for_coverage_viz;
 
-        let (hit_tx, hit_rx) = mpsc::channel(65_536);
-        let (m8_tx, m8_rx) = mpsc::channel(65_536);
+    // Adapt the SummarizeHitsNT output into the hit-summary byte stream
+    // expected by GenerateCoverageViz.
+    //
+    // The gsnap_deduped_m8 input is supplied separately from the original
+    // RunNTAlignment NT M8 stream retained above.
+    let hit_summary_for_viz = {
+        let mut pairs =
+            nt_pairs_for_coverage_viz_hit_summary;
+
+        let (hit_tx, hit_rx) =
+            mpsc::channel(65_536);
 
         let adapter_task = tokio::spawn(async move {
             while let Some(pair) = pairs.next().await {
                 hit_tx
-                    .send(ParseOutput::Bytes(Bytes::from(pair.summary)))
+                    .send(ParseOutput::Bytes(
+                        Bytes::from(pair.summary)
+                    ))
                     .await
                     .map_err(|_| {
                         anyhow!(
                         "GenerateCoverageViz hit-summary receiver dropped"
-                    )
-                    })?;
-
-                m8_tx
-                    .send(ParseOutput::Bytes(Bytes::from(pair.dedup)))
-                    .await
-                    .map_err(|_| {
-                        anyhow!(
-                        "GenerateCoverageViz reassigned-M8 receiver dropped"
                     )
                     })?;
             }
@@ -6720,7 +6760,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         cleanup_tasks.push(adapter_task);
 
-        (hit_rx, m8_rx)
+        hit_rx
     };
 
 
@@ -6754,7 +6794,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         coverage_json_path.clone(),
         contig_stats_path.clone(),
         flye_assembly_path.clone(),
-        ReceiverStream::new(m8_reassigned_for_viz),
+        nt_m8_for_coverage_viz,
         nt_info_db_path,
         out_dir.clone(),
         None,
