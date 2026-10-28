@@ -6261,6 +6261,24 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_tasks.push(generate_taxid_load_nr_task);
     cleanup_tasks.push(generate_taxid_main_task);
 
+
+    // *******************
+    // GenerateTaxidLocator
+    // *******************
+
+    let (taxid_locator_outputs, _, _) = generate_taxid_locator(
+        config.clone(),
+        taxid_mapped_rx,
+        out_dir.clone(),
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "GenerateTaxidLocator failed: {}",
+        e
+    ))
+        })?;
+
     // *******************
     // Temporary final stream drain for construction
     // *******************
