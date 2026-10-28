@@ -10012,7 +10012,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .ok_or(PipelineError::EmptyStream)?,
     );
 
-    
+
     let (nt_deduped_tx, nt_deduped_rx) =
         mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
@@ -10082,7 +10082,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("[run] nt_pairs_initial    -> collect_hit_summary / initial annotate maps");
     info!("[run] nt_pairs_blast      -> blast_contigs");
     info!("[run] nt_pairs_taxid      -> generate_taxid_fasta (experimental)");
-    info!("[run] nt_pairs_artifact      -> generate_taxid_fasta (experimental)");
+    info!("[run] nt_pairs_artifact   -> gsnap.deduped.m8 + gsnap.hitsummary.tab");
 
     let nt_hit_summary_handle = tokio::spawn({
         let config = config.clone();
@@ -10227,6 +10227,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
     let nr_pairs_taxid_initial =
         ReceiverStream::new(nr_pair_rxs_iter.next().ok_or(PipelineError::EmptyStream)?);
+    let nr_pairs_artifact =
+        ReceiverStream::new(
+            nr_pair_rxs_iter
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
 
     info!("[run] NR pair wiring complete");
     info!("[run] nr_pairs_taxon     -> generate_taxon_counts");
@@ -10234,7 +10240,75 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("[run] nr_pairs_initial   -> initial accession map");
     info!("[run] nr_pairs_blast     -> blast_contigs");
     info!("[run] nr_pairs_taxid     -> generate_taxid_fasta");
+    info!("[run] nr_pairs_artifact     -> dedup and hitsummary ");
 
+
+    let (nr_deduped_tx, nr_deduped_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    let (nr_hitsummary_tx, nr_hitsummary_rx) =
+        mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+    let nr_artifact_split_task = tokio::spawn(async move {
+        let mut pairs = nr_pairs_artifact;
+
+        while let Some(pair) = pairs.next().await {
+            nr_deduped_tx
+                .send(ParseOutput::Bytes(Bytes::from(pair.dedup)))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                    "rapsearch2.deduped.m8 artifact receiver dropped"
+                )
+                })?;
+
+            nr_hitsummary_tx
+                .send(ParseOutput::Bytes(Bytes::from(pair.summary)))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                    "rapsearch2.hitsummary.tab artifact receiver dropped"
+                )
+                })?;
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(nr_artifact_split_task);
+
+    let nr_deduped_path =
+        out_dir.join("rapsearch2.deduped.m8");
+
+    let nr_hitsummary_path =
+        out_dir.join("rapsearch2.hitsummary.tab");
+
+    let nr_deduped_write_task =
+        write_byte_stream_to_file(
+            &nr_deduped_path,
+            ReceiverStream::new(nr_deduped_rx),
+            config.clone(),
+            StreamDataType::JustBytes,
+            "rapsearch2_deduped_m8",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    let nr_hitsummary_write_task =
+        write_byte_stream_to_file(
+            &nr_hitsummary_path,
+            ReceiverStream::new(nr_hitsummary_rx),
+            config.clone(),
+            StreamDataType::JustBytes,
+            "rapsearch2_hitsummary",
+            true,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+
+    cleanup_tasks.push(nr_deduped_write_task);
+    cleanup_tasks.push(nr_hitsummary_write_task);
 
     let nr_hit_summary_handle = tokio::spawn(summarize_hits(
         config.clone(),
