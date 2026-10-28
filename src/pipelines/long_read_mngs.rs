@@ -4396,6 +4396,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         subsampled_stream,
         subsample_count_rx,
+        subsample_bases_rx,
         subsample_task,
     ) = subsample_uniform_reservoir(
         config.clone(),
@@ -6568,6 +6569,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let validation_qc_out_dir = out_dir.clone();
     let host_filter_out_dir = out_dir.clone();
     let human_filter_out_dir = out_dir.clone();
+    let subsample_out_dir = out_dir.clone();
 
     let validation_and_qc_fut = async move {
         let stats = join_with_error_handling(val_count_task).await?;
@@ -6744,21 +6746,56 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
     let subsample_counts_fut = async move {
-        let subsample_count = subsample_count_rx
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                "Subsample count receiver failed: {}",
-                e
-            ))
-            })?;
+        let (subsample_count, subsample_bases) = tokio::try_join!(
+        async {
+            subsample_count_rx
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Subsample count receiver failed: {}",
+                        e
+                    ))
+                })
+        },
+        async {
+            subsample_bases_rx
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "Subsample base count receiver failed: {}",
+                        e
+                    ))
+                })
+        },
+    )?;
 
         info!(
-        "Subsampled reads (pairs counted separately): {}",
-        subsample_count
+        "Subsampled output: {} reads, {} bases",
+        subsample_count,
+        subsample_bases
     );
 
-        Ok::<_, PipelineError>((subsample_count,))
+        tokio::try_join!(
+        tokio::fs::write(
+            subsample_out_dir.join("subsampled_reads.count"),
+            format!("{}\n", subsample_count),
+        ),
+        tokio::fs::write(
+            subsample_out_dir.join("subsampled_bases.count"),
+            format!("{}\n", subsample_bases),
+        ),
+    )
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed writing subsampling count artifact: {}",
+                    e
+                ))
+            })?;
+
+        Ok::<_, PipelineError>((
+            subsample_count,
+            subsample_bases,
+        ))
     };
 
     let (

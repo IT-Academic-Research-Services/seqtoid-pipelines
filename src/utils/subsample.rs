@@ -282,6 +282,7 @@ pub async fn subsample_uniform(
     ))
 }
 
+
 /// Uniformly subsample FASTQ records using reservoir sampling.
 ///
 /// Sampling units:
@@ -308,6 +309,7 @@ pub async fn subsample_uniform_reservoir(
 ) -> anyhow::Result<(
     ReceiverStream<ParseOutput>,
     tokio::sync::oneshot::Receiver<u64>,
+    tokio::sync::oneshot::Receiver<u64>,
     JoinHandle<anyhow::Result<()>>,
 )> {
     struct SampleUnit {
@@ -325,6 +327,7 @@ pub async fn subsample_uniform_reservoir(
 
     let (tx, rx) = mpsc::channel(config.base_buffer_size);
     let (count_tx, count_rx) = tokio::sync::oneshot::channel();
+    let (base_count_tx, base_count_rx) = tokio::sync::oneshot::channel();
 
     let task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(input_rx);
@@ -446,14 +449,34 @@ pub async fn subsample_uniform_reservoir(
         }
 
         // -------------------------------------------------------------
-        // Emit selected units.
+        // Emit selected units and count their bases.
+        //
+        // Base counting is performed directly from each selected FASTQ
+        // record already held in the reservoir. No FASTQ reread or
+        // parse/serialize cycle is required.
         //
         // In PE mode both records are emitted consecutively, so a pair
         // can never be split by the sampler.
         // -------------------------------------------------------------
 
+        let mut sampled_bases = 0u64;
+
         for unit in reservoir {
             for record in unit.records {
+                match &record {
+                    ParseOutput::Fastq(sequence_record) => {
+                        sampled_bases += sequence_record.seq().len() as u64;
+                    }
+
+                    other => {
+                        return Err(anyhow!(
+                            "subsample_uniform_reservoir: \
+                             unexpected non-FASTQ reservoir item: {:?}",
+                            other
+                        ));
+                    }
+                }
+
                 tx.send(record)
                     .await
                     .map_err(|_| {
@@ -465,17 +488,23 @@ pub async fn subsample_uniform_reservoir(
             }
         }
 
+        // Base count is optional metadata. Some callers (for example the
+        // short-read pipeline) do not consume it, so a dropped receiver is
+        // expected and should not produce a warning.
+        let _ = base_count_tx.send(sampled_bases);
+
         let sampled_records =
             sampled_units * if paired { 2 } else { 1 };
 
         info!(
             "Uniform reservoir subsampling processed {} records \
              ({} logical units), sampled {} records \
-             ({} logical units)",
+             ({} logical units, {} bases)",
             total_records,
             total_units,
             sampled_records,
-            sampled_units
+            sampled_units,
+            sampled_bases
         );
 
         Ok(())
@@ -484,6 +513,7 @@ pub async fn subsample_uniform_reservoir(
     Ok((
         ReceiverStream::new(rx),
         count_rx,
+        base_count_rx,
         task,
     ))
 }

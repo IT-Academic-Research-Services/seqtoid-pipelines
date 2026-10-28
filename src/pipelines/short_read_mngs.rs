@@ -9278,6 +9278,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         subsampled_stream,
         subsample_count_rx,
+        _subsample_base_rx,
         subsample_send_task,
     ) = subsample_uniform_reservoir(
         config.clone(),
