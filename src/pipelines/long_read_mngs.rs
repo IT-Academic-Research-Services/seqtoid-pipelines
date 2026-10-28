@@ -4641,13 +4641,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_receivers.push(mapped_contigs_fasta_router_done_rx);
 
-    let mut mapped_contigs_fasta__streams_iter = mapped_contigs_fasta_streams.into_iter();
+    let mut mapped_contigs_fasta_streams_iter = mapped_contigs_fasta_streams.into_iter();
 
     let nt_mapped_contigs_fasta_out_stream =
-        ReceiverStream::new(mapped_contigs_fasta__streams_iter .next().ok_or(PipelineError::EmptyStream)?);
+        ReceiverStream::new(mapped_contigs_fasta_streams_iter .next().ok_or(PipelineError::EmptyStream)?);
 
     let nr_mapped_contigs_fasta_file_stream =
-        ReceiverStream::new(mapped_contigs_fasta__streams_iter .next().ok_or(PipelineError::EmptyStream)?);
+        ReceiverStream::new(mapped_contigs_fasta_streams_iter .next().ok_or(PipelineError::EmptyStream)?);
 
 
 
