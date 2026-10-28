@@ -9656,14 +9656,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         )
             .await?;
 
-        let nt_m8_file_path = out_dir.join(
-            rename_file_path(
-                &sample_base_buf,
-                None,
-                Some("nt.m8"),
-                ".",
-            ),
-        );
+        let nt_m8_file_path = out_dir.join("gsnap.m8");
 
         let (
             m8_stream,
@@ -9793,14 +9786,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .ok_or(PipelineError::EmptyStream)?,
         );
 
-        let nr_m8_file_path = out_dir.join(
-            rename_file_path(
-                &sample_base_buf,
-                None,
-                Some("nr.m8"),
-                ".",
-            ),
-        );
+        let nr_m8_file_path = out_dir.join("rapsearch2.m8");
 
         let write_task = write_byte_stream_to_file(
             &nr_m8_file_path,
