@@ -40,7 +40,7 @@ use crate::config::defs::{
 use crate::utils::file::extension_remover;
 use crate::utils::sequence::{normal_phred_qual_string, DNA};
 use crate::utils::streams::{ParseOutput, ToBytes, batch_rayon_process, ChannelReader};
-use crate::utils::system::compute_phase_concurrency;
+use crate::utils::system::{compute_batch_size, compute_phase_concurrency};
 use crate::utils::taxonomy::get_taxid;
 use crate::utils::taxonomy::{combine_taxon_loc_json, get_valid_lineage};
 
@@ -3689,6 +3689,120 @@ pub async fn fastq_bytes_to_fasta_stream(
         ReceiverStream::new(rx),
         task,
     ))
+}
+
+/// Collects ReducedRead hit-summary records into:
+///
+///     read_id -> accession
+///
+/// The ReducedRead stream is expected to have already undergone any
+/// pipeline-specific reassignment/propagation.
+pub async fn collect_hit_summary_to_accession_map_concurrent(
+    config: Arc<RunConfig>,
+    mut pairs: ReceiverStream<ReducedRead>,
+) -> Result<AHashMap<String, String>> {
+    let concurrency =
+        compute_phase_concurrency(&config, "accession_map_final_merge", 0.2, 4.0, 32, 4);
+    let batch_size = compute_batch_size(None, 1024, 512, concurrency);
+
+    // Batch of (read_id, accession) already extracted — workers only insert
+    let (job_tx, job_rx) = mpsc::channel::<Vec<(String, String)>>(concurrency);
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(job_rx));
+
+    let mut worker_handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let rx = shared_rx.clone();
+        let handle = tokio::spawn(async move {
+            let mut partial = AHashMap::with_capacity(batch_size);
+            while let Some(batch) = {
+                let mut g = rx.lock().await;
+                g.recv().await
+            } {
+                for (k, v) in batch {
+                    partial.insert(k, v);
+                }
+            }
+            Ok::<AHashMap<String, String>, anyhow::Error>(partial)
+        });
+        worker_handles.push(handle);
+    }
+
+    let producer = tokio::spawn(async move {
+        let mut batch = Vec::with_capacity(batch_size);
+        while let Some(pair) = pairs.next().await {
+            // HitSummary: [0]=read_id … [3]=accession — prefer struct field for accession
+            let line = String::from_utf8_lossy(&pair.summary);
+            let line = line.trim_end();
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            let read_id = fields[0];
+            if read_id.is_empty() {
+                continue;
+            }
+            let accession = if !pair.accession.is_empty()
+                && pair.accession != "-"
+                && pair.accession != "None"
+            {
+                pair.accession
+            } else {
+                let a = fields[3];
+                if a.is_empty() || a == "-" || a == "None" {
+                    continue;
+                }
+                a.to_string()
+            };
+
+            batch.push((read_id.to_string(), accession));
+            if batch.len() >= batch_size {
+                if job_tx.send(std::mem::take(&mut batch)).await.is_err() {
+                    return Err(anyhow!(
+                        "collect_hit_summary_to_accession_map: workers closed while producer still had data"
+                    ));
+                }
+                batch = Vec::with_capacity(batch_size);
+            }
+        }
+        if !batch.is_empty() {
+            if job_tx.send(batch).await.is_err() {
+                return Err(anyhow!(
+                    "collect_hit_summary_to_accession_map: workers closed on final batch"
+                ));
+            }
+        }
+        drop(job_tx);
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let mut partial_maps = Vec::with_capacity(worker_handles.len());
+    for handle in worker_handles {
+        let partial = handle
+            .await
+            .map_err(|e| anyhow!("Worker task panicked: {}", e))??;
+        partial_maps.push(partial);
+    }
+
+    let map = tokio::task::spawn_blocking(move || {
+        let mut final_map = AHashMap::with_capacity(2_500_000);
+        for partial in partial_maps {
+            final_map.extend(partial);
+        }
+        final_map
+    })
+        .await
+        .map_err(|e| anyhow!("spawn_blocking panicked: {}", e))?;
+
+    producer.await??;
+
+    info!(
+        "collect_hit_summary_to_accession_map_concurrent → {} entries",
+        map.len()
+    );
+    Ok(map)
 }
 
 
