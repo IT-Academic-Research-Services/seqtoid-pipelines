@@ -6348,9 +6348,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     // Build the small accession maps for NT/NR in parallel
     let (nt_pairs_map, nr_pairs_map) = tokio::try_join!(
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nt_pairs_for_annotated_fasta),
-        collect_hit_summary_to_accession_map_concurrent(config.clone(), nr_pairs_for_annotated_fasta)
-    )?;
+    collect_hit_summary_to_accession_map_concurrent(
+        config.clone(),
+        nt_pairs_for_annotated_fasta
+    ),
+    collect_hit_summary_to_accession_map_concurrent(
+        config.clone(),
+        nr_pairs_for_annotated_fasta
+    )
+)?;
 
     pre_assembly_fasta_write_task
         .await
@@ -6374,9 +6380,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .await
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-        "Failed to parse pre-assembly FASTA: {}",
-        e
-    ))
+            "Failed to parse pre-assembly FASTA: {}",
+            e
+        ))
         })?;
 
     let pre_assembly_stream = ReceiverStream::new(pre_assembly_rx);
@@ -6398,6 +6404,129 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.extend(generate_annotated_cleanup_receivers);
 
 
+    // =====================================================================
+    //
+    // mapped_rx:
+    //     branch 1 -> GenerateTaxidFasta
+    //     branch 2 -> sample.annotated.fasta
+    //
+    // generic_unidentified_rx:
+    //     branch 1 -> GenerateTaxidFasta
+    //     branch 2 -> sample.unidentified.fasta
+    //
+    // Both artifact writers run asynchronously. Neither durable file is a
+    // synchronization dependency of GenerateTaxidFasta.
+    // =====================================================================
+
+    let (
+        mapped_annotated_streams,
+        mapped_annotated_router_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(mapped_rx),
+        2,
+        "long_read_annotated_fasta_mapped",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(mapped_annotated_router_done_rx);
+
+    let mut mapped_annotated_streams =
+        mapped_annotated_streams.into_iter();
+
+    let mapped_for_taxid_fasta =
+        mapped_annotated_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let mapped_for_artifact =
+        ReceiverStream::new(
+            mapped_annotated_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    let (
+        unidentified_annotated_streams,
+        unidentified_annotated_router_done_rx,
+    ) = fanout_to_channels(
+        ReceiverStream::new(generic_unidentified_rx),
+        2,
+        "long_read_annotated_fasta_unidentified",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(
+        unidentified_annotated_router_done_rx
+    );
+
+    let mut unidentified_annotated_streams =
+        unidentified_annotated_streams.into_iter();
+
+    let unidentified_for_taxid_fasta =
+        unidentified_annotated_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let unidentified_for_artifact =
+        ReceiverStream::new(
+            unidentified_annotated_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+
+    // =====================================================================
+    // Durable GenerateAnnotatedFasta artifacts.
+    // =====================================================================
+
+    let annotated_fasta_path =
+        out_dir.join("sample.annotated.fasta");
+
+    let unidentified_fasta_path =
+        out_dir.join("sample.unidentified.fasta");
+
+
+    let annotated_fasta_write_task =
+        write_byte_stream_to_file(
+            &annotated_fasta_path,
+            mapped_for_artifact,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "long_read_annotated_fasta",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(annotated_fasta_write_task);
+
+
+    let unidentified_fasta_write_task =
+        write_byte_stream_to_file(
+            &unidentified_fasta_path,
+            unidentified_for_artifact,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "long_read_unidentified_fasta",
+            false,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(e.to_string())
+            })?;
+
+    cleanup_tasks.push(unidentified_fasta_write_task);
+
+
     // *******************
     // GenerateTaxidFasta
     // *******************
@@ -6410,8 +6539,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         generate_taxid_main_task,
     ) = generate_taxid_fasta(
         config.clone(),
-        ReceiverStream::new(mapped_rx),
-        ReceiverStream::new(generic_unidentified_rx),
+        ReceiverStream::new(mapped_for_taxid_fasta),
+        ReceiverStream::new(unidentified_for_taxid_fasta),
         nt_pairs_for_taxid_fasta,
         nr_pairs_for_taxid_fasta,
         lineage_map.clone(),
