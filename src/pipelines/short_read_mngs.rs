@@ -11529,6 +11529,32 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let out_dir_for_viz = out_dir.clone();
     let gsnap_m8_path_for_viz = out_dir.join("gsnap.m8");
 
+
+    // nt_pairs_coverage is a bounded branch of nt_refined_pairs.
+    // It must always be consumed, even when coverage visualization is skipped.
+    let (coverage_hit_tx, coverage_hit_rx) = mpsc::channel(65_536);
+
+    let coverage_hit_adapter_task = tokio::spawn(async move {
+        let mut pairs = nt_pairs_coverage;
+
+        while let Some(pair) = pairs.next().await {
+            if coverage_hit_tx
+                .send(ParseOutput::Bytes(Bytes::from(pair.summary)))
+                .await
+                .is_err()
+            {
+                // Coverage visualization is not consuming this output.
+                // Continue draining the bounded upstream branch.
+                continue;
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(coverage_hit_adapter_task);
+
+
     let coverage_task = if !skip_coverage_viz {
         info!("All coverage viz inputs present — spawning visualization task");
 
@@ -11572,29 +11598,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             ))
             })?;
 
-        // Hit summary bytes from refined pairs
-        let hit_for_viz = {
-            let mut pairs = nt_pairs_coverage;
-            let (tx, rx) = mpsc::channel(65_536);
 
-            tokio::spawn(async move {
-                while let Some(p) = pairs.next().await {
-                    if tx
-                        .send(ParseOutput::Bytes(Bytes::from(p.summary)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-
-            rx
-        };
 
         Some(tokio::spawn(async move {
             generate_coverage_viz(
-                ReceiverStream::new(hit_for_viz),
+                ReceiverStream::new(coverage_hit_rx),
                 UnboundedReceiverStream::new(nt_refined_m8_top_stream_out), // pure contig top m8
                 coverage_json_path,
                 assembly_outputs.contig_stats_json,
@@ -11610,15 +11618,25 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .await
         }))
     } else {
-        // Must still drain so fanout does not stall
+        // nt_pairs_coverage is already drained unconditionally by
+        // coverage_hit_adapter_task above. Do not consume it again here.
+
+        // The unbounded top-m8 stream still needs a consumer when
+        // coverage visualization is skipped.
         tokio::spawn(async move {
-            let mut a = nt_pairs_coverage;
-            let mut c = UnboundedReceiverStream::new(nt_refined_m8_top_stream_out);
-            while a.next().await.is_some() {}
+            let mut c =
+                UnboundedReceiverStream::new(nt_refined_m8_top_stream_out);
+
             while c.next().await.is_some() {}
         });
-        warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
-        cleanup_tasks.push(nt_m8_write_task); // if this isnt needed, push it onto the cleanup pile
+
+        warn!(
+        "Skipping coverage viz: required inputs missing/empty \
+         (likely assembly failure)"
+    );
+
+        cleanup_tasks.push(nt_m8_write_task);
+
         None
     };
 
