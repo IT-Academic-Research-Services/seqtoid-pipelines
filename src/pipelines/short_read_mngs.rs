@@ -11112,7 +11112,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir.join("refined.m8"),
         out_dir.join("refined.hitsummary.tab"),
         out_dir.join("merged_taxon_counts_with_dcr.json"),
-        out_dir.join("assembly_combined_contig_summary.json"),
+        out_dir.join("assembly").join("combined_contig_summary.json"),
     );
 
     let ((merged_taxon_counts,_final_contigs, merged_cleanup_tasks), nt_refined_map, nr_refined_map) =
@@ -11131,12 +11131,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )?;
     cleanup_tasks.extend(merged_cleanup_tasks);
 
-    let refined_combined_path = out_dir.join(rename_file_path(
-        &sample_base_buf,
-        None,
-        Some("refined_taxon_counts_with_dcr.json"),
-        "_",
-    ));
+    let refined_combined_path =
+        out_dir
+            .join("assembly")
+            .join("refined_taxon_counts_with_dcr.json");
+    
     let (_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
         &nr_refined_counts,
