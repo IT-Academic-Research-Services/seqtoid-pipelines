@@ -7836,15 +7836,48 @@ async fn blast_contigs(
     let mut cleanup_tasks = Vec::new();
     let cleanup_receivers = Vec::new();
 
-    let out_dir = config.out_dir.join(format!("blast_{}", db_type));
+    let out_dir = config.out_dir.join("assembly");
     tokio::fs::create_dir_all(&out_dir).await?;
 
-    let blast_m8_path = out_dir.join("blast.m8");
-    let blast_top_m8_path = out_dir.join("blast_top.m8");
-    let refined_m8_path = out_dir.join("refined.m8");
-    let refined_hit_summary_path = out_dir.join("refined_hit_summary.tab");
-    let refined_counts_path = out_dir.join("refined_counts_with_dcr.json");
-    let contig_summary_path = out_dir.join("contig_summary.json");
+    let (
+        blast_m8_name,
+        blast_top_m8_name,
+        refined_m8_name,
+        refined_hit_summary_name,
+        refined_counts_name,
+        contig_summary_name,
+    ) = match db_type {
+        "nt" => (
+            "gsnap.blast.m8",
+            "gsnap.blast.top.m8",
+            "gsnap.reassigned.m8",
+            "gsnap.hitsummary2.tab",
+            "refined_gsnap_counts_with_dcr.json",
+            "gsnap_contig_summary.json",
+        ),
+        "nr" => (
+            "rapsearch2.blast.m8",
+            "rapsearch2.blast.top.m8",
+            "rapsearch2.reassigned.m8",
+            "rapsearch2.hitsummary2.tab",
+            "refined_rapsearch2_counts_with_dcr.json",
+            "rapsearch2_contig_summary.json",
+        ),
+        other => {
+            return Err(anyhow!(
+        "blast_contigs: unsupported db_type '{}'",
+        other
+        ));
+        }
+    };
+
+    let blast_m8_path = out_dir.join(blast_m8_name);
+    let blast_top_m8_path = out_dir.join(blast_top_m8_name);
+    let refined_m8_path = out_dir.join(refined_m8_name);
+    let refined_hit_summary_path =
+        out_dir.join(refined_hit_summary_name);
+    let refined_counts_path = out_dir.join(refined_counts_name);
+    let contig_summary_path = out_dir.join(contig_summary_name);
 
     let contig_size = file_size(assembled_contig_fasta).await?;
     let ref_size = file_size(reference_fasta).await?;
