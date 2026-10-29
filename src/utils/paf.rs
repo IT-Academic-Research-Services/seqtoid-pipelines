@@ -499,11 +499,14 @@ pub async fn paf_to_m8(
     m8_path: PathBuf,
 ) -> Result<(
     ReceiverStream<ParseOutput>,
-    Vec<JoinHandle<Result<(), anyhow::Error>>>,
-    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+    JoinHandle<Result<(), anyhow::Error>>,              // m8 file writer
+    Vec<JoinHandle<Result<(), anyhow::Error>>>,         // other cleanup tasks
+    Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,  // cleanup receivers
 )> {
-    let mut cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let cleanup_tasks: Vec<JoinHandle<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<
+        oneshot::Receiver<Result<(), anyhow::Error>>
+    > = Vec::new();
 
     let genome_size = config.args.nt_db_size as f64;
 
@@ -517,11 +520,14 @@ pub async fn paf_to_m8(
         config.clone(),
         input_stream,
         move |batch: Vec<u8>| {
-            let m8_lines = parse_paf_batch_to_m8(batch.clone(), genome_size);
+            let m8_lines =
+                parse_paf_batch_to_m8(batch.clone(), genome_size);
 
             // Count input PAF lines in the batch.
             let paf_lines_in_batch = {
-                let newline_count = batch.iter().filter(|&&b| b == b'\n').count();
+                let newline_count =
+                    batch.iter().filter(|&&b| b == b'\n').count();
+
                 if batch.is_empty() {
                     0
                 } else if *batch.last().unwrap_or(&b'\n') == b'\n' {
@@ -531,8 +537,15 @@ pub async fn paf_to_m8(
                 }
             };
 
-            paf_counter.fetch_add(paf_lines_in_batch, std::sync::atomic::Ordering::Relaxed);
-            m8_counter.fetch_add(m8_lines.len(), std::sync::atomic::Ordering::Relaxed);
+            paf_counter.fetch_add(
+                paf_lines_in_batch,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
+            m8_counter.fetch_add(
+                m8_lines.len(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
 
             m8_lines
         },
@@ -540,44 +553,69 @@ pub async fn paf_to_m8(
         16 * 1024 * 1024, // 16 MiB batches
     );
 
-    let (streams, paf_to_m8_stream_done_rx) = fanout_to_channels(
-        batched_stream,
-        2,
-        "paf_to_m8_stream",
-        &config,
-        StreamDataType::JustBytes,
-    )
-    .await
-    .map_err(|_| PipelineError::StreamDataDropped)?;
+    let (streams, paf_to_m8_stream_done_rx) =
+        fanout_to_channels(
+            batched_stream,
+            2,
+            "paf_to_m8_stream",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
+
     cleanup_receivers.push(paf_to_m8_stream_done_rx);
 
     let mut streams = streams;
 
-    let main_stream = ReceiverStream::new(streams.remove(0));
+    // Computational branch.
+    let main_stream =
+        ReceiverStream::new(streams.remove(0));
 
-    let file_stream = ReceiverStream::new(streams.remove(0));
+    // Durable gsnap.m8 artifact branch.
+    let file_stream =
+        ReceiverStream::new(streams.remove(0));
 
-    let write_task = write_byte_stream_to_file(
+    // IMPORTANT:
+    // This handle is intentionally returned separately rather than
+    // registered in cleanup_tasks. Callers that require the completed
+    // m8 artifact can explicitly synchronize on this writer without
+    // introducing a new bounded stream or blocking the computational
+    // branch early.
+    let m8_write_task = write_byte_stream_to_file(
         &m8_path,
         file_stream,
         config.clone(),
         StreamDataType::JustBytes,
         "paf_to_m8_m8",
-        true
+        true,
     )
-    .await
-    .map_err(|e| PipelineError::IOError(e.to_string()))?;
-    cleanup_tasks.push(write_task);
+        .await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
 
-    let paf_total = paf_record_count.load(std::sync::atomic::Ordering::Relaxed);
-    let m8_total = m8_line_count.load(std::sync::atomic::Ordering::Relaxed);
+    let paf_total =
+        paf_record_count.load(
+            std::sync::atomic::Ordering::Relaxed
+        );
+
+    let m8_total =
+        m8_line_count.load(
+            std::sync::atomic::Ordering::Relaxed
+        );
 
     info!(
-        "[paf_to_m8] wired conversion stage — ~{} PAF lines seen, {} m8 lines emitted so far",
-        paf_total, m8_total
+        "[paf_to_m8] wired conversion stage — \
+         ~{} PAF lines seen, {} m8 lines emitted so far",
+        paf_total,
+        m8_total
     );
 
-    Ok((main_stream, cleanup_tasks, cleanup_receivers))
+    Ok((
+        main_stream,
+        m8_write_task,
+        cleanup_tasks,
+        cleanup_receivers,
+    ))
 }
 
 #[cfg(test)]

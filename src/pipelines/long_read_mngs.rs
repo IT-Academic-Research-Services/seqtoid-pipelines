@@ -5031,6 +5031,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         let (
             nt_m8_stream,
+            nt_m8_write_task,
             mut m8_cleanup_tasks,
             m8_cleanup_receivers,
         ) = paf_to_m8(
@@ -5039,6 +5040,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             nt_m8_path,
         )
             .await?;
+
+        // Long reads do not need an explicit synchronization boundary on
+        // the persisted gsnap.m8 artifact, so retain the existing cleanup behavior.
+        nt_cleanup_tasks.push(nt_m8_write_task);
 
         nt_cleanup_tasks.append(
             &mut m8_cleanup_tasks,

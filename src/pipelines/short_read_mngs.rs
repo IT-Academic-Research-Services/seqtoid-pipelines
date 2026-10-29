@@ -9693,6 +9693,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         let (
             m8_stream,
+            nt_m8_write_task,
             mut m8_cleanup_tasks,
             m8_cleanup_receivers,
         ) = paf_to_m8(
@@ -9739,12 +9740,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         Ok::<
             (
                 ReceiverStream<ParseOutput>,
+                JoinHandle<anyhow::Result<(), anyhow::Error>>,
                 Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
                 Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
             ),
             PipelineError,
         >((
             m8_sorted,
+            nt_m8_write_task,
             non_host_nt_cleanup_tasks,
             non_host_nt_cleanup_receivers,
         ))
@@ -9890,6 +9893,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         (
             m8_sorted,
+            nt_m8_write_task,
             mut nt_non_host_cleanup_tasks,
             mut nt_non_host_cleanup_receivers,
         ),
@@ -10941,7 +10945,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
             let (nt_pair_rxs, nt_pairs_done_rx) = fanout_to_channels(
                 ReceiverStream::new(nt_refined_pairs_out),
-                5,
+                4,
                 "nt_refined_pairs",
                 &config,
                 StreamDataType::JustBytes,
@@ -10952,7 +10956,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             let mut it = nt_pair_rxs.into_iter();
             let nt_pairs_merge = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
             let nt_pairs_map = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
-            let nt_pairs_viz = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
             let nt_pairs_taxid_refined = ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
             let nt_pairs_coverage =
                 ReceiverStream::new(it.next().ok_or(PipelineError::EmptyStream)?);
@@ -10963,7 +10966,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 nt_contig_summary,
                 nt_pairs_merge,
                 nt_pairs_map,
-                nt_pairs_viz,
                 nt_pairs_taxid_refined,
                 nt_pairs_coverage,
                 nt_refined_m8_top_stream_out,
@@ -11056,7 +11058,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         nt_contig_summary,
         nt_pairs_merge,
         nt_pairs_map,
-        nt_pairs_viz,
         nt_pairs_taxid_refined,
         nt_pairs_coverage,
         nt_refined_m8_top_stream_out,
@@ -11517,15 +11518,57 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
     let out_dir_for_viz = out_dir.clone();
+    let gsnap_m8_path_for_viz = out_dir.join("gsnap.m8");
+
     let coverage_task = if !skip_coverage_viz {
         info!("All coverage viz inputs present — spawning visualization task");
 
-        // Hit summary bytes from pairs (7-col / optional contig cols)
+        // Coverage viz requires the completed original gsnap.m8 artifact.
+        // Synchronize on its dedicated writer only here, at the point where
+        // the file becomes a real computational dependency.
+        nt_m8_write_task
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "gsnap.m8 writer task panicked before coverage viz: {}",
+                e
+            ))
+            })?
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "gsnap.m8 writer failed before coverage viz: {}",
+                e
+            ))
+            })?;
+
+        let gsnap_m8_file = TokioFile::open(&gsnap_m8_path_for_viz)
+            .await
+            .map_err(|e| {
+                PipelineError::IOError(format!(
+                    "Failed to open completed gsnap.m8 for coverage viz: {}",
+                    e
+                ))
+            })?;
+
+        let gsnap_m8_rx = parse_lines(
+            gsnap_m8_file,
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to stream gsnap.m8 for coverage viz: {}",
+                e
+            ))
+            })?;
+
+        // Hit summary bytes from refined pairs
         let hit_for_viz = {
             let mut pairs = nt_pairs_coverage;
             let (tx, rx) = mpsc::channel(65_536);
-            tokio::spawn(async move {
 
+            tokio::spawn(async move {
                 while let Some(p) = pairs.next().await {
                     if tx
                         .send(ParseOutput::Bytes(Bytes::from(p.summary)))
@@ -11536,24 +11579,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                     }
                 }
             });
-            rx
-        };
 
-        // Refined dedup m8 bytes from pairs
-        let m8_for_viz = {
-            let mut pairs = nt_pairs_viz;
-            let (tx, rx) = mpsc::channel(65_536);
-            tokio::spawn(async move {
-                while let Some(p) = pairs.next().await {
-                    if tx
-                        .send(ParseOutput::Bytes(Bytes::from(p.dedup)))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
             rx
         };
 
@@ -11564,7 +11590,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 coverage_json_path,
                 assembly_outputs.contig_stats_json,
                 assembly_outputs.contigs_fasta,
-                ReceiverStream::new(m8_for_viz),
+                ReceiverStream::new(gsnap_m8_rx),
                 nt_info_db_path,
                 out_dir_for_viz,
                 Some(MAX_NUM_BINS_COVERAGE),
@@ -11578,13 +11604,12 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         // Must still drain so fanout does not stall
         tokio::spawn(async move {
             let mut a = nt_pairs_coverage;
-            let mut b = nt_pairs_viz;
             let mut c = UnboundedReceiverStream::new(nt_refined_m8_top_stream_out);
             while a.next().await.is_some() {}
-            while b.next().await.is_some() {}
             while c.next().await.is_some() {}
         });
         warn!("Skipping coverage viz: required inputs missing/empty (likely assembly failure)");
+        cleanup_tasks.push(nt_m8_write_task); // if this isnt needed, push it onto the cleanup pile
         None
     };
 
