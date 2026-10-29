@@ -87,7 +87,8 @@ use crate::utils::fastx::{
     generate_taxid_fasta, generate_taxid_locator, parse_byte_stream_to_fastq, raw_read_count,
     read_fasta, read_fastq, stream_record_counter, write_combined_fastq,
     write_fasta_stream_to_file, SequenceRecord, chunk_paired_fastq, generate_annotated_fasta_stream,
-    UNMAPPED_HEADER_PREFIX, StreamRecordStats, collect_hit_summary_to_accession_map_concurrent
+    UNMAPPED_HEADER_PREFIX, StreamRecordStats, collect_hit_summary_to_accession_map_concurrent,
+    load_taxid_hit_maps
 };
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
@@ -10484,6 +10485,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     info!("[run] nr_pairs_artifact     -> dedup and hitsummary ");
 
 
+    // Start the initial taxid hit-map consumers NOW.
+    //
+    // This must happen immediately after both NT and NR taxid branches exist.
+    // From this point forward, neither fanout has an unconsumed taxid branch.
+    let (
+        initial_nt_hits_rx,
+        initial_nr_hits_rx,
+        initial_load_nt_task,
+        initial_load_nr_task,
+    ) = load_taxid_hit_maps(
+        nt_pairs_taxid_initial,
+        nr_pairs_taxid_initial,
+    );
+
+    cleanup_tasks.push(initial_load_nt_task);
+    cleanup_tasks.push(initial_load_nr_task);
+
+    info!(
+    "[run] initial taxid NT/NR hit-map consumers started"
+);
+
+
     let (nr_deduped_tx, nr_deduped_rx) =
         mpsc::channel::<ParseOutput>(config.base_buffer_size);
 
@@ -10686,18 +10709,28 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
-    // Part of Experimental phase but starting this as early as possible to avvoid stalling the fanout
-    let experimental_taxid_handle = tokio::spawn({
-        let config = config.clone();
-        let lineage_map = lineage_map.clone();
-        let mapped = ReceiverStream::new(initial_annotated_taxon_stream);
-        let unid = ReceiverStream::new(initial_unidentified_taxon_stream);
-        let nt = nt_pairs_taxid_initial;
-        let nr = nr_pairs_taxid_initial;
-        async move {
-            generate_taxid_fasta(config, mapped, unid, nt, nr, lineage_map).await
-        }
-    });
+
+    let (
+        initial_taxid_mapped_rx,
+        initial_taxid_combined_rx,
+        initial_taxid_main_task,
+    ) = generate_taxid_fasta(
+        config.clone(),
+        ReceiverStream::new(initial_annotated_taxon_stream),
+        ReceiverStream::new(initial_unidentified_taxon_stream),
+        initial_nt_hits_rx,
+        initial_nr_hits_rx,
+        lineage_map.clone(),
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "Initial generate_taxid_fasta failed: {}",
+        e
+    ))
+        })?;
+
+    cleanup_tasks.push(initial_taxid_main_task);
 
     // Write tasks are now eager consumers → EOF propagates instantly
     cleanup_tasks.push(write_fasta_stream_to_file(
@@ -11290,6 +11323,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         final_temp_dirs.push(td);
     }
 
+    // Start refined taxid hit-map consumers immediately.
+    //
+    // The refined NT/NR fanouts are live now. Do not leave their taxid
+    // branches sitting unconsumed while merge/map/annotation proceeds.
+    let (
+        refined_nt_hits_rx,
+        refined_nr_hits_rx,
+        refined_load_nt_task,
+        refined_load_nr_task,
+    ) = load_taxid_hit_maps(
+        nt_pairs_taxid_refined,
+        nr_pairs_taxid_refined,
+    );
+
+    cleanup_tasks.push(refined_load_nt_task);
+    cleanup_tasks.push(refined_load_nr_task);
+
+    info!(
+    "[run] refined taxid NT/NR hit-map consumers started"
+);
+
     cleanup_receivers.extend(nt_cleanup_receivers);
     cleanup_receivers.extend(nr_cleanup_receivers);
 
@@ -11485,20 +11539,26 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
 
     // Hit maps from refined pairs (summary side only). Already ReceiverStream<ReducedRead>.
-    let (taxid_mapped_rx, taxid_combined_rx, load_nt_task, load_nr_task, taxid_main_task) =
-        generate_taxid_fasta(
-            config.clone(),
-            ReceiverStream::new(refined_mapped_taxid_stream),
-            ReceiverStream::new(refined_unidentified_taxid_stream),
-            nt_pairs_taxid_refined,
-            nr_pairs_taxid_refined,
-            lineage_map.clone(),
-        )
-            .await
-            .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_fasta failed: {}", e)))?;
+    let (
+        taxid_mapped_rx,
+        taxid_combined_rx,
+        taxid_main_task,
+    ) = generate_taxid_fasta(
+        config.clone(),
+        ReceiverStream::new(refined_mapped_taxid_stream),
+        ReceiverStream::new(refined_unidentified_taxid_stream),
+        refined_nt_hits_rx,
+        refined_nr_hits_rx,
+        lineage_map.clone(),
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "generate_taxid_fasta failed: {}",
+        e
+    ))
+        })?;
 
-    cleanup_tasks.push(load_nt_task);
-    cleanup_tasks.push(load_nr_task);
     cleanup_tasks.push(taxid_main_task);
 
 
@@ -11558,28 +11618,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Experimental
     // *******************
 
-    let (
-        initial_taxid_mapped_rx,
-        initial_taxid_combined_rx,
-        initial_load_nt_task,
-        initial_load_nr_task,
-        initial_taxid_main_task,
-    ) = experimental_taxid_handle
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Experimental generate_taxid_fasta task panicked: {e}"
-        ))
-        })?
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Experimental generate_taxid_fasta failed: {e}"
-        ))
-        })?;
-
-    cleanup_tasks.push(initial_load_nt_task);
-    cleanup_tasks.push(initial_load_nr_task);
-    cleanup_tasks.push(initial_taxid_main_task);
 
     let initial_mapped_path = out_dir.join("taxid_annot_mapped_only.fasta");
     let initial_combined_path = out_dir.join("taxid_annot.fasta");

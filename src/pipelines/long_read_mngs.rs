@@ -51,7 +51,7 @@ use crate::utils::file::{file_path_manipulator, validate_file_inputs, write_byte
 use crate::utils::fastx::{read_fastq, StreamRecordStats, stream_record_counter,
                           fastq_to_fasta_stream, fastq_bytes_to_fasta_stream, SequenceRecord,
                           generate_annotated_fasta_stream, collect_hit_summary_to_accession_map_concurrent,
-                          generate_taxid_fasta, generate_taxid_locator};
+                          generate_taxid_fasta, generate_taxid_locator, load_taxid_hit_maps};
 use crate::utils::paf::paf_to_m8;
 use crate::utils::sambam::{filter_clipped_alignments, generate_assembly_coverage, generate_info_from_bam_stream};
 use crate::utils::streams::{fanout_to_channels, join_with_error_handling, ParseOutput,
@@ -5960,6 +5960,34 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .ok_or(PipelineError::EmptyStream)?,
         );
 
+    // =====================================================================
+    // Start GenerateTaxidFasta hit-map consumers immediately.
+    //
+    // Both NT and NR reassigned fanouts are now installed, and their
+    // GenerateTaxidFasta branches must begin draining now rather than waiting
+    // for the much later annotated-FASTA stage.
+    //
+    // The loaders consume the ReducedRead streams and publish one completed
+    // NT/NR hit map each. generate_taxid_fasta() will consume those maps later.
+    // =====================================================================
+
+    let (
+        taxid_nt_hits_rx,
+        taxid_nr_hits_rx,
+        taxid_load_nt_task,
+        taxid_load_nr_task,
+    ) = load_taxid_hit_maps(
+        nt_pairs_for_taxid_fasta,
+        nr_pairs_for_taxid_fasta,
+    );
+
+    cleanup_tasks.push(taxid_load_nt_task);
+    cleanup_tasks.push(taxid_load_nr_task);
+
+    info!(
+    "[run] GenerateTaxidFasta NT/NR hit-map consumers started"
+);
+
 
     let nt_m8_reassigned_path =
         out_dir.join("m8_reassigned_nt.tab");
@@ -6588,15 +6616,13 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         taxid_mapped_rx,
         taxid_combined_rx,
-        generate_taxid_load_nt_task,
-        generate_taxid_load_nr_task,
         generate_taxid_main_task,
     ) = generate_taxid_fasta(
         config.clone(),
         ReceiverStream::new(mapped_for_taxid_fasta),
         ReceiverStream::new(unidentified_for_taxid_fasta),
-        nt_pairs_for_taxid_fasta,
-        nr_pairs_for_taxid_fasta,
+        taxid_nt_hits_rx,
+        taxid_nr_hits_rx,
         lineage_map.clone(),
     )
         .await
@@ -6607,8 +6633,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     ))
         })?;
 
-    cleanup_tasks.push(generate_taxid_load_nt_task);
-    cleanup_tasks.push(generate_taxid_load_nr_task);
     cleanup_tasks.push(generate_taxid_main_task);
 
 
