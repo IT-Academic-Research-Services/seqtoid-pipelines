@@ -11481,8 +11481,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Now safe to await the annotated and unidentified fanout tasks
     annotated_done_rx.await??;
     unidentified_done_rx.await??;
-
-    cleanup_tasks.append(&mut initial_locator_tasks);
+    
     info!(
         "Experimental taxid locator files generated: {:?}",
         initial_locator_outputs
