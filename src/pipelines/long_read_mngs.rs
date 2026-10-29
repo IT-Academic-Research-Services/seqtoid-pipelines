@@ -6707,6 +6707,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         taxid_mapped_for_locator,
         assembly_out_dir.clone(),
+        true
     )
         .await
         .map_err(|e| {

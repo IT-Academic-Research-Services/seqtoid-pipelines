@@ -11546,6 +11546,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         taxid_mapped_locator, // directly pass the receiver
         assembly_dir,
+        true
     )
         .await
         .map_err(|e| PipelineError::Other(anyhow!("generate_taxid_locator failed: {}", e)))?;
@@ -11652,6 +11653,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         config.clone(),
         initial_taxid_mapped_locator,
         out_dir.clone(),
+        false
     )
         .await
         .map_err(|e| {

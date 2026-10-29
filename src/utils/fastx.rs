@@ -2527,11 +2527,11 @@ pub async fn generate_taxid_fasta(
         main_task,
     ))
 }
-
 pub async fn generate_taxid_locator(
     config: Arc<RunConfig>,
     fasta_stream_rx: tokio::sync::mpsc::Receiver<ParseOutput>,
-    assembly_dir: PathBuf,
+    output_dir: PathBuf,
+    refined: bool,
 ) -> Result<
     (
         Vec<PathBuf>,
@@ -2540,7 +2540,11 @@ pub async fn generate_taxid_locator(
     ),
     PipelineError,
 > {
-    info!("generate_taxid_locator starting");
+    info!(
+        "generate_taxid_locator starting: refined={}, output_dir={}",
+        refined,
+        output_dir.display()
+    );
 
     // ── 1. Drain full input once (Python reads one FA per field; we reuse one buffer) ──
     let mut records: Vec<(String, String)> = Vec::with_capacity(100_000);
@@ -2555,6 +2559,7 @@ pub async fn generate_taxid_locator(
                 })?;
                 records.push((header, seq));
             }
+
             ParseOutput::Bytes(b) => {
                 // Tolerate byte-oriented fanout: expect full FASTA text chunks is unsafe;
                 // only accept if you know upstream converted one-record-per-item.
@@ -2564,6 +2569,7 @@ pub async fn generate_taxid_locator(
                     b.len()
                 );
             }
+
             other => {
                 warn!(
                     "generate_taxid_locator: unexpected item {:?}",
@@ -2588,36 +2594,101 @@ pub async fn generate_taxid_locator(
     // ── 2. One worker per (level, hit_type) — every record appears in every FA (Python) ──
     for level in levels {
         for hit_type in hit_types {
-            let taxid_field = format!("{}_{}", level, hit_type.to_lowercase());
+            let taxid_field =
+                format!("{}_{}", level, hit_type.to_lowercase());
 
-            let fa_name = if level == "species" {
-                format!(
-                    "refined_taxid_annot_sorted_{}.fasta",
-                    hit_type.to_lowercase()
-                )
-            } else {
-                format!(
-                    "refined_taxid_annot_sorted_{}_{}.fasta",
-                    level,
-                    hit_type.to_lowercase()
-                )
+            // -------------------------------------------------------------
+            // Output naming differs between the two GenerateTaxidLocator
+            // stages in the WDL:
+            //
+            // Initial:
+            //   taxid_annot_sorted_nt.fasta
+            //   taxid_annot_sorted_nr.fasta
+            //   taxid_annot_sorted_genus_nt.fasta
+            //   taxid_annot_sorted_genus_nr.fasta
+            //   taxid_annot_sorted_family_nt.fasta
+            //   taxid_annot_sorted_family_nr.fasta
+            //
+            // Refined:
+            //   refined_taxid_annot_sorted_nt.fasta
+            //   refined_taxid_annot_sorted_nr.fasta
+            //   refined_taxid_annot_sorted_genus_nt.fasta
+            //   refined_taxid_annot_sorted_genus_nr.fasta
+            //   refined_taxid_annot_sorted_family_nt.fasta
+            //   refined_taxid_annot_sorted_family_nr.fasta
+            // -------------------------------------------------------------
+
+            let fa_name = match (refined, level) {
+                (true, "species") => {
+                    format!(
+                        "refined_taxid_annot_sorted_{}.fasta",
+                        hit_type.to_lowercase()
+                    )
+                }
+
+                (true, _) => {
+                    format!(
+                        "refined_taxid_annot_sorted_{}_{}.fasta",
+                        level,
+                        hit_type.to_lowercase()
+                    )
+                }
+
+                (false, "species") => {
+                    format!(
+                        "taxid_annot_sorted_{}.fasta",
+                        hit_type.to_lowercase()
+                    )
+                }
+
+                (false, _) => {
+                    format!(
+                        "taxid_annot_sorted_{}_{}.fasta",
+                        level,
+                        hit_type.to_lowercase()
+                    )
+                }
             };
-            let fa_path = assembly_dir.join(&fa_name);
 
-            let json_name = if level == "species" {
-                format!(
-                    "refined_taxid_locations_{}.json",
-                    hit_type.to_lowercase()
-                )
-            } else {
-                format!(
-                    "refined_taxid_locations_{}_{}.json",
-                    level,
-                    hit_type.to_lowercase()
-                )
+            let fa_path = output_dir.join(&fa_name);
+
+            // -------------------------------------------------------------
+            // Locator JSON naming follows the same initial/refined split.
+            // -------------------------------------------------------------
+
+            let json_name = match (refined, level) {
+                (true, "species") => {
+                    format!(
+                        "refined_taxid_locations_{}.json",
+                        hit_type.to_lowercase()
+                    )
+                }
+
+                (true, _) => {
+                    format!(
+                        "refined_taxid_locations_{}_{}.json",
+                        level,
+                        hit_type.to_lowercase()
+                    )
+                }
+
+                (false, "species") => {
+                    format!(
+                        "taxid_locations_{}.json",
+                        hit_type.to_lowercase()
+                    )
+                }
+
+                (false, _) => {
+                    format!(
+                        "taxid_locations_{}_{}.json",
+                        level,
+                        hit_type.to_lowercase()
+                    )
+                }
             };
 
-            let json_path = assembly_dir.join(json_name);
+            let json_path = output_dir.join(json_name);
 
             output_paths.push(fa_path.clone());
             output_paths.push(json_path.clone());
@@ -2627,11 +2698,19 @@ pub async fn generate_taxid_locator(
             let hit_type = hit_type.to_string();
 
             handles.push(tokio::task::spawn_blocking(move || {
-                // Group by taxid for this field (Python: sort by that key, then scan)
-                let mut by_taxid: AHashMap<i32, Vec<usize>> = AHashMap::new();
+                // Group by taxid for this field
+                // (Python: sort by that key, then scan).
+                let mut by_taxid: AHashMap<i32, Vec<usize>> =
+                    AHashMap::new();
+
                 for (idx, (header, _)) in records.iter().enumerate() {
-                    let taxid = get_taxid(header, &taxid_field).unwrap_or(-1);
-                    by_taxid.entry(taxid).or_default().push(idx);
+                    let taxid =
+                        get_taxid(header, &taxid_field).unwrap_or(-1);
+
+                    by_taxid
+                        .entry(taxid)
+                        .or_default()
+                        .push(idx);
                 }
 
                 if by_taxid.is_empty() {
@@ -2640,31 +2719,58 @@ pub async fn generate_taxid_locator(
                     return Ok(());
                 }
 
-                let mut sorted_taxids: Vec<i32> = by_taxid.keys().copied().collect();
+                let mut sorted_taxids: Vec<i32> =
+                    by_taxid.keys().copied().collect();
+
                 sorted_taxids.sort_unstable();
 
                 let file = std::fs::File::create(&fa_path)
-                    .map_err(|e| anyhow!("create {}: {}", fa_path.display(), e))?;
-                let mut writer = std::io::BufWriter::with_capacity(32 * 1024 * 1024, file);
+                    .map_err(|e| {
+                        anyhow!(
+                            "create {}: {}",
+                            fa_path.display(),
+                            e
+                        )
+                    })?;
+
+                let mut writer =
+                    std::io::BufWriter::with_capacity(
+                        32 * 1024 * 1024,
+                        file,
+                    );
 
                 let mut pos: u64 = 0;
-                let mut locations = Vec::with_capacity(sorted_taxids.len());
+
+                let mut locations =
+                    Vec::with_capacity(sorted_taxids.len());
 
                 for taxid in sorted_taxids {
-                    let idxs = by_taxid.get(&taxid).unwrap();
+                    let idxs = by_taxid
+                        .get(&taxid)
+                        .unwrap();
+
                     let start = pos;
 
                     for &idx in idxs {
                         let (header, seq) = &records[idx];
-                        // Two-line FASTA records; header id without leading '>'
+
+                        // Two-line FASTA records; header id without
+                        // leading '>'.
                         writer.write_all(b">")?;
                         writer.write_all(header.as_bytes())?;
                         writer.write_all(b"\n")?;
-                        pos += 1 + header.len() as u64 + 1;
+
+                        pos +=
+                            1
+                                + header.len() as u64
+                                + 1;
 
                         writer.write_all(seq.as_bytes())?;
                         writer.write_all(b"\n")?;
-                        pos += seq.len() as u64 + 1;
+
+                        pos +=
+                            seq.len() as u64
+                                + 1;
                     }
 
                     locations.push(TaxonSeqLocation {
@@ -2677,12 +2783,35 @@ pub async fn generate_taxid_locator(
 
                 writer
                     .flush()
-                    .map_err(|e| anyhow!("flush {}: {}", fa_path.display(), e))?;
+                    .map_err(|e| {
+                        anyhow!(
+                            "flush {}: {}",
+                            fa_path.display(),
+                            e
+                        )
+                    })?;
 
-                let json_bytes = serde_json::to_vec(&locations)
-                    .map_err(|e| anyhow!("json {}: {}", json_path.display(), e))?;
-                std::fs::write(&json_path, json_bytes)
-                    .map_err(|e| anyhow!("write {}: {}", json_path.display(), e))?;
+                let json_bytes =
+                    serde_json::to_vec(&locations)
+                        .map_err(|e| {
+                            anyhow!(
+                                "json {}: {}",
+                                json_path.display(),
+                                e
+                            )
+                        })?;
+
+                std::fs::write(
+                    &json_path,
+                    json_bytes,
+                )
+                    .map_err(|e| {
+                        anyhow!(
+                        "write {}: {}",
+                        json_path.display(),
+                        e
+                    )
+                    })?;
 
                 info!(
                     "Wrote {} ({} taxids, {} records)",
@@ -2690,6 +2819,7 @@ pub async fn generate_taxid_locator(
                     locations.len(),
                     records.len()
                 );
+
                 Ok(())
             }));
         }
@@ -2697,26 +2827,51 @@ pub async fn generate_taxid_locator(
 
     for h in handles {
         h.await
-            .map_err(|e| PipelineError::Other(anyhow!("locator worker panicked: {e}")))?
-            .map_err(|e| PipelineError::Other(e))?;
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "locator worker panicked: {e}"
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
     }
 
     // ── 3. Combined JSON (Python combine_json) ──
     let json_paths: Vec<PathBuf> = output_paths
         .iter()
-        .filter(|p| p.extension().map_or(false, |e| e == "json"))
+        .filter(|p| {
+            p.extension()
+                .map_or(false, |e| e == "json")
+        })
         .cloned()
         .collect();
 
-    let combined_path = assembly_dir.join("refined_taxid_locations_combined.json");
-    combine_taxon_loc_json(json_paths, combined_path.clone())
-        .map_err(|e| PipelineError::Other(e))?;
+    let combined_name = if refined {
+        "refined_taxid_locations_combined.json"
+    } else {
+        "taxid_locations_combined.json"
+    };
+
+    let combined_path =
+        output_dir.join(combined_name);
+
+    combine_taxon_loc_json(
+        json_paths,
+        combined_path.clone(),
+    )
+        .map_err(PipelineError::Other)?;
+
     output_paths.push(combined_path);
 
-    info!("generate_taxid_locator complete");
-    // Work finished inline — no leftover tasks/receivers
+    info!(
+        "generate_taxid_locator complete: refined={}, outputs={}",
+        refined,
+        output_paths.len()
+    );
+
+    // Work finished inline — no leftover tasks/receivers.
     Ok((output_paths, vec![], vec![]))
 }
+
 
 pub async fn filter_fastq_to_bytes_stream(
     mut input_stream: ReceiverStream<ParseOutput>,
@@ -2730,11 +2885,19 @@ pub async fn filter_fastq_to_bytes_stream(
                 if headers.contains(&record.id()[..]) {
                     match record.to_bytes() {
                         Ok(vec) => {
-                            let _ = tx.send(ParseOutput::Bytes(vec)).await;
+                            let _ =
+                                tx.send(ParseOutput::Bytes(vec)).await;
                         }
-                        Err(e) => error!("Failed to serialize FASTQ record: {}", e),
+
+                        Err(e) => {
+                            error!(
+                                "Failed to serialize FASTQ record: {}",
+                                e
+                            );
+                        }
                     }
                 }
+
                 // else: explicitly skipped
             }
         }
@@ -2742,7 +2905,6 @@ pub async fn filter_fastq_to_bytes_stream(
 
     ReceiverStream::new(rx)
 }
-
 pub async fn write_combined_fastq(
     r1_path: PathBuf,
     r2_path_opt: Option<PathBuf>,
