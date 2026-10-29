@@ -10405,8 +10405,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let assembly_dir = out_dir.join("assembly");
 
-    let annotated_path = assembly_dir.join("annotated_merged.fa");
-    let unidentified_path = assembly_dir.join("unidentified.fa");
+    let annotated_path = out_dir.join("annotated_merged.fa");
+    let unidentified_path = out_dir.join("unidentified.fa");
     let unique_unidentified_path = assembly_dir.join("unique_unidentified.fa");
 
     info!("[run] starting fanout_to_channels for annotated FASTA (2 private channels)");
