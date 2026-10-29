@@ -8166,7 +8166,7 @@ async fn blast_contigs(
         .await?;
 
     cleanup_tasks.push(blast_m8_write_task);
-    
+
 
     // ── Top hits ──────────────────────────────────────────────────────────
     let (top_internal_tx, top_internal_rx) = mpsc::channel(131_072);
@@ -8215,8 +8215,44 @@ async fn blast_contigs(
         })
     };
 
+    // Fan out top-M8:
+    //   branch 0 -> existing update/caller forwarder
+    //   branch 1 -> durable WDL artifact
+    let (top_m8_rxs, top_m8_fanout_done) = fanout_to_channels(
+        ReceiverStream::new(top_internal_rx),
+        2,
+        "blast_contigs_top_m8",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await?;
+
+    let mut top_m8_rxs_iter = top_m8_rxs.into_iter();
+
+    let top_m8_forward_rx = top_m8_rxs_iter
+        .next()
+        .ok_or(PipelineError::EmptyStream)?;
+
+    let top_m8_artifact_rx = top_m8_rxs_iter
+        .next()
+        .ok_or(PipelineError::EmptyStream)?;
+
+    cleanup_receivers.push(top_m8_fanout_done);
+
+    let blast_top_m8_write_task = write_byte_stream_to_file(
+        &blast_top_m8_path,
+        ReceiverStream::new(top_m8_artifact_rx),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "blast_contigs_top_m8",
+        true,
+    )
+        .await?;
+
+    cleanup_tasks.push(blast_top_m8_write_task);
+
     let forward_handle = tokio::spawn({
-        let mut rx = top_internal_rx;
+        let mut rx = top_m8_forward_rx;
         let tx_update = top_for_update_tx;
         let tx_caller = top_for_caller_tx;
         async move {
