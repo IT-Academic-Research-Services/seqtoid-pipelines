@@ -11315,8 +11315,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let taxid_mapped_file = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
     let taxid_mapped_locator = taxid_mapped_iter.next().ok_or(PipelineError::EmptyStream)?;
 
-    let mapped_path = assembly_dir.join("refined_taxid_annot_mapped_only_fasta");
-    let combined_path = assembly_dir.join("refined_taxid_annot_fasta");
+    let mapped_path =
+        assembly_dir.join("refined_taxid_annot_mapped_only.fasta");
+
+    let combined_path =
+        assembly_dir.join("refined_taxid_annot.fasta");
 
     let write_mapped_handle = write_fasta_stream_to_file(
         ReceiverStream::new(taxid_mapped_file),
