@@ -10687,15 +10687,89 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
                 .map_err(|e| PipelineError::Other(anyhow!(e.to_string())))
         },
     )?;
+
     let nt_counts = nt_counts?;
     let nr_counts = nr_counts?;
 
-    let combined_path = out_dir.join(rename_file_path(
-        &sample_base_buf,
-        None,
-        Some("taxon_counts_with_dcr.json"),
-        "_",
-    ));
+    // Persist the individual initial NT/NR taxon-count artifacts required
+    // by the legacy non-host-alignment workflow.
+    //
+    // nt_counts / nr_counts are already the completed outputs of
+    // generate_taxon_counts(), so no additional stream or counting pass
+    // is required.
+    let nt_counts_path =
+        out_dir.join("gsnap_counts_with_dcr.json");
+
+    let nr_counts_path =
+        out_dir.join("rapsearch2_counts_with_dcr.json");
+
+    let nt_counts_json = serde_json::to_vec(&nt_counts)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Failed to serialize gsnap_counts_with_dcr.json: {}",
+            e
+        ))
+        })?;
+
+    let nr_counts_json = serde_json::to_vec(&nr_counts)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Failed to serialize rapsearch2_counts_with_dcr.json: {}",
+            e
+        ))
+        })?;
+
+    let nt_counts_write_task = {
+        let path = nt_counts_path.clone();
+
+        tokio::spawn(async move {
+            tokio::fs::write(&path, nt_counts_json)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                    "Failed to write {}: {}",
+                    path.display(),
+                    e
+                )
+                })?;
+
+            info!(
+            "Wrote initial NT taxon counts to {}",
+            path.display()
+        );
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    let nr_counts_write_task = {
+        let path = nr_counts_path.clone();
+
+        tokio::spawn(async move {
+            tokio::fs::write(&path, nr_counts_json)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                    "Failed to write {}: {}",
+                    path.display(),
+                    e
+                )
+                })?;
+
+            info!(
+            "Wrote initial NR taxon counts to {}",
+            path.display()
+        );
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    cleanup_tasks.push(nt_counts_write_task);
+    cleanup_tasks.push(nr_counts_write_task);
+
+    let combined_path =
+        out_dir.join("taxon_counts_with_dcr.json");
 
     let nt_counts_for_combine = nt_counts.clone();
     let nr_counts_for_combine = nr_counts.clone();
