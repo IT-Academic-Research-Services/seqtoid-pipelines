@@ -8633,6 +8633,70 @@ async fn blast_contigs(
         contig_summary.len()
     );
 
+
+    // =====================================================================
+    // Persist WDL-compatible refined JSON artifacts.
+    //
+    // Paths were constructed at the top of blast_contigs():
+    //
+    // NT:
+    //   assembly/refined_gsnap_counts_with_dcr.json
+    //   assembly/gsnap_contig_summary.json
+    //
+    // NR:
+    //   assembly/refined_rapsearch2_counts_with_dcr.json
+    //   assembly/rapsearch2_contig_summary.json
+    // =====================================================================
+
+    let refined_counts_bytes = serde_json::to_vec(&refined_counts)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "[blast_contigs:{}] failed serializing refined counts: {}",
+            db_type,
+            e
+        ))
+        })?;
+
+    let contig_summary_bytes = serde_json::to_vec(&contig_summary)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "[blast_contigs:{}] failed serializing contig summary: {}",
+            db_type,
+            e
+        ))
+        })?;
+
+    let refined_counts_write_task = write_vecu8_to_file(
+        Arc::new(refined_counts_bytes),
+        &refined_counts_path,
+        16 * 1024 * 1024,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "[blast_contigs:{}] failed starting refined counts writer: {}",
+        db_type,
+        e
+    ))
+        })?;
+
+    let contig_summary_write_task = write_vecu8_to_file(
+        Arc::new(contig_summary_bytes),
+        &contig_summary_path,
+        16 * 1024 * 1024,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+        "[blast_contigs:{}] failed starting contig summary writer: {}",
+        db_type,
+        e
+    ))
+        })?;
+
+    cleanup_tasks.push(refined_counts_write_task);
+    cleanup_tasks.push(contig_summary_write_task);
+    
     let final_read_dict = read_dict.lock().unwrap().clone();
     info!(
         "[blast_contigs:{}] DONE after {:?} — counts={} contig_summary={} read_dict={}",
