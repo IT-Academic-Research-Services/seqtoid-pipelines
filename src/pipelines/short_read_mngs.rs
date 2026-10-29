@@ -11135,7 +11135,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         out_dir
             .join("assembly")
             .join("refined_taxon_counts_with_dcr.json");
-    
+
     let (_path, refined_write_json_task) = combine_taxon_counts(
         &nt_refined_counts,
         &nr_refined_counts,
@@ -11192,10 +11192,86 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.append(&mut annot_tasks);
     cleanup_receivers.append(&mut annot_rxs);
-    cleanup_tasks.append(&mut annot_tasks);
-    cleanup_receivers.append(&mut annot_rxs);
 
-    let unique_path = assembly_dir.join("unique_refined_unidentified.fa");
+    // Refined mapped FASTA:
+    //   branch 1 -> generate_taxid_fasta
+    //   branch 2 -> required WDL artifact
+    let (refined_mapped_rxs, refined_mapped_done_rx) =
+        fanout_to_channels(
+            ReceiverStream::new(mapped_contigs_rx),
+            2,
+            "refined_annotated",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await?;
+
+    cleanup_receivers.push(refined_mapped_done_rx);
+
+    let mut refined_mapped_rxs = refined_mapped_rxs.into_iter();
+
+    let refined_mapped_taxid_stream =
+        refined_mapped_rxs
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let refined_mapped_file_stream =
+        refined_mapped_rxs
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+
+    // Refined unidentified FASTA:
+    //   branch 1 -> generate_taxid_fasta
+    //   branch 2 -> required WDL artifact
+    let (refined_unidentified_rxs, refined_unidentified_done_rx) =
+        fanout_to_channels(
+            ReceiverStream::new(unidentified_contigs_rx),
+            2,
+            "refined_unidentified",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await?;
+
+    cleanup_receivers.push(refined_unidentified_done_rx);
+
+    let mut refined_unidentified_rxs =
+        refined_unidentified_rxs.into_iter();
+
+    let refined_unidentified_taxid_stream =
+        refined_unidentified_rxs
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+    let refined_unidentified_file_stream =
+        refined_unidentified_rxs
+            .next()
+            .ok_or(PipelineError::EmptyStream)?;
+
+
+    // Start artifact consumers immediately.
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        ReceiverStream::new(refined_mapped_file_stream),
+        assembly_dir.join("refined_annotated_merged.fa"),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "refined_annotated_merged",
+    ));
+
+    cleanup_tasks.push(write_fasta_stream_to_file(
+        ReceiverStream::new(refined_unidentified_file_stream),
+        assembly_dir.join("refined_unidentified.fa"),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "refined_unidentified",
+    ));
+
+
+    // Existing internal artifact remains unchanged.
+    let unique_path =
+        assembly_dir.join("unique_refined_unidentified.fa");
+
     let unique_write = write_fasta_stream_to_file(
         ReceiverStream::new(unique_unidentified_rx),
         unique_path,
@@ -11203,14 +11279,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         StreamDataType::JustBytes,
         "unique_refined_unidentified",
     );
+
     cleanup_tasks.push(unique_write);
+
 
     // Hit maps from refined pairs (summary side only). Already ReceiverStream<ReducedRead>.
     let (taxid_mapped_rx, taxid_combined_rx, load_nt_task, load_nr_task, taxid_main_task) =
         generate_taxid_fasta(
             config.clone(),
-            ReceiverStream::new(mapped_contigs_rx),
-            ReceiverStream::new(unidentified_contigs_rx),
+            ReceiverStream::new(refined_mapped_taxid_stream),
+            ReceiverStream::new(refined_unidentified_taxid_stream),
             nt_pairs_taxid_refined,
             nr_pairs_taxid_refined,
             lineage_map.clone(),
