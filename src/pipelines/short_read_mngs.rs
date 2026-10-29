@@ -9418,7 +9418,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ercc_bt2_cleanup_tasks,
         ercc_bt2_cleanup_receivers,
         ercc_bt2_bam_write_handle,
-        _ercc_bt2_bam_path,
+        ercc_bt2_bam_path,
         ercc_bt2_temp_dirs,
     ) = bowtie2_filter_stream(
         config.clone(),
@@ -11872,6 +11872,56 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         ercc_bt2_bam_write_handle.await??;
         host_bt2_bam_write_handle.await??;
 
+        let ercc_view_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
+            .positional(ercc_bt2_bam_path.to_string_lossy().to_string());
+
+        let ercc_view_args =
+            generate_cli(SAMTOOLS_TAG, &config, Some(&ercc_view_config))?;
+
+        let (mut ercc_view_child, ercc_view_err_task) = spawn_cmd(
+            config.clone(),
+            SAMTOOLS_TAG,
+            ercc_view_args,
+            config.args.verbose,
+            None,
+        )
+            .await?;
+
+        let ercc_view_lines = read_child_output_to_vec(
+            &mut ercc_view_child,
+            ChildStream::Stdout,
+            &config,
+        )
+            .await?;
+
+        ercc_view_err_task.await??;
+
+        let mut ercc_counts: HashMap<String, u64> = HashMap::new();
+
+        for line in ercc_view_lines {
+            if let Some(rname) = line.split('\t').nth(2) {
+                if rname.starts_with("ERCC-") {
+                    *ercc_counts.entry(rname.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut ercc_counts: Vec<_> = ercc_counts.into_iter().collect();
+        ercc_counts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let ercc_counts_path = out_dir_host.join("bowtie2_ERCC_counts.tsv");
+        let ercc_counts_file = TokioFile::create(&ercc_counts_path).await?;
+        let mut ercc_counts_writer = BufWriter::new(ercc_counts_file);
+
+        for (ercc_id, count) in ercc_counts {
+            let line = format!("{}\t{}\n", ercc_id, count);
+            ercc_counts_writer.write_all(line.as_bytes()).await?;
+        }
+
+        ercc_counts_writer.flush().await?;
+
+        info!("Wrote bowtie2_ERCC_counts.tsv");
+
         if let Some(handle) = optional_human_bam_write_handle {
             handle.await??;
         }
@@ -11888,9 +11938,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
         if paired {
             info!(
-                "Computing host insert size statistics from {}",
-                host_bt2_bam_path.display()
-            );
+            "Computing host insert size statistics from {}",
+            host_bt2_bam_path.display()
+        );
 
             let stats = compute_insert_size_stats_from_bam(host_bt2_bam_path.clone(), None)
                 .await
@@ -11917,9 +11967,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             }
 
             info!(
-                "Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
-                stats.mean, stats.median, stats.total_proper_pairs
-            );
+            "Host insert size stats written: mean {:.2}, median {:.0}, {} proper pairs",
+            stats.mean, stats.median, stats.total_proper_pairs
+        );
         }
 
         Ok::<_, PipelineError>((host_bt2_counts, host_hisat2_counts))
