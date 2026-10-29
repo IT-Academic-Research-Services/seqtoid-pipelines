@@ -11438,13 +11438,36 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     );
     cleanup_tasks.push(initial_write_combined_handle);
 
-    let initial_mapped_count = stream_record_counter(initial_taxid_mapped_count, false)
-        .await?
-        .reads;
+    info!("Starting generate_taxid_locator on second");
 
-    let initial_combined_count = stream_record_counter(initial_taxid_combined_count, false)
-        .await?
-        .reads;
+    let (
+        initial_locator_outputs,
+        mut initial_locator_tasks,
+        _initial_locator_receivers,
+    ) = generate_taxid_locator(
+        config.clone(),
+        initial_taxid_mapped_locator,
+        out_dir.clone(),
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+            "Experimental generate_taxid_locator failed: {}",
+            e
+        ))
+        })?;
+
+    cleanup_tasks.append(&mut initial_locator_tasks);
+
+    let initial_mapped_count =
+        stream_record_counter(initial_taxid_mapped_count, false)
+            .await?
+            .reads;
+
+    let initial_combined_count =
+        stream_record_counter(initial_taxid_combined_count, false)
+            .await?
+            .reads;
 
     info!(
     "Experimental: {} mapped, {} combined records",
@@ -11452,18 +11475,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     initial_combined_count
 );
 
-    info!("Starting generate_taxid_locator on second");
-    let (initial_locator_outputs, mut initial_locator_tasks, _initial_locator_receivers) =
-        generate_taxid_locator(
-            config.clone(),
-            initial_taxid_mapped_locator,
-            out_dir.clone(),
-        )
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!("Experimental generate_taxid_locator failed: {}", e))
-            })?;
-    info!("second generate_taxid_locator odone ");
+    info!("generate_taxid_locator started");
+
 
     // Now safe to await the annotated and unidentified fanout tasks
     annotated_done_rx.await??;
