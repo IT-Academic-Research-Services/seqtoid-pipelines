@@ -7834,7 +7834,7 @@ async fn blast_contigs(
     );
 
     let mut cleanup_tasks = Vec::new();
-    let cleanup_receivers = Vec::new();
+    let mut cleanup_receivers = Vec::new();
 
     let out_dir = config.out_dir.join("assembly");
     tokio::fs::create_dir_all(&out_dir).await?;
@@ -8131,6 +8131,43 @@ async fn blast_contigs(
     )
         .await?;
 
+    // Fan out raw BLAST M8:
+    //   branch 0 -> existing top-hit computation
+    //   branch 1 -> durable WDL artifact
+    let (blast_m8_rxs, blast_m8_fanout_done) = fanout_to_channels(
+        ReceiverStream::new(blast_out_stream),
+        2,
+        "blast_contigs_raw_m8",
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await?;
+
+    let mut blast_m8_rxs_iter = blast_m8_rxs.into_iter();
+
+    let blast_m8_compute_rx = blast_m8_rxs_iter
+        .next()
+        .ok_or(PipelineError::EmptyStream)?;
+
+    let blast_m8_artifact_rx = blast_m8_rxs_iter
+        .next()
+        .ok_or(PipelineError::EmptyStream)?;
+
+    cleanup_receivers.push(blast_m8_fanout_done);
+
+    let blast_m8_write_task = write_byte_stream_to_file(
+        &blast_m8_path,
+        ReceiverStream::new(blast_m8_artifact_rx),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "blast_contigs_raw_m8",
+        true,
+    )
+        .await?;
+
+    cleanup_tasks.push(blast_m8_write_task);
+    
+
     // ── Top hits ──────────────────────────────────────────────────────────
     let (top_internal_tx, top_internal_rx) = mpsc::channel(131_072);
     let (top_for_update_tx, top_for_update_rx) = mpsc::channel(131_072);
@@ -8148,7 +8185,7 @@ async fn blast_contigs(
         tokio::spawn(async move {
             info!("[blast_contigs:{}] get_top_m8_nt started", db_type);
             let res =
-                get_top_m8_nt(ReceiverStream::new(blast_out_stream), top_internal_tx, c, bs).await;
+                get_top_m8_nt(ReceiverStream::new(blast_m8_compute_rx), top_internal_tx, c, bs).await;
             info!(
                 "[blast_contigs:{}] get_top_m8_nt finished after {:?}",
                 db_type,
@@ -8168,7 +8205,7 @@ async fn blast_contigs(
         tokio::spawn(async move {
             info!("[blast_contigs:{}] get_top_m8_nr started", db_type);
             let res =
-                get_top_m8_nr(ReceiverStream::new(blast_out_stream), top_internal_tx, c, bs).await;
+                get_top_m8_nr(ReceiverStream::new(blast_m8_compute_rx), top_internal_tx, c, bs).await;
             info!(
                 "[blast_contigs:{}] get_top_m8_nr finished after {:?}",
                 db_type,
@@ -8696,7 +8733,7 @@ async fn blast_contigs(
 
     cleanup_tasks.push(refined_counts_write_task);
     cleanup_tasks.push(contig_summary_write_task);
-    
+
     let final_read_dict = read_dict.lock().unwrap().clone();
     info!(
         "[blast_contigs:{}] DONE after {:?} — counts={} contig_summary={} read_dict={}",
