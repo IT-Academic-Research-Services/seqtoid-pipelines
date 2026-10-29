@@ -8518,48 +8518,61 @@ async fn blast_contigs(
     );
 
 
-    // Durable hitsummary2 + reassigned m8 (CZID: gsnap.hitsummary2.tab / gsnap.reassigned.m8)
-    // Written from the same pairs_out that feeds merge / taxid / coverage.
-    let hitsummary2_path = config
-        .out_dir
-        .join(format!("{}_{}.hitsummary2.tab", sample_base, db_type));
-    let reassigned_m8_path = config
-        .out_dir
-        .join(format!("{}_{}.reassigned.m8", sample_base, db_type));
 
+
+    // Durable refined artifacts.
+    //
+    // These are the WDL-compatible outputs:
+    //   NT: assembly/gsnap.reassigned.m8
+    //       assembly/gsnap.hitsummary2.tab
+    //   NR: assembly/rapsearch2.reassigned.m8
+    //       assembly/rapsearch2.hitsummary2.tab
+    //
+    // Write from the same pairs_out that continues into downstream
+    // merge / taxid / coverage processing.
     {
         use tokio::io::AsyncWriteExt;
-        let mut hit_w =
-            tokio::io::BufWriter::new(tokio::fs::File::create(&hitsummary2_path).await?);
-        let mut m8_w =
-            tokio::io::BufWriter::new(tokio::fs::File::create(&reassigned_m8_path).await?);
+
+        let mut hit_w = tokio::io::BufWriter::new(
+            tokio::fs::File::create(&refined_hit_summary_path).await?
+        );
+
+        let mut m8_w = tokio::io::BufWriter::new(
+            tokio::fs::File::create(&refined_m8_path).await?
+        );
 
         let mut long_rows = 0u64;
+
         for p in &pairs_out {
             let nf = p.summary.split(|&b| b == b'\t').count();
+
             if nf >= 12 {
                 long_rows += 1;
             }
+
             hit_w.write_all(&p.summary).await?;
             if !p.summary.ends_with(b"\n") {
                 hit_w.write_all(b"\n").await?;
             }
+
             m8_w.write_all(&p.dedup).await?;
             if !p.dedup.ends_with(b"\n") {
                 m8_w.write_all(b"\n").await?;
             }
         }
+
         hit_w.flush().await?;
         m8_w.flush().await?;
 
         info!(
-            "[blast_contigs:{}] wrote hitsummary2={} lines={} long_rows(>=12)={} reassigned_m8={}",
-            db_type,
-            hitsummary2_path.display(),
-            pairs_out.len(),
-            long_rows,
-            reassigned_m8_path.display()
-        );
+        "[blast_contigs:{}] wrote refined_hit_summary={} lines={} \
+         long_rows(>=12)={} refined_m8={}",
+        db_type,
+        refined_hit_summary_path.display(),
+        pairs_out.len(),
+        long_rows,
+        refined_m8_path.display()
+    );
     }
 
 
@@ -11481,7 +11494,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Now safe to await the annotated and unidentified fanout tasks
     annotated_done_rx.await??;
     unidentified_done_rx.await??;
-    
+
     info!(
         "Experimental taxid locator files generated: {:?}",
         initial_locator_outputs
