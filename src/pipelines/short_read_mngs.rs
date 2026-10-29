@@ -11086,12 +11086,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         final_temp_dirs.push(td);
     }
 
-    for rx in nt_cleanup_receivers {
-        rx.await??;
-    }
-    for rx in nr_cleanup_receivers {
-        rx.await??;
-    }
+    cleanup_receivers.extend(nt_cleanup_receivers);
+    cleanup_receivers.extend(nr_cleanup_receivers);
 
     for rx in nt_call_cleanup_receivers {
         rx.await??;
