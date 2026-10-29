@@ -1986,7 +1986,20 @@ async fn kallisto_results(
                 ercc_counts.push((target_id.clone(), est_counts));
             }
 
-            transcript_to_gene.push((target_id, format!("gene_{}", fields[0])));
+            let gene_id = if target_id.starts_with("ERCC-")
+                || target_id.starts_with("RNA")
+                || target_id.starts_with("rRNA")
+            {
+                target_id.clone()
+            } else {
+                target_id
+                    .split('|')
+                    .find(|part| part.starts_with("ENSG"))
+                    .unwrap_or(&target_id)
+                    .to_string()
+            };
+
+            transcript_to_gene.push((target_id, gene_id));
             parsed += 1;
         }
 
@@ -11981,9 +11994,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             Ok(_) => info!("Kallisto completed successfully"),
             Err(e) => {
                 warn!(
-                    "Kallisto failed (non-fatal, possibly no ERCC spiked in): {}",
-                    e
-                );
+                "Kallisto failed (non-fatal, possibly no ERCC spiked in): {}",
+                e
+            );
             }
         }
 
@@ -12004,39 +12017,57 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         tokio::fs::create_dir_all(&kallisto_dir).await?;
 
         let abundance_path = kallisto_dir.join("abundance.tsv");
-        let abundance_file = TokioFile::create(&abundance_path).await?;
-        let mut abundance_writer = BufWriter::new(abundance_file);
+        let reads_per_transcript_path =
+            out_dir_kallisto.join("reads_per_transcript.kallisto.tsv");
 
-        abundance_writer
-            .write_all(b"target_id\tlength\teff_length\test_counts\ttpm\n")
-            .await?;
+        tokio::fs::rename(
+            &abundance_path,
+            &reads_per_transcript_path,
+        )
+            .await
+            .map_err(|e| PipelineError::IOError(format!(
+                "Failed to rename {} to {}: {}",
+                abundance_path.display(),
+                reads_per_transcript_path.display(),
+                e
+            )))?;
 
-        for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
-            let line = format!("{}\t0\t0\t{:.6}\t0.000000\n", target_id, est_counts);
-            abundance_writer.write_all(line.as_bytes()).await?;
-        }
-        abundance_writer.flush().await?;
         info!(
-            "Wrote Kallisto abundance.tsv with {} ERCC transcripts",
-            kallisto_ercc_counts.ercc_counts.len()
-        );
+        "Wrote reads_per_transcript.kallisto.tsv to {}",
+        reads_per_transcript_path.display()
+    );
 
-        let ercc_path = out_dir_kallisto.join("kallisto_ERCC_counts_tsv");
+        let ercc_path = out_dir_kallisto.join("ERCC_counts.tsv");
         let ercc_file = TokioFile::create(&ercc_path).await?;
         let mut ercc_writer = BufWriter::new(ercc_file);
-
-        ercc_writer.write_all(b"target_id\test_counts\n").await?;
 
         for (target_id, est_counts) in &kallisto_ercc_counts.ercc_counts {
             let line = format!("{}\t{:.6}\n", target_id, est_counts);
             ercc_writer.write_all(line.as_bytes()).await?;
         }
+
         ercc_writer.flush().await?;
-        info!("Wrote kallisto_ERCC_counts_tsv");
+        info!("Wrote ERCC_counts.tsv");
+
+        let transcript_to_gene_path =
+            out_dir_kallisto.join("transcript_to_gene_mapping.kallisto.tsv");
+
+        let transcript_to_gene_file =
+            TokioFile::create(&transcript_to_gene_path).await?;
+
+        let mut transcript_to_gene_writer =
+            BufWriter::new(transcript_to_gene_file);
+
+        for (transcript_id, gene_id) in &kallisto_ercc_counts.transcript_to_gene {
+            let line = format!("{}\t{}\n", transcript_id, gene_id);
+            transcript_to_gene_writer.write_all(line.as_bytes()).await?;
+        }
+
+        transcript_to_gene_writer.flush().await?;
+        info!("Wrote transcript_to_gene_mapping.kallisto.tsv");
 
         Ok::<_, PipelineError>((kallisto_ercc_counts, ()))
     };
-
     let dedup_and_subsample_counts_fut = async move {
         let uniques_count = dedup_count_rx
             .await
