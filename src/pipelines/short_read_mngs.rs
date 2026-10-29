@@ -12069,6 +12069,30 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     )
         .await?;
 
+    let validation_summary = serde_json::json!({
+    "<50": validation_stats.validation_too_short,
+    "50-500": validation_stats.validation_normal,
+    "500-10000": validation_stats.validation_long,
+    "10000+": validation_stats.validation_too_long,
+});
+
+    let validation_summary_path =
+        out_dir.join("validate_input_summary.json");
+
+    tokio::fs::write(
+        &validation_summary_path,
+        serde_json::to_vec(&validation_summary)
+            .map_err(|e| PipelineError::Other(e.into()))?,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to write {}: {}",
+                validation_summary_path.display(),
+                e
+            ))
+        })?;
+
     write_count_file(
         &out_dir,
         "fastp_out.count",

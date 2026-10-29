@@ -563,6 +563,11 @@ pub fn read_fastq(
         let mut unpaired_r1: u64 = 0;
         let mut unpaired_r2: u64 = 0;
 
+        let mut validation_too_short: u64 = 0;
+        let mut validation_normal: u64 = 0;
+        let mut validation_long: u64 = 0;
+        let mut validation_too_long: u64 = 0;
+
         // max_reads is a fragment limit:
         // - single-end: one read = one fragment
         // - paired-end: one R1+R2 pair = one fragment
@@ -613,6 +618,13 @@ pub fn read_fastq(
                     }
 
                     let seq_len = record.seq().len();
+
+                    match seq_len {
+                        0..=49 => validation_too_short += 1,
+                        50..=499 => validation_normal += 1,
+                        500..=9999 => validation_long += 1,
+                        _ => validation_too_long += 1,
+                    }
 
                     // Raw counts are taken before length filtering.
                     raw_reads += 1;
@@ -703,6 +715,10 @@ pub fn read_fastq(
                     oversized: oversized_reads,
                     unpaired_r1: 0,
                     unpaired_r2: 0,
+                    validation_too_short,
+                    validation_normal,
+                    validation_long,
+                    validation_too_long,
                 })
             }
 
@@ -805,6 +821,15 @@ pub fn read_fastq(
 
                             let r1_len = r1.seq().len();
                             let r2_len = r2.seq().len();
+
+                            for seq_len in [r1_len, r2_len] {
+                                match seq_len {
+                                    0..=49 => validation_too_short += 1,
+                                    50..=499 => validation_normal += 1,
+                                    500..=9999 => validation_long += 1,
+                                    _ => validation_too_long += 1,
+                                }
+                            }
 
                             // Raw counts are additive across R1 and R2.
                             raw_reads += 2;
@@ -952,6 +977,10 @@ pub fn read_fastq(
                     oversized: oversized_reads,
                     unpaired_r1,
                     unpaired_r2,
+                    validation_too_short,
+                    validation_normal,
+                    validation_long,
+                    validation_too_long,
                 })
             }
         }
