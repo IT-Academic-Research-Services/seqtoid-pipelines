@@ -11645,6 +11645,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     info!("Starting generate_taxid_locator on second");
 
+    let initial_mapped_count_task = tokio::spawn(async move {
+        let stats =
+            stream_record_counter(initial_taxid_mapped_count, false).await?;
+
+        Ok::<u64, anyhow::Error>(stats.reads)
+    });
+
+    let initial_combined_count_task = tokio::spawn(async move {
+        let stats =
+            stream_record_counter(initial_taxid_combined_count, false).await?;
+
+        Ok::<u64, anyhow::Error>(stats.reads)
+    });
+
     let (
         initial_locator_outputs,
         mut initial_locator_tasks,
@@ -11665,15 +11679,8 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.append(&mut initial_locator_tasks);
 
-    let initial_mapped_count =
-        stream_record_counter(initial_taxid_mapped_count, false)
-            .await?
-            .reads;
-
-    let initial_combined_count =
-        stream_record_counter(initial_taxid_combined_count, false)
-            .await?
-            .reads;
+    let initial_mapped_count = initial_mapped_count_task.await??;
+    let initial_combined_count = initial_combined_count_task.await??;
 
     info!(
     "Experimental: {} mapped, {} combined records",
