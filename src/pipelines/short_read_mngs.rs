@@ -9248,6 +9248,29 @@ async fn collect_m8_accession_map(
     Ok(map)
 }
 
+
+async fn write_count_file(
+    out_dir: &PathBuf,
+    filename: &str,
+    count: u64,
+) -> Result<(), PipelineError> {
+    let path = out_dir.join(filename);
+
+    tokio::fs::write(&path, format!("{}\n", count))
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to write count file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+    info!("Wrote {}: {}", path.display(), count);
+
+    Ok(())
+}
+
 /// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
 ///
 /// # Arguments
@@ -11805,7 +11828,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             stats.raw_reads, stats.raw_bases, stats.validated, stats.validated_bases, stats.undersized, stats.oversized
         );
 
-        let _qc_fastp_read_count = match qc_count_result_rx.await {
+        let qc_fastp_read_count = match qc_count_result_rx.await {
             Ok(Ok(count)) => {
                 info!("Received fastp read count: {}", count);
                 count
@@ -11824,7 +11847,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             .await
             .map_err(|e| PipelineError::Other(anyhow!("ERCC count receiver failed: {}", e)))?;
 
-        Ok::<_, PipelineError>((stats, ercc_mapped_count))
+        Ok::<_, PipelineError>((stats, ercc_mapped_count, qc_fastp_read_count))
     };
 
     let host_bam_and_counts_fut = async move {
@@ -11988,16 +12011,62 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     };
 
     let (
-        _validation_and_qc,
+        validation_and_qc,
         _host_bam_and_counts,
         _kallisto_and_taxon,
-        _dedup_and_subsample_counts,
+        dedup_and_subsample_counts,
     ) = tokio::try_join!(
     validation_and_qc_fut,
     host_bam_and_counts_fut,
     kallisto_and_taxon_fut,
     dedup_and_subsample_counts_fut,
 )?;
+
+    let (
+        validation_stats,
+        _ercc_mapped_count,
+        qc_fastp_read_count,
+    ) = validation_and_qc;
+
+    let (
+        unique_reads,
+        subsample_reads,
+    ) = dedup_and_subsample_counts;
+
+    write_count_file(
+        &out_dir,
+        "fastqs.count",
+        validation_stats.raw_reads,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "validate_input_out.count",
+        validation_stats.validated,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "fastp_out.count",
+        qc_fastp_read_count,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "czid_dedup_out.count",
+        unique_reads,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "subsampled_out.count",
+        subsample_reads,
+    )
+        .await?;
 
     // *******************
     // Cleanup
