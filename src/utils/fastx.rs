@@ -2603,11 +2603,21 @@ pub async fn generate_taxid_locator(
                 )
             };
             let fa_path = assembly_dir.join(&fa_name);
-            let json_path = assembly_dir.join(format!(
-                "refined_taxid_locations_{}_{}.json",
-                level,
-                hit_type.to_lowercase()
-            ));
+
+            let json_name = if level == "species" {
+                format!(
+                    "refined_taxid_locations_{}.json",
+                    hit_type.to_lowercase()
+                )
+            } else {
+                format!(
+                    "refined_taxid_locations_{}_{}.json",
+                    level,
+                    hit_type.to_lowercase()
+                )
+            };
+
+            let json_path = assembly_dir.join(json_name);
 
             output_paths.push(fa_path.clone());
             output_paths.push(json_path.clone());
