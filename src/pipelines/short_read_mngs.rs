@@ -733,7 +733,7 @@ async fn bowtie2_filter_stream(
         bam_write_task,
         count_rx,
         mut cleanup_tasks,
-        cleanup_receivers,
+        mut cleanup_receivers,
         temp_dir,
     ) = bowtie2_align_and_sort_stream(
         config.clone(),
@@ -788,9 +788,53 @@ async fn bowtie2_filter_stream(
             .await?
     };
 
-    Ok((
+    // The WDL reads_out_count is the number of FASTQ records emitted by
+    // samtools fastq after filtering. Tee that exact output so the count
+    // and downstream stream are derived from identical data.
+    let (filtered_streams, filtered_done_rx) = fanout_to_channels(
         ReceiverStream::new(out_stream),
-        count_rx,
+        2,
+        "bt2_filtered_count",
+        &config,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
+
+    cleanup_receivers.push(filtered_done_rx);
+
+    let mut filtered_streams = filtered_streams.into_iter();
+
+    let filtered_out_stream = ReceiverStream::new(
+        filtered_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let filtered_count_stream = ReceiverStream::new(
+        filtered_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let (filtered_count_tx, filtered_count_rx) = oneshot::channel::<u64>();
+
+    let filtered_count_task = tokio::spawn(async move {
+        let stats =
+            stream_record_counter(filtered_count_stream.into_inner(), false).await?;
+
+        filtered_count_tx
+            .send(stats.reads)
+            .map_err(|_| anyhow!("Bowtie2 filtered count receiver dropped"))?;
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(filtered_count_task);
+
+    Ok((
+        filtered_out_stream,
+        filtered_count_rx,
         cleanup_tasks,
         cleanup_receivers,
         bam_write_task,
@@ -1199,66 +1243,42 @@ async fn hisat2_filter(
 
         let out_stream = ReceiverStream::new(rx);
 
-        // 5. mapped count
-        let (count_tx, count_rx) = oneshot::channel();
+        // 5. filtered FASTQ count
+        let (filtered_streams, filtered_done_rx) = fanout_to_channels(
+            out_stream,
+            2,
+            "hisat2_filtered_count",
+            &config,
+            StreamDataType::IlluminaFastq,
+        )
+            .await
+            .map_err(|_| PipelineError::StreamDataDropped)?;
 
-        let count_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
-            .option(
-                "-@",
-                config
-                    .thread_allocation(SAMTOOLS_TAG, Some("view"))
-                    .to_string(),
-            )
-            .flag("--no-PG")
-            .flag("-c")
-            .flag("-F13")
-            .positional(bam_path.to_string_lossy().to_string());
+        cleanup_receivers.push(filtered_done_rx);
 
-        let count_args =
-            generate_cli(SAMTOOLS_TAG, &config, Some(&count_config))
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: SAMTOOLS_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+        let mut filtered_streams = filtered_streams.into_iter();
 
-        let count_config_clone = config.clone();
+        let filtered_out_stream = ReceiverStream::new(
+            filtered_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+        let filtered_count_stream = ReceiverStream::new(
+            filtered_streams
+                .next()
+                .ok_or(PipelineError::EmptyStream)?,
+        );
+
+        let (count_tx, count_rx) = oneshot::channel::<u64>();
 
         let count_task = tokio::spawn(async move {
-            let (mut child, err_task) = spawn_cmd(
-                count_config_clone.clone(),
-                SAMTOOLS_TAG,
-                count_args,
-                count_config_clone.args.verbose,
-                None,
-            )
-                .await?;
+            let stats =
+                stream_record_counter(filtered_count_stream.into_inner(), false).await?;
 
-            let lines = read_child_output_to_vec(
-                &mut child,
-                ChildStream::Stdout,
-                &count_config_clone,
-            )
-                .await?;
-
-            let status = child.wait().await?;
-
-            err_task.await??;
-
-            if !status.success() {
-                return Err(anyhow!(
-            "samtools view count exited with status {}",
-            status
-        ));
-            }
-
-            let count = lines
-                .first()
-                .map(|line| line.trim())
-                .unwrap_or("0")
-                .parse::<u64>()
-                .unwrap_or(0);
-
-            let _ = count_tx.send(count);
+            count_tx
+                .send(stats.reads)
+                .map_err(|_| anyhow!("HISAT2 filtered count receiver dropped"))?;
 
             Ok::<(), anyhow::Error>(())
         });
@@ -1266,7 +1286,7 @@ async fn hisat2_filter(
         cleanup_tasks.push(count_task);
 
         return Ok((
-            out_stream,
+            filtered_out_stream,
             count_rx,
             cleanup_tasks,
             cleanup_receivers,
@@ -1366,7 +1386,7 @@ async fn hisat2_filter(
 
     // 3. Always fanout for count + fastq (reuse existing fanout + splits pattern).
     //    Write tee only if output_bam_path requested. Keeps streaming when None.
-    let num_tees = if output_bam_path.is_some() { 3 } else { 2 };
+    let num_tees = if output_bam_path.is_some() { 2 } else { 1 };
     let (streams, hisat2_bam_split_done_rx) = fanout_to_channels(
         ReceiverStream::new(sorted_bam_stream),
         num_tees,
@@ -1378,7 +1398,6 @@ async fn hisat2_filter(
         .map_err(|_| PipelineError::StreamDataDropped)?;
 
     let mut splits = streams.into_iter();
-    let count_stream = splits.next().ok_or(PipelineError::EmptyStream)?;
     let fastq_stream = splits.next().ok_or(PipelineError::EmptyStream)?;
 
     if let Some(bam_path) = output_bam_path {
@@ -1430,57 +1449,56 @@ async fn hisat2_filter(
 
     let out_stream = ReceiverStream::new(unmapped_fastq_stream);
 
-    // 5. mapped count via streaming view -c -F4 on its tee (correct SE count, no data drop)
-    let (count_tx, count_rx) = oneshot::channel();
-    let samtools_count_config = SamtoolsConfig::new(SamtoolsSubcommand::View)
-        .option(
-            "-@",
-            config
-                .thread_allocation(SAMTOOLS_TAG, Some("view"))
-                .to_string(),
-        )
-        .flag("--no-PG")
-        .flag("-c")
-        .flag("-F4")
-        .positional("-");
-    let count_args = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_count_config))?;
-
-    let (count_child_arc, count_stream_task, count_err_task) = stream_to_cmd(
-        config.clone(),
-        count_stream,
-        SAMTOOLS_TAG,
-        count_args,
-        StreamDataType::JustBytes,
-        config.args.verbose,
-        None,
+    // 5. filtered FASTQ count
+    let (filtered_streams, filtered_done_rx) = fanout_to_channels(
+        out_stream,
+        2,
+        "hisat2_filtered_count",
+        &config,
+        StreamDataType::IlluminaFastq,
     )
-        .await?;
+        .await
+        .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    cleanup_tasks.push(count_stream_task);
-    cleanup_tasks.push(count_err_task);
+    cleanup_receivers.push(filtered_done_rx);
 
-    let count_future = tokio::spawn({
-        let config = config.clone();
-        async move {
-            let mut guard = count_child_arc.lock().await;
-            let lines = read_child_output_to_vec(&mut guard, ChildStream::Stdout, &config).await?;
-            let count_str = lines.first().map(|s| s.trim()).unwrap_or("0");
-            let count: u64 = count_str.parse().unwrap_or(0);
-            let _ = count_tx.send(count);
-            Ok::<(), anyhow::Error>(())
-        }
+    let mut filtered_streams = filtered_streams.into_iter();
+
+    let filtered_out_stream = ReceiverStream::new(
+        filtered_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let filtered_count_stream = ReceiverStream::new(
+        filtered_streams
+            .next()
+            .ok_or(PipelineError::EmptyStream)?,
+    );
+
+    let (count_tx, count_rx) = oneshot::channel::<u64>();
+
+    let count_task = tokio::spawn(async move {
+        let stats =
+            stream_record_counter(filtered_count_stream.into_inner(), false).await?;
+
+        count_tx
+            .send(stats.reads)
+            .map_err(|_| anyhow!("HISAT2 filtered count receiver dropped"))?;
+
+        Ok::<(), anyhow::Error>(())
     });
-    cleanup_tasks.push(count_future);
+
+    cleanup_tasks.push(count_task);
 
     Ok((
-        out_stream,
+        filtered_out_stream,
         count_rx,
         cleanup_tasks,
         cleanup_receivers,
         vec![temp_dir],
     ))
 }
-
 
 /// Performs quality control on the input FASTQ stream using fastp.
 ///
@@ -12009,10 +12027,9 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             subsample_reads,
         ))
     };
-
     let (
         validation_and_qc,
-        _host_bam_and_counts,
+        host_bam_and_counts,
         _kallisto_and_taxon,
         dedup_and_subsample_counts,
     ) = tokio::try_join!(
@@ -12024,9 +12041,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (
         validation_stats,
-        _ercc_mapped_count,
+        ercc_filtered_count,
         qc_fastp_read_count,
     ) = validation_and_qc;
+
+    let (
+        host_bt2_filtered_count,
+        host_hisat2_filtered_count,
+    ) = host_bam_and_counts;
 
     let (
         unique_reads,
@@ -12051,6 +12073,27 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &out_dir,
         "fastp_out.count",
         qc_fastp_read_count,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "bowtie2_ercc_filtered_out.count",
+        ercc_filtered_count,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "bowtie2_host_filtered_out.count",
+        host_bt2_filtered_count,
+    )
+        .await?;
+
+    write_count_file(
+        &out_dir,
+        "hisat2_host_filtered_out.count",
+        host_hisat2_filtered_count,
     )
         .await?;
 
