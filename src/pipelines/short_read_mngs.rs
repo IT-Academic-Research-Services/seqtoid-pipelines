@@ -10226,7 +10226,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     cleanup_receivers.append(&mut nr_call_cleanup_receivers);
 
     // ---------------------------------------------------------------------
-    // Single 5-way fanout of ReducedRead.
+    // Single 6-way fanout of ReducedRead.
     //
     // Each logical pair remains together for every downstream consumer.
     // ---------------------------------------------------------------------
@@ -10239,7 +10239,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     let (nr_pair_rxs, nr_pairs_done_rx) = fanout_to_channels(
         nr_pairs,
-        5,
+        6,
         "nr_pairs",
         &config,
         StreamDataType::JustBytes,
