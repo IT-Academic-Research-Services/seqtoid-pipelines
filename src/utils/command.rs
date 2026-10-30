@@ -4910,6 +4910,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 SORT_TAG => sort::sort_presence_check(&config).await,
                 MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
                 FLYE_TAG => flye::flye_presence_check(&config, version_file).await,
+                PIGZ_TAG => pigz::pigz_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))
