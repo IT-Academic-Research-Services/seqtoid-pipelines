@@ -5080,15 +5080,15 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         );
 
 
-        // ================================================================
-        // IMPORTANT:
+        // The NT branch does not complete until its streaming pipeline
+        // has completed successfully.
         //
-        // Do NOT sort here yet unless the next long-read WDL stage requires
-        // read-ID grouping.
-        //
-        // RunNTAlignment itself ends at gsnap.m8. Sorting belongs to the
-        // downstream semantic stage if required there.
-        // ================================================================
+        // This is the synchronization boundary that guarantees single-node
+        // execution finishes NT before NR/Diamond begins.
+        for rx in nt_cleanup_receivers.drain(..) {
+            rx.await??;
+        }
+        
 
         info!(
         "[run] NT non-host alignment phase complete"
