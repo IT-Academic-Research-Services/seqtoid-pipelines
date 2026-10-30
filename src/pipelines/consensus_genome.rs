@@ -490,32 +490,34 @@ async fn align_to_host(
     ))
 }
 
-/// Processes ERCC spike-in sequences to quantify their abundance.
+/// Quantifies ERCC spike-in sequences from a side-branch copy of the
+/// host-removed FASTQ stream.
 ///
-/// # Arguments
+/// This mirrors the WDL QuantifyERCCs task:
 ///
-/// * `config`: the run configuration
-/// * `input_stream`: stream of interleaved FASTQ records
-/// * `ercc_index_path`: path to the minimap2 ERCC index
-/// * `out_dir`: directory where ERCC outputs will be written
-/// * `no_ext_sample_base`: sample base name without extension
+///   host-removed FASTQs
+///       -> minimap2 against ERCC reference
+///       -> samtools view (BAM)
+///       -> samtools stats
+///
+/// ERCC processing does NOT filter or transform the main read stream.
+/// The caller is responsible for fanout before calling this function.
+///
+/// Zero ERCC mappings are valid and are handled naturally by samtools stats.
 ///
 /// # Returns
 ///
-/// Result containing:
-/// - stream of non-ERCC FASTQ records
-/// - optional handle for the ERCC count results task
-/// - vector of cleanup tasks
-/// - vector of cleanup receivers
+/// - handle for parsed ERCC statistics
+/// - cleanup tasks
+/// - cleanup receivers
 async fn process_ercc(
     config: Arc<RunConfig>,
-    input_stream: ReceiverStream<ParseOutput>, // FASTQ byte stream
+    input_stream: ReceiverStream<ParseOutput>,
     ercc_index_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base: &str,
 ) -> Result<
     (
-        ReceiverStream<ParseOutput>,
         Option<JoinHandle<Result<HashMap<String, u64>, anyhow::Error>>>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
@@ -533,20 +535,12 @@ async fn process_ercc(
         "_",
     );
 
-    let (ercc_streams, ercc_router_handle) = fanout_to_channels(
-        input_stream,
-        2,
-        "process_ercc_bypass",
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await?;
-
-    let mut streams_iter = ercc_streams.into_iter();
-    let bypass_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let alignment_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    cleanup_receivers.push(ercc_router_handle);
-
+    // ------------------------------------------------------------
+    // Align host-removed reads to the ERCC reference.
+    //
+    // This stream is already a dedicated ERCC branch created by
+    // the caller. There is deliberately no bypass stream here.
+    // ------------------------------------------------------------
     let minimap_preset = match config.args.technology {
         Technology::Illumina => "sr",
         Technology::ONT => "map-ont",
@@ -573,10 +567,10 @@ async fn process_ercc(
 
     let (minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
-        alignment_stream, // Use alignment_stream, not input_stream
+        input_stream.into_inner(),
         MINIMAP2_TAG,
         minimap2_args,
-        StreamDataType::JustBytes, // FASTQ bytes
+        StreamDataType::JustBytes,
         config.args.verbose,
         None,
     )
@@ -585,12 +579,19 @@ async fn process_ercc(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(minimap2_stream_task);
     cleanup_tasks.push(minimap2_err_task);
 
     let minimap2_out_stream = {
         let mut guard = minimap2_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config)
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: MINIMAP2_TAG.to_string(),
@@ -598,98 +599,46 @@ async fn process_ercc(
             })?
     };
 
-    // Split SAM stream for check and further processing
-    let (sam_streams, sam_router_handle) = fanout_to_channels(
-        ReceiverStream::new(minimap2_out_stream),
-        2,
-        "process_ercc_sam",
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await?;
+    // ------------------------------------------------------------
+    // Convert minimap2 SAM output to BAM.
+    //
+    // Match the WDL:
+    //
+    //   samtools view --no-PG -bo ercc_mapped.bam
+    //
+    // Do NOT filter for mapped reads here. samtools stats determines
+    // the mapped-read counts from the BAM flags.
+    // ------------------------------------------------------------
+    let samtools_config_view =
+        SamtoolsConfig::new(SamtoolsSubcommand::View)
+            .option(
+                "-@",
+                config
+                    .thread_allocation(SAMTOOLS_TAG, Some("view"))
+                    .to_string(),
+            )
+            .flag("--no-PG")
+            .flag("-b")
+            .flag("-u");
 
-    cleanup_receivers.push(sam_router_handle);
-    let mut sam_streams_iter = sam_streams.into_iter();
-    let sam_check_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let sam_view_stream = sam_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+    let samtools_args_view =
+        generate_cli(
+            SAMTOOLS_TAG,
+            &config,
+            Some(&samtools_config_view),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
-    // Check task for empty ERCC alignments
-    let (count_tx, mut count_rx) = mpsc::channel(1);
-    let count_task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(sam_check_stream);
-        let mut count = 0;
-        while let Some(item) = stream.next().await {
-            match item {
-                ParseOutput::Bytes(bytes) => {
-                    let line_str = String::from_utf8_lossy(&bytes);
-                    if !line_str.starts_with('@') && !line_str.trim().is_empty() {
-                        count = 1;
-                        // Spawn background drain to avoid blocking
-                        tokio::spawn(async move {
-                            while stream.next().await.is_some() {}
-
-                            Ok::<(), anyhow::Error>(())
-                        });
-                        break; // Exit early to unblock sender
-                    }
-                }
-                _ => return Err(anyhow!("Unexpected item type in sam_check_stream")),
-            }
-        }
-        count_tx
-            .send(count)
-            .await
-            .map_err(|e| anyhow!("Failed to send SAM alignment count: {}", e))?;
-        Ok::<(), anyhow::Error>(())
-    });
-    cleanup_tasks.push(count_task);
-
-    let alignment_count = count_rx.recv().await.ok_or(PipelineError::EmptyStream)?;
-
-    if alignment_count == 0 {
-        // Case of no ERCC spike-ins
-        let (dummy_tx, dummy_rx) = mpsc::channel(config.base_buffer_size);
-        drop(dummy_tx); // Ensure stream is empty but valid
-        let drain_task = tokio::spawn(async move {
-            let mut stream = ReceiverStream::new(bypass_output_stream);
-            while stream.next().await.is_some() {}
-            Ok(())
-        });
-        cleanup_tasks.push(drain_task);
-
-        let zero_stats = HashMap::from([
-            ("ercc_mapped_reads".to_string(), 0),
-            ("ercc_mapped_paired".to_string(), 0),
-        ]);
-        let stats_write_task = tokio::spawn(async move {
-            let mut file = File::create(&ercc_stats_file_path)?;
-            writeln!(file, "ercc_mapped_reads: 0\nercc_mapped_paired: 0")?;
-            Ok(())
-        });
-        cleanup_tasks.push(stats_write_task);
-        return Ok((
-            ReceiverStream::new(dummy_rx),
-            Some(tokio::spawn(async { Ok(zero_stats) })),
-            cleanup_tasks,
-            cleanup_receivers,
-        ));
-    }
-
-    // Non-zero case: process stats
-    let samtools_config_view = SamtoolsConfig::new(SamtoolsSubcommand::View)
-        .option("-@", config.thread_allocation(SAMTOOLS_TAG, Some("view")).to_string())
-        .flag("--no-PG")
-        .flag("-b") // BAM output
-        .flag("-u"); // Uncompressed BAM;
-    let samtools_args_view = generate_cli(SAMTOOLS_TAG, &config, Some(&samtools_config_view))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
-
-    let (samtools_child_view, samtools_task_view, samtools_err_task_view) = stream_to_cmd(
+    let (
+        samtools_child_view,
+        samtools_task_view,
+        samtools_err_task_view,
+    ) = stream_to_cmd(
         config.clone(),
-        sam_view_stream,
+        minimap2_out_stream,
         SAMTOOLS_TAG,
         samtools_args_view,
         StreamDataType::JustBytes,
@@ -701,12 +650,19 @@ async fn process_ercc(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(samtools_task_view);
     cleanup_tasks.push(samtools_err_task_view);
 
     let samtools_out_stream_view = {
         let mut guard = samtools_child_view.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config)
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: SAMTOOLS_TAG.to_string(),
@@ -714,15 +670,33 @@ async fn process_ercc(
             })?
     };
 
-    let stats_samtools_config = SamtoolsConfig::new(SamtoolsSubcommand::Stats)
-        .positional("-");
-    let stats_samtools_args = generate_cli(SAMTOOLS_TAG, &config, Some(&stats_samtools_config))
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: SAMTOOLS_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    // ------------------------------------------------------------
+    // Generate ERCC statistics.
+    //
+    // This runs regardless of how many reads mapped to ERCC.
+    // Zero mapped reads are a normal samtools-stats result, not an
+    // empty-stream condition.
+    // ------------------------------------------------------------
+    let stats_samtools_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::Stats)
+            .positional("-");
 
-    let (stats_samtools_child, stats_samtools_task, stats_samtools_err_task) = stream_to_cmd(
+    let stats_samtools_args =
+        generate_cli(
+            SAMTOOLS_TAG,
+            &config,
+            Some(&stats_samtools_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    let (
+        stats_samtools_child,
+        stats_samtools_task,
+        stats_samtools_err_task,
+    ) = stream_to_cmd(
         config.clone(),
         samtools_out_stream_view,
         SAMTOOLS_TAG,
@@ -736,12 +710,19 @@ async fn process_ercc(
             tool: SAMTOOLS_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(stats_samtools_task);
     cleanup_tasks.push(stats_samtools_err_task);
 
     let stats_samtools_out_stream = {
         let mut guard = stats_samtools_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Lines, &config)
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            &config,
+        )
             .await
             .map_err(|e| PipelineError::ToolExecution {
                 tool: SAMTOOLS_TAG.to_string(),
@@ -749,6 +730,12 @@ async fn process_ercc(
             })?
     };
 
+    // ------------------------------------------------------------
+    // samtools stats output has two consumers:
+    //
+    //   1. write <sample>_ercc_stats.txt
+    //   2. parse the values needed by calculate_statistics()
+    // ------------------------------------------------------------
     let (stats_streams, stats_router_handle) = fanout_to_channels(
         ReceiverStream::new(stats_samtools_out_stream),
         2,
@@ -759,21 +746,28 @@ async fn process_ercc(
         .await?;
 
     cleanup_receivers.push(stats_router_handle);
+
     let mut stats_streams_iter = stats_streams.into_iter();
+
     let stats_file_stream = stats_streams_iter
         .next()
         .ok_or(PipelineError::EmptyStream)?;
+
     let stats_parse_stream = stats_streams_iter
         .next()
         .ok_or(PipelineError::EmptyStream)?;
 
-    let stats_write_task = tokio::spawn(stream_to_file(stats_file_stream, ercc_stats_file_path));
+    let stats_write_task = tokio::spawn(stream_to_file(
+        stats_file_stream,
+        ercc_stats_file_path,
+    ));
+
     cleanup_tasks.push(stats_write_task);
 
-    let ercc_stats_task = Some(tokio::spawn(parse_ercc_stats(stats_parse_stream)));
+    let ercc_stats_task =
+        Some(tokio::spawn(parse_ercc_stats(stats_parse_stream)));
 
     Ok((
-        ReceiverStream::new(bypass_output_stream),
         ercc_stats_task,
         cleanup_tasks,
         cleanup_receivers,
@@ -2296,20 +2290,39 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 temp_dirs.push(index_temp);
             }
 
+            let (no_host_branches, no_host_router_done) = fanout_to_channels(
+                no_host_output_stream,
+                2,
+                "consensus_no_host_split",
+                &config,
+                StreamDataType::JustBytes,
+            ).await?;
+
+            cleanup_receivers.push(no_host_router_done);
+
+            let mut no_host_branches = no_host_branches.into_iter();
+
+            let filter_reads_input_stream =
+                ReceiverStream::new(no_host_branches.next().ok_or(PipelineError::EmptyStream)?);
+
+            let ercc_input_stream =
+                ReceiverStream::new(no_host_branches.next().ok_or(PipelineError::EmptyStream)?);
+
+
             // ERCC
             let (
-                no_host_ercc_stream,
                 ercc_stats_out_task,
                 mut ercc_cleanup_tasks,
                 mut ercc_cleanup_receivers,
             ) = process_ercc(
                 config.clone(),
-                no_host_output_stream,
+                ercc_input_stream,
                 ercc_index_path,
                 &out_dir,
                 &no_ext_sample_base,
             )
                 .await?;
+
             ercc_stats_task = ercc_stats_out_task;
             cleanup_tasks.append(&mut ercc_cleanup_tasks);
             cleanup_receivers.append(&mut ercc_cleanup_receivers);
@@ -2321,7 +2334,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 filter_reads_cleanup_receivers,
             ) = filter_with_kraken(
                 config.clone(),
-                no_host_ercc_stream,
+                filter_reads_input_stream,
                 &out_dir,
                 &no_ext_sample_base_buf,
                 config
