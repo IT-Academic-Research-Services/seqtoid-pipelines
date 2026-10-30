@@ -4196,10 +4196,10 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let (
         _host_ref_fasta_path,
         host_index_path,
-        _host_ref_temp,
-        _host_index_temp,
+        host_ref_temp,
+        host_index_temp,
         host_temp_dir,
-        _host_ref_tasks,
+        host_ref_tasks,
     ) = minimap2_index_prep(
         &config,
         &config.ram_temp_dir,
@@ -4208,6 +4208,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "host",
     )
         .await?;
+
+    try_join_all(host_ref_tasks).await?;
+
+    if let Some(temp) = host_ref_temp {
+        temp_files.push(temp);
+    }
+
+    if let Some(temp) = host_index_temp {
+        temp_files.push(temp);
+    }
+
+    if let Some(temp_dir) = host_temp_dir {
+        final_temp_dirs.push(temp_dir);
+    }
 
     debug!("Host index : {}", host_index_path.display());
 
@@ -4226,17 +4240,16 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(host_filter_cleanup_tasks);
     cleanup_receivers.extend(host_filter_cleanup_receivers);
-    final_temp_dirs.extend(host_temp_dir);
 
     //Human filtering
 
     let (
         _human_ref_fasta_path,
         human_index_path,
-        _human_ref_temp,
-        _human_index_temp,
+        human_ref_temp,
+        human_index_temp,
         human_temp_dir,
-        _human_ref_tasks,
+        human_ref_tasks,
     ) = minimap2_index_prep(
         &config,
         &config.ram_temp_dir,
@@ -4245,6 +4258,20 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         "host",
     )
         .await?;
+
+    try_join_all(human_ref_tasks).await?;
+
+    if let Some(temp) = human_ref_temp {
+        temp_files.push(temp);
+    }
+
+    if let Some(temp) = human_index_temp {
+        temp_files.push(temp);
+    }
+
+    if let Some(temp_dir) = human_temp_dir {
+        final_temp_dirs.push(temp_dir);
+    }
 
     debug!("Human index : {}", human_index_path.display());
 
@@ -4263,7 +4290,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
 
     cleanup_tasks.extend(human_filter_cleanup_tasks);
     cleanup_receivers.extend(human_filter_cleanup_receivers);
-    final_temp_dirs.extend(human_temp_dir);
 
     // Human filter output remains raw FASTQ bytes through both minimap2 stages.
     //
