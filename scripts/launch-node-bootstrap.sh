@@ -162,6 +162,9 @@ if ! dnf_retry \
     tar \
     wget \
     python3-pip \
+    python3-setuptools \
+    gcc-c++ \
+    make \
     || true
 
   return 0
@@ -241,6 +244,93 @@ install_s5cmd() {
 
   log "s5cmd installed: $(/usr/local/bin/s5cmd version | head -n 1)"
 
+  return 0
+}
+
+
+# ============================================================
+# Flye
+# ============================================================
+#
+# Pin the launch-node Flye installation to a known release. Flye is
+# built from the upstream source release and installed as a stable
+# executable under /usr/local/bin, matching the other launch-node tools.
+# The source tree lives under /usr/local/src rather than /opt.
+# ============================================================
+
+install_flye() {
+  local version="2.9.6"
+  local src_root="/usr/local/src"
+  local install_root="${src_root}/flye-${version}"
+  local archive_root="${src_root}/flye-${version}.archive"
+  local archive="${src_root}/flye-${version}.tar.gz"
+  local url="https://github.com/mikolmogorov/Flye/archive/refs/tags/${version}.tar.gz"
+  local binary="${install_root}/bin/flye"
+
+  if command -v flye >/dev/null 2>&1; then
+    if flye --version 2>/dev/null | grep -q "${version}"; then
+      log "Flye ${version} already installed: $(command -v flye)"
+      return 0
+    fi
+  fi
+
+  log "Installing Flye ${version} from source"
+
+  mkdir -p "$src_root"
+  rm -rf "$archive_root" "$install_root"
+  rm -f "$archive"
+
+  if ! curl \
+      -fL \
+      --retry 5 \
+      --retry-delay 2 \
+      --connect-timeout 15 \
+      -o "$archive" \
+      "$url"; then
+    log "ERROR: failed to download Flye ${version}"
+    rm -f "$archive"
+    return 1
+  fi
+
+  mkdir -p "$archive_root"
+
+  if ! tar -xzf "$archive" -C "$archive_root"; then
+    log "ERROR: failed to extract Flye ${version}"
+    rm -rf "$archive_root" "$archive"
+    return 1
+  fi
+
+  if [ ! -d "$archive_root/Flye-${version}" ]; then
+    log "ERROR: expected Flye source directory was not created"
+    rm -rf "$archive_root" "$archive"
+    return 1
+  fi
+
+  mv "$archive_root/Flye-${version}" "$install_root"
+  rm -rf "$archive_root" "$archive"
+
+  if ! (
+    cd "$install_root" && make
+  ); then
+    log "ERROR: Flye ${version} build failed"
+    rm -rf "$install_root"
+    return 1
+  fi
+
+  if [ ! -x "$binary" ]; then
+    log "ERROR: Flye ${version} build did not produce $binary"
+    rm -rf "$install_root"
+    return 1
+  fi
+
+  ln -sfn "$binary" /usr/local/bin/flye
+
+  if ! /usr/local/bin/flye --version; then
+    log "ERROR: Flye installation verification failed"
+    return 1
+  fi
+
+  log "Flye installed: $(/usr/local/bin/flye --version)"
   return 0
 }
 
@@ -726,6 +816,7 @@ validate_launch_software() {
     minimap2
     samtools
     bcftools
+    flye
     s5cmd
   )
 
@@ -875,6 +966,14 @@ fi
 if ! install_s5cmd; then
 
   log "ERROR: s5cmd installation failed"
+
+  exit 1
+fi
+
+
+if ! install_flye; then
+
+  log "ERROR: Flye installation failed"
 
   exit 1
 fi
