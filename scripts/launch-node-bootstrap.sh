@@ -266,10 +266,11 @@ install_flye() {
   local archive="${src_root}/flye-${version}.tar.gz"
   local url="https://github.com/mikolmogorov/Flye/archive/refs/tags/${version}.tar.gz"
   local binary="${install_root}/bin/flye"
+  local wrapper="/usr/local/bin/flye"
 
-  if command -v flye >/dev/null 2>&1; then
-    if flye --version 2>/dev/null | grep -q "${version}"; then
-      log "Flye ${version} already installed: $(command -v flye)"
+  if [ -x "$wrapper" ]; then
+    if "$wrapper" --version 2>/dev/null | grep -q "${version}"; then
+      log "Flye ${version} already installed: $wrapper"
       return 0
     fi
   fi
@@ -323,14 +324,25 @@ install_flye() {
     return 1
   fi
 
-  ln -sfn "$binary" /usr/local/bin/flye
+  # bin/flye is a Python launcher, not a self-contained executable. It
+  # imports the Flye package from the source tree, so do not symlink the
+  # launcher itself into /usr/local/bin. Keep the complete source tree in
+  # place and install a small wrapper that supplies the package root.
+  cat > "$wrapper" << EOF
+#!/bin/bash
+set -euo pipefail
+export PYTHONPATH="${install_root}\${PYTHONPATH:+:\$PYTHONPATH}"
+exec python3 "${install_root}/bin/flye" "\$@"
+EOF
+  chmod 0755 "$wrapper"
 
-  if ! /usr/local/bin/flye --version; then
+  if ! "$wrapper" --version; then
     log "ERROR: Flye installation verification failed"
+    rm -f "$wrapper"
     return 1
   fi
 
-  log "Flye installed: $(/usr/local/bin/flye --version)"
+  log "Flye installed: $($wrapper --version)"
   return 0
 }
 
