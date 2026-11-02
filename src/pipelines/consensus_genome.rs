@@ -1353,34 +1353,20 @@ async fn filter_with_kraken(
         })?;
 
     let stdout_drain_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let mut stdout = kraken_stdout;
-        let mut buffer = vec![0u8; 1024 * 1024];
-        let mut total_bytes: u64 = 0;
+        let mut lines = BufReader::new(kraken_stdout).lines();
+        let mut count = 0u64;
 
-        loop {
-            let n = stdout
-                .read(&mut buffer)
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed reading Kraken2 stdout: {}",
-                        e
-                    )
-                })?;
-
-            if n == 0 {
-                break;
+        while let Some(line) = lines.next_line().await? {
+            if count < 10 {
+                debug!("KRAKEN CLASSIFICATION OUTPUT: {}", line);
             }
 
-            total_bytes += n as u64;
+            count += 1;
         }
 
-        debug!(
-            "FilterReads increment-2 Kraken stdout drained {} bytes",
-            total_bytes
-        );
+        debug!("Kraken classification output: {} lines", count);
 
         Ok::<(), anyhow::Error>(())
     });
