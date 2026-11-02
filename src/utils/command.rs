@@ -1200,6 +1200,7 @@ pub mod kraken2 {
         pub report_path: PathBuf,
         pub classified_path: PathBuf,
         pub fastq_path: PathBuf,
+        pub fastq_path_2: Option<PathBuf>,
     }
 
     pub struct Kraken2ArgGenerator;
@@ -1223,7 +1224,7 @@ pub mod kraken2 {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -1269,7 +1270,13 @@ pub mod kraken2 {
             args_vec.push("--output".to_string());
             args_vec.push("-".to_string()); // "-" will suppress normal output
 
-            args_vec.push(config.fastq_path.to_string_lossy().to_string());
+            if let Some(fastq_path_2) = &config.fastq_path_2 {
+                args_vec.push("--paired".to_string());
+                args_vec.push(config.fastq_path.to_string_lossy().to_string());
+                args_vec.push(fastq_path_2.to_string_lossy().to_string());
+            } else {
+                args_vec.push(config.fastq_path.to_string_lossy().to_string());
+            }
 
             Ok(args_vec)
         }

@@ -46,7 +46,7 @@ use crate::utils::stats::{
 use crate::utils::streams::ParseOutput;
 use crate::utils::streams::{
     fanout_to_channels, join_with_error_handling, parse_bytes, parse_child_output, parse_fastq,
-    spawn_cmd, stream_to_cmd, stream_to_file, y_junction, ChildStream, ParseMode,
+    spawn_cmd, stream_to_cmd, stream_to_file, y_junction, ChildStream, ParseMode, create_fifo
 };
 use crate::utils::vcf::count_variants_from_bcftools_stats;
 
@@ -795,94 +795,454 @@ async fn filter_with_kraken(
     input_stream: ReceiverStream<ParseOutput>,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
-    target_taxid: &str,
+    _target_taxid: &str,
 ) -> Result<
     (
         ReceiverStream<ParseOutput>,
         Vec<JoinHandle<Result<(), anyhow::Error>>>,
         Vec<oneshot::Receiver<Result<(), anyhow::Error>>>,
+        Vec<NamedTempFile>,
+        Vec<TempDir>,
     ),
     PipelineError,
 > {
     let mut cleanup_tasks = vec![];
-    let mut cleanup_receivers = Vec::new();
+    let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let mut temp_dirs: Vec<TempDir> = Vec::new();
+    let mut named_temp_files: Vec<NamedTempFile> = Vec::new();
 
-    // Parse the byte stream into Fastq records
-    let (parse_rx, parse_task) = parse_byte_stream_to_fastq(
-        input_stream.into_inner(), // Convert ReceiverStream to Receiver
-        config.base_buffer_size,
-        config.args.stall_threshold,
+    // -------------------------------------------------------------------------
+    // WDL FilterReads increment 1:
+    //
+    // host-removed reads
+    //   -> minimap2 against target
+    //   -> samtools sort -n
+    //   -> samtools fastq -G 12
+    //        -> R1 FIFO
+    //        -> R2 FIFO
+    //   -> kraken2 --paired
+    //
+    // This test stops after Kraken completes successfully.
+    // -------------------------------------------------------------------------
+
+    // -------------------------------------------------------------------------
+    // Prepare target minimap2 index
+    // -------------------------------------------------------------------------
+
+    let (
+        _target_ref_fasta_path,
+        target_index_path,
+        target_ref_temp,
+        target_index_temp,
+        target_temp_dir,
+        target_ref_tasks,
+    ) = minimap2_index_prep(
+        &config,
+        &config.ram_temp_dir,
+        config.args.target_sequence.clone(),
+        config.args.target_index.clone(),
+        "target",
+    )
+        .await?;
+
+    try_join_all(target_ref_tasks).await?;
+
+    debug!(
+        "filter_with_kraken target index: {}",
+        target_index_path.display()
+    );
+
+    if let Some(temp) = target_ref_temp {
+        named_temp_files.push(temp);
+    }
+
+    if let Some(temp) = target_index_temp {
+        named_temp_files.push(temp);
+    }
+
+    if let Some(temp_dir) = target_temp_dir {
+        temp_dirs.push(temp_dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // minimap2 -ax sr TARGET -
+    // -------------------------------------------------------------------------
+
+    let minimap2_config = Minimap2Config::new()
+        .option(
+            "-t",
+            config
+                .thread_allocation(MINIMAP2_TAG, None)
+                .to_string(),
+        )
+        .option("-ax", "sr")
+        .positional(target_index_path.to_string_lossy().to_string())
+        .positional("-");
+
+    let minimap2_args =
+        generate_cli(MINIMAP2_TAG, &config, Some(&minimap2_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    let (
+        minimap2_child,
+        minimap2_stream_task,
+        minimap2_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        input_stream.into_inner(),
+        MINIMAP2_TAG,
+        minimap2_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+        None,
     )
         .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    cleanup_tasks.push(parse_task);
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: MINIMAP2_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-    // Concatenate paired-end reads
-    let (concat_stream, concat_task) = concatenate_paired_reads(
-        ReceiverStream::new(parse_rx),
-        config.base_buffer_size,
-        config.args.stall_threshold,
+    cleanup_tasks.push(minimap2_stream_task);
+    cleanup_tasks.push(minimap2_err_task);
+
+    let minimap2_out_stream = {
+        let mut guard = minimap2_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: MINIMAP2_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // -------------------------------------------------------------------------
+    // samtools sort -n
+    // -------------------------------------------------------------------------
+
+    let sort_temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    )
+        .await?;
+
+    let sort_config = SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("sort"))
+                .to_string(),
+        )
+        .option("-m", "2G")
+        .flag("-n")
+        .flag("-u")
+        .option("-O", "bam")
+        .option(
+            "-T",
+            sort_temp_dir.path().to_string_lossy().to_string(),
+        )
+        .positional("-");
+
+    let sort_args =
+        generate_cli(SAMTOOLS_TAG, &config, Some(&sort_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    let (
+        sort_child,
+        sort_stream_task,
+        sort_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        minimap2_out_stream,
+        SAMTOOLS_TAG,
+        sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
     )
         .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    cleanup_tasks.push(concat_task);
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
 
-    let final_compressed_path = file_path_manipulator(
+    cleanup_tasks.push(sort_stream_task);
+    cleanup_tasks.push(sort_err_task);
+
+    let sorted_bam_stream = {
+        let mut guard = sort_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    // Keep sort scratch alive while the pipeline is running.
+    temp_dirs.push(sort_temp_dir);
+
+    // -------------------------------------------------------------------------
+    // Create R1/R2 FIFOs.
+    //
+    // samtools fastq writes these.
+    // Kraken reads these.
+    // -------------------------------------------------------------------------
+
+    let fifo_temp_dir = tempfile::Builder::new()
+        .prefix("consensus_filter_reads_")
+        .tempdir_in(&config.ram_temp_dir)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to create FilterReads FIFO directory in {}: {}",
+                config.ram_temp_dir.display(),
+                e
+            ))
+        })?;
+
+    let fq1_fifo = fifo_temp_dir.path().join("paired1.fq");
+    let fq2_fifo = fifo_temp_dir.path().join("paired2.fq");
+
+    create_fifo(&fq1_fifo)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    create_fifo(&fq2_fifo)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    debug!(
+        "FilterReads paired query FIFOs created: R1={} R2={}",
+        fq1_fifo.display(),
+        fq2_fifo.display()
+    );
+
+    // Keep FIFO directory alive.
+    temp_dirs.push(fifo_temp_dir);
+
+    // -------------------------------------------------------------------------
+    // Create a classified-output FIFO.
+    //
+    // Increment 1 does not parse this output yet. We MUST drain it, however,
+    // otherwise Kraken can block trying to write classified reads.
+    //
+    // Increment 2 will replace this with the paired classified-output
+    // arrangement.
+    // -------------------------------------------------------------------------
+
+    let mut classified_builder = tempfile::Builder::new();
+    classified_builder.suffix(".fq");
+
+    let classified_temp = classified_builder
+        .tempfile_in(&config.ram_temp_dir)
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to create classified FIFO placeholder in {}: {}",
+                config.ram_temp_dir.display(),
+                e
+            ))
+        })?;
+
+    let classified_fifo = classified_temp.path().to_path_buf();
+
+    classified_temp
+        .close()
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to close classified FIFO placeholder: {}",
+                e
+            ))
+        })?;
+
+    let _ = tokio::fs::remove_file(&classified_fifo).await;
+
+    create_fifo(&classified_fifo)
+        .await
+        .map_err(|e| PipelineError::Other(e.into()))?;
+
+    // -------------------------------------------------------------------------
+    // Start a drain for the classified-output FIFO BEFORE Kraken.
+    //
+    // Opening the FIFO reader may block until Kraken opens the writer, so
+    // perform the open inside its own task.
+    // -------------------------------------------------------------------------
+
+    let classified_fifo_for_drain = classified_fifo.clone();
+
+    let classified_drain_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+
+        let mut file = tokio::fs::File::open(
+            &classified_fifo_for_drain
+        )
+            .await
+            .map_err(|e| {
+                anyhow!(
+                "Failed to open Kraken classified FIFO {}: {}",
+                classified_fifo_for_drain.display(),
+                e
+            )
+            })?;
+
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut total_bytes: u64 = 0;
+
+        loop {
+            let n = file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed reading Kraken classified FIFO: {}",
+                        e
+                    )
+                })?;
+
+            if n == 0 {
+                break;
+            }
+
+            total_bytes += n as u64;
+        }
+
+        debug!(
+            "FilterReads increment-1 classified FIFO drained {} bytes",
+            total_bytes
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(classified_drain_task);
+
+    // -------------------------------------------------------------------------
+    // samtools fastq
+    //
+    // Exact paired WDL semantics:
+    //
+    // samtools fastq
+    //   -G 12
+    //   -1 R1
+    //   -2 R2
+    //   -0 /dev/null
+    //   -s /dev/null
+    //   -n
+    //   -c 6
+    //
+    // DO NOT WAIT FOR THIS CHILD HERE.
+    //
+    // samtools may block opening/writing the FIFOs until Kraken opens them.
+    // -------------------------------------------------------------------------
+
+    let fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
+        .option(
+            "-@",
+            config
+                .thread_allocation(SAMTOOLS_TAG, Some("fastq"))
+                .to_string(),
+        )
+        .option("-G", "12")
+        .option("-1", fq1_fifo.to_string_lossy().to_string())
+        .option("-2", fq2_fifo.to_string_lossy().to_string())
+        .option("-0", "/dev/null")
+        .option("-s", "/dev/null")
+        .flag("-n")
+        .option("-c", "6")
+        .positional("-");
+
+    let fastq_args =
+        generate_cli(SAMTOOLS_TAG, &config, Some(&fastq_config))
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: SAMTOOLS_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    debug!(
+        "FilterReads starting samtools fastq -> paired FIFOs"
+    );
+
+    let (
+        _fastq_child,
+        fastq_stream_task,
+        fastq_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        sorted_bam_stream,
+        SAMTOOLS_TAG,
+        fastq_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: SAMTOOLS_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(fastq_stream_task);
+    cleanup_tasks.push(fastq_err_task);
+
+    // -------------------------------------------------------------------------
+    // Kraken2 --paired R1_FIFO R2_FIFO
+    // -------------------------------------------------------------------------
+
+    let kraken_report_path = file_path_manipulator(
         no_ext_sample_base_buf,
         Some(out_dir),
         None,
-        Some("classified_filtered.fq.gz"),
+        Some("kraken2_report.txt"),
         "_",
     );
 
-    // Write input stream to temp FIFO for Kraken2
-    let (kraken_query_write_task, kraken_query_pipe_path) = write_parse_output_to_temp_fifo(
-        concat_stream,
-        Some(config.base_buffer_size),
-        Some(".fq"),
-        Some(&config.ram_temp_dir),
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-    cleanup_tasks.push(kraken_query_write_task);
-
-    // Create temp FIFO for Kraken2 classified output
-    let mut builder = tempfile::Builder::new();
-    builder.suffix(".fq");
-    let temp_name = builder.tempfile_in(&config.ram_temp_dir).map_err(|e| {
-        PipelineError::Other(anyhow!(
-            "Failed to create temp file in {}: {}",
-            config.ram_temp_dir.display(),
-            e
-        ))
-    })?;
-    let kraken2_pipe_path = temp_name.path().to_path_buf();
-    temp_name
-        .close()
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to close temp file: {}", e)))?;
-
-    let _ = tokio::fs::remove_file(&kraken2_pipe_path).await;
-    tokio::process::Command::new("mkfifo")
-        .arg(&kraken2_pipe_path)
-        .status()
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to create named pipe: {}", e)))?;
-
-    // Run Kraken2 in single-end mode
     let kraken2_config = Kraken2Config {
-        report_path: file_path_manipulator(
-            no_ext_sample_base_buf,
-            Some(out_dir),
-            None,
-            Some("kraken2_report.txt"),
-            "_",
-        ),
-        classified_path: kraken2_pipe_path.clone(),
-        fastq_path: kraken_query_pipe_path.clone(),
+        report_path: kraken_report_path.clone(),
+        classified_path: classified_fifo.clone(),
+        fastq_path: fq1_fifo.clone(),
+        fastq_path_2: Some(fq2_fifo.clone()),
     };
-    let kraken2_args = generate_cli(KRAKEN2_TAG, &config, Some(&kraken2_config))?;
 
-    let (mut kraken2_child, kraken2_err_task) = spawn_cmd(
+    let kraken2_args =
+        generate_cli(
+            KRAKEN2_TAG,
+            &config,
+            Some(&kraken2_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: KRAKEN2_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    debug!(
+        "FilterReads starting paired Kraken2: R1={} R2={}",
+        fq1_fifo.display(),
+        fq2_fifo.display()
+    );
+
+    let (
+        mut kraken2_child,
+        kraken2_err_task,
+    ) = spawn_cmd(
         config.clone(),
         KRAKEN2_TAG,
         kraken2_args,
@@ -894,156 +1254,135 @@ async fn filter_with_kraken(
             tool: KRAKEN2_TAG.to_string(),
             error: e.to_string(),
         })?;
+
     cleanup_tasks.push(kraken2_err_task);
 
-    let kraken2_wait_task = tokio::spawn(async move {
-        let status = kraken2_child
-            .wait()
-            .await
-            .map_err(|e| anyhow!("Failed to wait on kraken2: {}", e))?;
-        if !status.success() {
-            return Err(anyhow!("kraken2 exited with non-zero status"));
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(kraken2_wait_task);
+    // -------------------------------------------------------------------------
+    // Kraken normal output is configured as:
+    //
+    //     --output -
+    //
+    // In your existing generator this means stdout is still a pipe. Drain it
+    // so Kraken cannot block if it produces output.
+    // -------------------------------------------------------------------------
 
-    // Stream classified FASTQ from named pipe
-    let kraken2_file = tokio::fs::File::open(&kraken2_pipe_path)
-        .await
-        .map_err(|e| PipelineError::Other(anyhow!("Failed to open named pipe: {}", e)))?;
-    let parse_rx = parse_fastq(kraken2_file, &config, StreamDataType::IlluminaFastq)
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!("Failed to parse FASTQ from named pipe: {}", e))
+    let kraken_stdout = kraken2_child
+        .stdout
+        .take()
+        .ok_or_else(|| {
+            PipelineError::Other(anyhow!(
+                "Failed to capture Kraken2 stdout"
+            ))
         })?;
 
-    // Filter using parse_and_filter_fastq_id
-    let pattern = format!("kraken:taxid|{}", target_taxid);
-    let (filtered_rx, filter_task) =
-        parse_and_filter_fastq_id(parse_rx, config.base_buffer_size, pattern);
-    cleanup_tasks.push(filter_task);
+    let stdout_drain_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
 
-    let (parse_output_tx, parse_output_rx) = mpsc::channel(config.base_buffer_size);
-    let conversion_task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(filtered_rx);
-        while let Some(record) = stream.next().await {
-            parse_output_tx
-                .send(ParseOutput::Fastq(record))
+        let mut stdout = kraken_stdout;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut total_bytes: u64 = 0;
+
+        loop {
+            let n = stdout
+                .read(&mut buffer)
                 .await
-                .map_err(|e| anyhow!("Failed to send ParseOutput: {}", e))?;
-        }
-        Ok(())
-    });
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed reading Kraken2 stdout: {}",
+                        e
+                    )
+                })?;
 
-    cleanup_tasks.push(conversion_task);
-
-    let filtered_stream = ReceiverStream::new(parse_output_rx);
-
-    // Before fanout_to_channels, split for check
-    let (check_tx, mut check_rx) = mpsc::channel(1);
-    let (forward_tx, forward_rx) = mpsc::channel(config.base_buffer_size);
-    let check_split_task = tokio::spawn(async move {
-        let mut stream = ReceiverStream::new(filtered_stream.into_inner());
-        let mut found = false;
-        while let Some(item) = stream.next().await {
-            if matches!(item, ParseOutput::Fastq(_)) {
-                found = true;
+            if n == 0 {
+                break;
             }
-            forward_tx
-                .send(item)
-                .await
-                .map_err(|e| anyhow!("Failed to forward item: {}", e))?;
-            if found {
-                break; // Exit after first Fastq record
-            }
+
+            total_bytes += n as u64;
         }
+
         debug!(
-            "check_split_task found {} Fastq record",
-            if found { "a" } else { "no" }
+            "FilterReads increment-1 Kraken stdout drained {} bytes",
+            total_bytes
         );
-        check_tx
-            .send(if found { 1 } else { 0 })
-            .await
-            .map_err(|e| anyhow!("Failed to send check count: {}", e))?;
-        // Continue forwarding remaining records
-        while let Some(item) = stream.next().await {
-            forward_tx
-                .send(item)
-                .await
-                .map_err(|e| anyhow!("Failed to forward item: {}", e))?;
-        }
-        Ok(())
+
+        Ok::<(), anyhow::Error>(())
     });
-    cleanup_tasks.push(check_split_task);
 
-    let filtered_stream = ReceiverStream::new(forward_rx);
+    cleanup_tasks.push(stdout_drain_task);
 
-    // Split stream for output and compression
-    let (kraken_streams, kraken_router_handle) = fanout_to_channels(
-        filtered_stream,
-        2, // Only two streams now
-        "filter_reads_output",
-        &config,
-        StreamDataType::IlluminaFastq,
-    )
-        .await?;
+    // -------------------------------------------------------------------------
+    // Wait for Kraken.
+    //
+    // At this point:
+    //   - samtools fastq exists and is trying to write R1/R2
+    //   - Kraken exists and is trying to read R1/R2
+    //   - classified output has an active reader
+    //   - Kraken stdout has an active reader
+    //
+    // Therefore all producer/consumer endpoints required for this test exist.
+    // -------------------------------------------------------------------------
 
-    cleanup_receivers.push(kraken_router_handle);
-    let mut streams_iter = kraken_streams.into_iter();
-    let kraken_output_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-    let kraken_file_stream = streams_iter.next().ok_or(PipelineError::EmptyStream)?;
-
-    let _check_count = check_rx.recv().await.ok_or_else(|| {
-        error!("check_rx.recv failed");
-        PipelineError::EmptyStream
-    })?;
-
-    let pigz_args = generate_cli(PIGZ_TAG, &config, None)?;
-    let (pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
-        config.clone(),
-        kraken_file_stream,
-        PIGZ_TAG,
-        pigz_args,
-        StreamDataType::IlluminaFastq,
-        config.args.verbose,
-        None,
-    )
+    let kraken_status = kraken2_child
+        .wait()
         .await
         .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
+            tool: KRAKEN2_TAG.to_string(),
+            error: format!(
+                "Failed waiting for paired Kraken2: {}",
+                e
+            ),
         })?;
-    cleanup_tasks.push(pigz_stream_task);
-    cleanup_tasks.push(pigz_err_task);
 
-    let pigz_out_stream = {
-        let mut guard = pigz_child.lock().await;
-        parse_child_output(&mut guard, ChildStream::Stdout, ParseMode::Bytes, &config)
-            .await
-            .map_err(|e| PipelineError::ToolExecution {
-                tool: PIGZ_TAG.to_string(),
-                error: e.to_string(),
-            })?
-    };
-    let pigz_write_task = tokio::spawn(stream_to_file(pigz_out_stream, final_compressed_path));
-    cleanup_tasks.push(pigz_write_task);
+    if !kraken_status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: KRAKEN2_TAG.to_string(),
+            error: format!(
+                "Paired Kraken2 FIFO test exited with status {:?}",
+                kraken_status.code()
+            ),
+        });
+    }
 
-    let cleanup_pipe_task = tokio::spawn(async move {
-        tokio::fs::remove_file(&kraken2_pipe_path)
-            .await
-            .map_err(|e| anyhow!("Failed to remove named pipe: {}", e))?;
-        Ok(())
-    });
-    cleanup_tasks.push(cleanup_pipe_task);
+    info!(
+        "FilterReads increment-1 SUCCESS: paired Kraken2 completed; report={}",
+        kraken_report_path.display()
+    );
 
-    Ok((
-        ReceiverStream::new(kraken_output_stream),
-        cleanup_tasks,
-        cleanup_receivers,
-    ))
+    // -------------------------------------------------------------------------
+    // TEST STOP
+    //
+    // Increment 1 has now demonstrated:
+    //
+    //   input
+    //     -> minimap2 target
+    //     -> samtools sort -n
+    //     -> samtools fastq -G 12
+    //     -> paired FIFOs
+    //     -> kraken2 --paired
+    //
+    // Do NOT reconnect the previous single-end classified-output code.
+    //
+    // Increment 2 will implement:
+    //
+    //   --classified-out classified#.fq
+    //           /                \
+    //       classified R1    classified R2
+    //           |                |
+    //       taxid filter      taxid filter
+    //           \                /
+    //              interleave
+    //                  |
+    //          existing downstream stream
+    //
+    // Returning an intentional error prevents any downstream consensus code
+    // from accidentally running against incomplete test data.
+    // -------------------------------------------------------------------------
+
+    Err(PipelineError::Other(anyhow!(
+        "FilterReads increment-1 paired FIFO test completed successfully; \
+         intentional stop before paired classified-output handling"
+    )))
 }
-
 /// Aligns reads against a target organism's reference index and sorts the resulting BAM.
 ///
 /// # Arguments
@@ -2332,6 +2671,8 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                 filter_reads_out_stream,
                 filter_reads_cleanup_tasks,
                 filter_reads_cleanup_receivers,
+                filter_reads_temp_files,
+                filter_reads_temp_dirs,
             ) = filter_with_kraken(
                 config.clone(),
                 filter_reads_input_stream,
@@ -2344,8 +2685,11 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
                     .expect("target_taxid must be set"),
             )
                 .await?;
+
             cleanup_tasks.extend(filter_reads_cleanup_tasks);
             cleanup_receivers.extend(filter_reads_cleanup_receivers);
+            temp_files.extend(filter_reads_temp_files);
+            temp_dirs.extend(filter_reads_temp_dirs);
 
             // Align Reads to Target
             let (
