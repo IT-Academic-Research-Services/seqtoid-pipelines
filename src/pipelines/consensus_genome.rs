@@ -820,23 +820,22 @@ async fn filter_with_kraken(
     // host-removed reads
     //   -> minimap2 against target
     //   -> samtools sort -n
-    //   -> samtools fastq -G 12 -N
+    //   -> samtools fastq -G 12 -0 /dev/null -s /dev/null -N
     //   -> route explicit /1 and /2 mate identities
     //   -> R1 FIFO + R2 FIFO
     //   -> kraken2 --paired
     //
-    // IMPORTANT:
+    // samtools retains only complete category-1/category-2 pairs:
     //
-    // We do NOT infer mate identity from FASTQ record position or adjacency.
+    //   -G 12         exclude records where read + mate are both unmapped
+    //   -0 /dev/null  discard category-0 records
+    //   -s /dev/null  discard singleton category-1/category-2 records
     //
-    // samtools fastq -N appends /1 or /2 based on BAM READ1/READ2 flags.
-    // Each FASTQ record is routed independently according to that explicit
-    // marker.
+    // -N is used instead of the WDL's -n only so Rust can identify the
+    // category-1/category-2 output records as /1 and /2. Those temporary
+    // suffixes are removed before Kraken.
     //
-    // The temporary /1 and /2 suffixes are stripped again before Kraken so
-    // the read names match the WDL's `samtools fastq -n` naming behavior.
-    //
-    // At EOF, R1 and R2 counts must be identical.
+    // No mate identity is inferred from record position or adjacency.
     //
     // This test stops intentionally after paired Kraken completes.
     // -------------------------------------------------------------------------
@@ -903,8 +902,6 @@ async fn filter_with_kraken(
 
     // -------------------------------------------------------------------------
     // samtools sort -n
-    //
-    // Name sorting is essential here. samtools fastq operates on QNAME groups.
     // -------------------------------------------------------------------------
 
     let sort_temp_dir = choose_temp_dir(
@@ -981,12 +978,19 @@ async fn filter_with_kraken(
     temp_dirs.push(sort_temp_dir);
 
     // -------------------------------------------------------------------------
-    // samtools fastq -G 12 -N
+    // samtools fastq
     //
-    // -N exposes BAM mate identity explicitly as /1 or /2.
+    // WDL paired-end selection semantics:
     //
-    // No -1/-2 paths are used here. FASTQ is emitted on stdout and Rust
-    // routes each record independently by its explicit mate marker.
+    //   -G 12
+    //   -0 /dev/null
+    //   -s /dev/null
+    //
+    // WDL uses -1/-2 to separate the surviving complete pairs.
+    //
+    // For this FIFO test we instead allow those surviving category-1 and
+    // category-2 records to stdout and use -N to expose /1 and /2 so Rust
+    // can route them to independently-owned FIFO writers.
     // -------------------------------------------------------------------------
 
     let fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
@@ -997,6 +1001,8 @@ async fn filter_with_kraken(
                 .to_string(),
         )
         .option("-G", "12")
+        .option("-0", "/dev/null")
+        .option("-s", "/dev/null")
         .flag("-N")
         .option("-c", "6")
         .positional("-");
@@ -1009,7 +1015,7 @@ async fn filter_with_kraken(
             })?;
 
     debug!(
-        "FilterReads starting samtools fastq -G 12 -N -> explicit mate router"
+        "FilterReads starting samtools fastq -G 12 -0 /dev/null -s /dev/null -N -> explicit mate router"
     );
 
     let (
@@ -1087,10 +1093,8 @@ async fn filter_with_kraken(
     // -------------------------------------------------------------------------
     // Explicit mate router.
     //
-    // There is deliberately NO assumption about FASTQ stdout ordering.
-    //
-    // Every record is independently routed according to the /1 or /2 marker
-    // emitted by samtools fastq -N.
+    // Every surviving record is routed according to the /1 or /2 marker
+    // produced by samtools fastq -N.
     // -------------------------------------------------------------------------
 
     let fifo_channel_buffer = crate::utils::system::compute_buffer_size(
@@ -1488,7 +1492,6 @@ async fn filter_with_kraken(
          intentional stop before paired classified-output handling"
     )))
 }
-
 
 /// Aligns reads against a target organism's reference index and sorts the resulting BAM.
 ///
