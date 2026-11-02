@@ -798,7 +798,7 @@ async fn filter_with_kraken(
     target_index_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
-    _target_taxid: &str,
+    target_taxid: &str,
 ) -> Result<
     (
         ReceiverStream<ParseOutput>,
@@ -815,7 +815,7 @@ async fn filter_with_kraken(
     let named_temp_files: Vec<NamedTempFile> = Vec::new();
 
     // -------------------------------------------------------------------------
-    // WDL FilterReads increment 1:
+    // WDL FilterReads increment 2:
     //
     // host-removed reads
     //   -> minimap2 against target
@@ -837,7 +837,9 @@ async fn filter_with_kraken(
     //
     // No mate identity is inferred from record position or adjacency.
     //
-    // This test stops intentionally after paired Kraken completes.
+    // Increment 1 validates paired Kraken input accounting.
+    // Increment 2 additionally validates Kraken paired classified output.
+    // This test still stops intentionally before downstream handoff.
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
@@ -1259,7 +1261,7 @@ async fn filter_with_kraken(
     });
 
     // -------------------------------------------------------------------------
-    // Increment 1: Kraken classified output goes to temporary files.
+    // Kraken paired classified output goes to temporary files.
     //
     // Kraken requires '#' in --classified-out when using --paired.
     // -------------------------------------------------------------------------
@@ -1277,7 +1279,10 @@ async fn filter_with_kraken(
 
     let classified_path =
         classified_temp_dir.path().join("classified#.fq");
-
+    let classified_r1_path =
+        classified_temp_dir.path().join("classified_1.fq");
+    let classified_r2_path =
+        classified_temp_dir.path().join("classified_2.fq");
     temp_dirs.push(classified_temp_dir);
 
     // -------------------------------------------------------------------------
@@ -1373,7 +1378,7 @@ async fn filter_with_kraken(
         }
 
         debug!(
-            "FilterReads increment-1 Kraken stdout drained {} bytes",
+            "FilterReads increment-2 Kraken stdout drained {} bytes",
             total_bytes
         );
 
@@ -1401,7 +1406,7 @@ async fn filter_with_kraken(
         return Err(PipelineError::ToolExecution {
             tool: KRAKEN2_TAG.to_string(),
             error: format!(
-                "Paired Kraken2 FIFO test exited with status {:?}",
+                "Paired Kraken2 exited with status {:?}",
                 kraken_status.code()
             ),
         });
@@ -1484,14 +1489,184 @@ async fn filter_with_kraken(
     );
 
     // -------------------------------------------------------------------------
+    // Increment 2: validate paired Kraken classified output.
+    //
+    // With --paired, Kraken expands classified#.fq into:
+    //
+    //   classified_1.fq
+    //   classified_2.fq
+    //
+    // Kraken has already exited, so both files are complete and can be
+    // reopened without introducing another FIFO lifecycle into this test.
+    // Consume the two FASTQ streams in lockstep and require:
+    //
+    //   * equal numbers of R1 and R2 classified records
+    //   * matching mate IDs for every classified pair
+    //   * matching Kraken taxid annotations for both mates
+    //
+    // Also count the exact target-taxid pairs that the legacy implementation
+    // would retain via parse_and_filter_fastq_id().
+    // -------------------------------------------------------------------------
+
+    let classified_r1_file = tokio::fs::File::open(&classified_r1_path)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to open Kraken classified R1 FASTQ {}: {}",
+                classified_r1_path.display(),
+                e
+            ))
+        })?;
+
+    let classified_r2_file = tokio::fs::File::open(&classified_r2_path)
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to open Kraken classified R2 FASTQ {}: {}",
+                classified_r2_path.display(),
+                e
+            ))
+        })?;
+
+    let classified_r1_rx = parse_fastq(
+        classified_r1_file,
+        &config,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to parse Kraken classified R1 FASTQ: {}",
+                e
+            ))
+        })?;
+
+    let classified_r2_rx = parse_fastq(
+        classified_r2_file,
+        &config,
+        StreamDataType::IlluminaFastq,
+    )
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Failed to parse Kraken classified R2 FASTQ: {}",
+                e
+            ))
+        })?;
+
+    let mut classified_r1_stream = ReceiverStream::new(classified_r1_rx);
+    let mut classified_r2_stream = ReceiverStream::new(classified_r2_rx);
+
+    let target_pattern = format!("kraken:taxid|{}", target_taxid);
+
+    let mut classified_pairs: u64 = 0;
+    let mut target_pairs: u64 = 0;
+
+    loop {
+        let r1_item = classified_r1_stream.next().await;
+        let r2_item = classified_r2_stream.next().await;
+
+        match (r1_item, r2_item) {
+            (None, None) => break,
+
+            (Some(_), None) => {
+                return Err(PipelineError::Other(anyhow!(
+                    "Kraken classified mate imbalance: R1 contains more records than R2 after {} complete pairs",
+                    classified_pairs
+                )));
+            }
+
+            (None, Some(_)) => {
+                return Err(PipelineError::Other(anyhow!(
+                    "Kraken classified mate imbalance: R2 contains more records than R1 after {} complete pairs",
+                    classified_pairs
+                )));
+            }
+
+            (Some(r1_item), Some(r2_item)) => {
+                let r1_record = match r1_item {
+                    ParseOutput::Fastq(record) => record,
+                    _ => {
+                        return Err(PipelineError::Other(anyhow!(
+                            "Kraken classified R1 parser emitted non-FASTQ item"
+                        )));
+                    }
+                };
+
+                let r2_record = match r2_item {
+                    ParseOutput::Fastq(record) => record,
+                    _ => {
+                        return Err(PipelineError::Other(anyhow!(
+                            "Kraken classified R2 parser emitted non-FASTQ item"
+                        )));
+                    }
+                };
+
+                let r1_id = r1_record.id();
+                let r2_id = r2_record.id();
+
+                if r1_id != r2_id {
+                    return Err(PipelineError::Other(anyhow!(
+                        "Kraken classified mate ID mismatch at pair {}: R1='{}' R2='{}'",
+                        classified_pairs + 1,
+                        r1_id,
+                        r2_id
+                    )));
+                }
+
+                let r1_is_target = r1_id.contains(&target_pattern);
+                let r2_is_target = r2_id.contains(&target_pattern);
+
+                if r1_is_target != r2_is_target {
+                    return Err(PipelineError::Other(anyhow!(
+                        "Kraken classified target-taxid disagreement at pair {}: R1='{}' R2='{}' target_taxid={}",
+                        classified_pairs + 1,
+                        r1_id,
+                        r2_id,
+                        target_taxid
+                    )));
+                }
+
+                classified_pairs += 1;
+
+                if r1_is_target {
+                    target_pairs += 1;
+                }
+
+                if classified_pairs % 100_000 == 0 {
+                    debug!(
+                        "FilterReads classified-output validation: {} classified pairs, {} exact target-taxid pairs",
+                        classified_pairs,
+                        target_pairs
+                    );
+                }
+            }
+        }
+    }
+
+    info!(
+        "FilterReads increment-2 CLASSIFIED OUTPUT SUCCESS: \
+         classified_pairs={} classified_records={} exact_target_taxid_pairs={} \
+         exact_target_taxid_records={} target_taxid={} R1={} R2={}",
+        classified_pairs,
+        classified_pairs * 2,
+        target_pairs,
+        target_pairs * 2,
+        target_taxid,
+        classified_r1_path.display(),
+        classified_r2_path.display()
+    );
+
+    // -------------------------------------------------------------------------
     // TEST STOP
     // -------------------------------------------------------------------------
 
     Err(PipelineError::Other(anyhow!(
-        "FilterReads increment-1 paired FIFO test completed successfully; \
-         intentional stop before paired classified-output handling"
+        "FilterReads increment-2 paired classified-output validation completed successfully; \
+         intentional stop before target-pair downstream handoff"
     )))
 }
+
 
 /// Aligns reads against a target organism's reference index and sorts the resulting BAM.
 ///
