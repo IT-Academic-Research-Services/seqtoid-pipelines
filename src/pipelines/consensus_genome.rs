@@ -810,12 +810,20 @@ async fn filter_with_kraken(
     PipelineError,
 > {
     let mut cleanup_tasks = vec![];
-    let cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<Result<(), anyhow::Error>>> = Vec::new();
     let mut temp_dirs: Vec<TempDir> = Vec::new();
     let named_temp_files: Vec<NamedTempFile> = Vec::new();
 
+    let final_compressed_path = file_path_manipulator(
+        no_ext_sample_base_buf,
+        Some(out_dir),
+        None,
+        Some("classified_filtered.fq.gz"),
+        "_",
+    );
+
     // -------------------------------------------------------------------------
-    // WDL FilterReads increment 2:
+    // WDL FilterReads increment 3:
     //
     // host-removed reads
     //   -> minimap2 against target
@@ -838,8 +846,8 @@ async fn filter_with_kraken(
     // No mate identity is inferred from record position or adjacency.
     //
     // Increment 1 validates paired Kraken input accounting.
-    // Increment 2 additionally validates Kraken paired classified output.
-    // This test still stops intentionally before downstream handoff.
+    // Increment 2 validates Kraken paired classified output and target-taxid reconciliation.
+    // Increment 3 emits matching target pairs downstream and restores the compressed artifact.
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
@@ -1597,31 +1605,13 @@ async fn filter_with_kraken(
     );
 
     // -------------------------------------------------------------------------
-    // Increment 2: reconcile Kraken classification decisions against the
-    // paired --classified-out FASTQs.
+    // Increment 3: stream target-classified paired reads downstream.
     //
-    // With --paired and:
-    //
-    //   --classified-out classified#.fq
-    //
-    // Kraken writes:
-    //
-    //   classified_1.fq
-    //   classified_2.fq
-    //
-    // Those files contain every pair for which Kraken emitted status C.
-    //
-    // Kraken stdout above tells us which of those classified pairs were
-    // assigned specifically to target_taxid.
-    //
-    // Requirements:
-    //
-    //   1. R1 and R2 classified files contain the same number of records.
-    //   2. Every R1/R2 pair has the same read ID.
-    //   3. Number of classified FASTQ pairs equals the number of C lines
-    //      emitted by Kraken.
-    //   4. Every target ID from Kraken stdout occurs exactly once among the
-    //      paired classified FASTQs.
+    // Kraken has completed and both classified FASTQs are complete. The
+    // classification-output task above produced the authoritative set of pair
+    // IDs assigned directly to target_taxid. Parse the paired classified files
+    // in lockstep, validate the same invariants proven in Increment 2, and emit
+    // matching records as interleaved R1, R2 ParseOutput::Fastq items.
     // -------------------------------------------------------------------------
 
     let classified_r1_file = tokio::fs::File::open(&classified_r1_path)
@@ -1670,160 +1660,248 @@ async fn filter_with_kraken(
         ))
         })?;
 
-    let mut classified_r1_stream =
-        ReceiverStream::new(classified_r1_rx);
-
-    let mut classified_r2_stream =
-        ReceiverStream::new(classified_r2_rx);
-
-    let mut classified_pairs: u64 = 0;
-    let mut target_pairs: u64 = 0;
-
-    loop {
-        let r1_item = classified_r1_stream.next().await;
-        let r2_item = classified_r2_stream.next().await;
-
-        let (r1_record, r2_record) = match (r1_item, r2_item) {
-            (None, None) => {
-                break;
-            }
-
-            (Some(_), None) => {
-                return Err(PipelineError::Other(anyhow!(
-                    "Kraken classified mate imbalance: \
-                     R1 contains more records than R2 after {} complete pairs",
-                    classified_pairs
-                )));
-            }
-
-            (None, Some(_)) => {
-                return Err(PipelineError::Other(anyhow!(
-                    "Kraken classified mate imbalance: \
-                     R2 contains more records than R1 after {} complete pairs",
-                    classified_pairs
-                )));
-            }
-
-            (
-                Some(ParseOutput::Fastq(r1_record)),
-                Some(ParseOutput::Fastq(r2_record)),
-            ) => {
-                (r1_record, r2_record)
-            }
-
-            (Some(_), Some(_)) => {
-                return Err(PipelineError::Other(anyhow!(
-                    "Kraken classified parser emitted non-FASTQ item \
-                     after {} complete pairs",
-                    classified_pairs
-                )));
-            }
-        };
-
-        let r1_id = r1_record.id();
-        let r2_id = r2_record.id();
-
-        if r1_id != r2_id {
-            return Err(PipelineError::Other(anyhow!(
-                "Kraken classified mate ID mismatch at pair {}: \
-                 R1='{}' R2='{}'",
-                classified_pairs + 1,
-                r1_id,
-                r2_id
-            )));
-        }
-
-        classified_pairs += 1;
-
-        if target_ids.contains(r1_id) {
-            target_pairs += 1;
-        }
-
-        if classified_pairs % 100_000 == 0 {
-            debug!(
-                "FilterReads classified-output reconciliation: \
-                 classified_pairs={} target_pairs={}",
-                classified_pairs,
-                target_pairs
-            );
-        }
+    if target_ids.is_empty() {
+        return Err(PipelineError::EmptyStream);
     }
 
-    // -------------------------------------------------------------------------
-    // Reconcile the two independent Kraken outputs.
-    //
-    // --output says how many pairs Kraken classified and which target taxid
-    // each classified pair received.
-    //
-    // --classified-out contains the actual classified sequence pairs.
-    //
-    // These counts must agree exactly.
-    // -------------------------------------------------------------------------
-
-    if classified_pairs != kraken_classified_pairs {
-        return Err(PipelineError::Other(anyhow!(
-            "FilterReads Kraken classified-pair reconciliation failed: \
-             classification_output_C_pairs={} classified_FASTQ_pairs={}",
-            kraken_classified_pairs,
-            classified_pairs
-        )));
-    }
-
-    if target_pairs != target_ids.len() as u64 {
-        return Err(PipelineError::Other(anyhow!(
-            "FilterReads Kraken target-pair reconciliation failed: \
-             classification_output_target_ids={} \
-             classified_FASTQ_target_pairs={}",
-            target_ids.len(),
-            target_pairs
-        )));
-    }
-
-    info!(
-        "FilterReads increment-2 TARGET FILTER VALIDATION SUCCESS: \
-         kraken_total_pairs={} \
-         kraken_classified_pairs={} \
-         kraken_unclassified_pairs={} \
-         classified_FASTQ_pairs={} \
-         target_pairs={} \
-         target_records={} \
-         target_taxid={} \
-         R1={} \
-         R2={}",
-        kraken_total_pairs,
-        kraken_classified_pairs,
-        kraken_unclassified_pairs,
-        classified_pairs,
-        target_pairs,
-        target_pairs * 2,
-        target_taxid,
-        classified_r1_path.display(),
-        classified_r2_path.display()
+    let output_channel_buffer = crate::utils::system::compute_buffer_size(
+        &config,
+        "filter_with_kraken_target_output",
+        StreamDataType::IlluminaFastq,
+        1.0,
     );
 
+    let (filtered_tx, filtered_rx) =
+        mpsc::channel::<ParseOutput>(output_channel_buffer);
+
+    let expected_target_pairs = target_ids.len() as u64;
+
+    let target_filter_task = tokio::spawn(async move {
+        let mut classified_r1_stream = ReceiverStream::new(classified_r1_rx);
+        let mut classified_r2_stream = ReceiverStream::new(classified_r2_rx);
+
+        let mut classified_pairs: u64 = 0;
+        let mut target_pairs: u64 = 0;
+
+        loop {
+            let r1_item = classified_r1_stream.next().await;
+            let r2_item = classified_r2_stream.next().await;
+
+            let (r1_record, r2_record) = match (r1_item, r2_item) {
+                (None, None) => break,
+
+                (Some(_), None) => {
+                    return Err(anyhow!(
+                        "Kraken classified mate imbalance: R1 contains more records than R2 after {} complete pairs",
+                        classified_pairs
+                    ));
+                }
+
+                (None, Some(_)) => {
+                    return Err(anyhow!(
+                        "Kraken classified mate imbalance: R2 contains more records than R1 after {} complete pairs",
+                        classified_pairs
+                    ));
+                }
+
+                (
+                    Some(ParseOutput::Fastq(r1_record)),
+                    Some(ParseOutput::Fastq(r2_record)),
+                ) => (r1_record, r2_record),
+
+                (Some(_), Some(_)) => {
+                    return Err(anyhow!(
+                        "Kraken classified parser emitted non-FASTQ item after {} complete pairs",
+                        classified_pairs
+                    ));
+                }
+            };
+
+            let is_target = {
+                let r1_id = r1_record.id();
+                let r2_id = r2_record.id();
+
+                if r1_id != r2_id {
+                    return Err(anyhow!(
+                        "Kraken classified mate ID mismatch at pair {}: R1='{}' R2='{}'",
+                        classified_pairs + 1,
+                        r1_id,
+                        r2_id
+                    ));
+                }
+
+                target_ids.contains(r1_id)
+            };
+
+            classified_pairs += 1;
+
+            if is_target {
+                filtered_tx
+                    .send(ParseOutput::Fastq(r1_record))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "FilterReads downstream channel closed while sending target R1 at pair {}",
+                            classified_pairs
+                        )
+                    })?;
+
+                filtered_tx
+                    .send(ParseOutput::Fastq(r2_record))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "FilterReads downstream channel closed while sending target R2 at pair {}",
+                            classified_pairs
+                        )
+                    })?;
+
+                target_pairs += 1;
+            }
+
+            if classified_pairs % 100_000 == 0 {
+                debug!(
+                    "FilterReads target-output producer: classified_pairs={} target_pairs={} target_records={}",
+                    classified_pairs,
+                    target_pairs,
+                    target_pairs * 2
+                );
+            }
+        }
+
+        if classified_pairs != kraken_classified_pairs {
+            return Err(anyhow!(
+                "FilterReads Kraken classified-pair reconciliation failed: classification_output_C_pairs={} classified_FASTQ_pairs={}",
+                kraken_classified_pairs,
+                classified_pairs
+            ));
+        }
+
+        if target_pairs != target_ids.len() as u64 {
+            return Err(anyhow!(
+                "FilterReads Kraken target-pair reconciliation failed: classification_output_target_ids={} emitted_target_pairs={}",
+                target_ids.len(),
+                target_pairs
+            ));
+        }
+
+        info!(
+            "FilterReads increment-3 TARGET OUTPUT SUCCESS: kraken_total_pairs={} kraken_classified_pairs={} kraken_unclassified_pairs={} classified_FASTQ_pairs={} target_pairs={} target_records={}",
+            kraken_total_pairs,
+            kraken_classified_pairs,
+            kraken_unclassified_pairs,
+            classified_pairs,
+            target_pairs,
+            target_pairs * 2
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    cleanup_tasks.push(target_filter_task);
+
     // -------------------------------------------------------------------------
-    // TEST STOP
+    // Fan out the target-filtered interleaved stream.
     //
-    // Increment 2 has now proven:
-    //
-    //   Kraken input pair count
-    //       == Kraken classification-output line count
-    //
-    //   Kraken C count
-    //       == paired classified FASTQ count
-    //
-    //   Kraken target-taxid ID count
-    //       == target IDs found in paired classified FASTQs
-    //
-    // The next increment can replace this intentional stop with emission of
-    // the matching R1/R2 records to the downstream ReceiverStream.
+    // Consumer 1 is returned to the caller and flows directly into
+    // align_to_target(). Consumer 2 is compressed to the historical
+    // classified_filtered.fq.gz artifact.
     // -------------------------------------------------------------------------
 
-    Err(PipelineError::Other(anyhow!(
-        "FilterReads increment-2 target classification reconciliation \
-         completed successfully; intentional stop before downstream handoff"
-    )))
+    let filtered_stream = ReceiverStream::new(filtered_rx);
+
+    let (kraken_streams, kraken_router_handle) = fanout_to_channels(
+        filtered_stream,
+        2,
+        "filter_reads_output",
+        &config,
+        StreamDataType::IlluminaFastq,
+    )
+        .await?;
+
+    cleanup_receivers.push(kraken_router_handle);
+
+    let mut streams_iter = kraken_streams.into_iter();
+
+    let kraken_output_stream =
+        streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    let kraken_file_stream =
+        streams_iter.next().ok_or(PipelineError::EmptyStream)?;
+
+    // -------------------------------------------------------------------------
+    // Write durable
+    // -------------------------------------------------------------------------
+
+    let pigz_args =
+        generate_cli(PIGZ_TAG, &config, None)
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+    let (
+        pigz_child,
+        pigz_stream_task,
+        pigz_err_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        kraken_file_stream,
+        PIGZ_TAG,
+        pigz_args,
+        StreamDataType::IlluminaFastq,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: PIGZ_TAG.to_string(),
+            error: e.to_string(),
+        })?;
+
+    cleanup_tasks.push(pigz_stream_task);
+    cleanup_tasks.push(pigz_err_task);
+
+    let pigz_out_stream = {
+        let mut guard = pigz_child.lock().await;
+
+        parse_child_output(
+            &mut guard,
+            ChildStream::Stdout,
+            ParseMode::Bytes,
+            &config,
+        )
+            .await
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?
+    };
+
+    let pigz_write_task = tokio::spawn(stream_to_file(
+        pigz_out_stream,
+        final_compressed_path,
+    ));
+
+    cleanup_tasks.push(pigz_write_task);
+
+    info!(
+        "FilterReads increment-3 downstream handoff initialized: target_pairs={} target_records={} target_taxid={} report={}",
+        expected_target_pairs,
+        expected_target_pairs * 2,
+        target_taxid,
+        kraken_report_path.display()
+    );
+
+    Ok((
+        ReceiverStream::new(kraken_output_stream),
+        cleanup_tasks,
+        cleanup_receivers,
+        named_temp_files,
+        temp_dirs,
+    ))
 }
+
 
 
 /// Aligns reads against a target organism's reference index and sorts the resulting BAM.
