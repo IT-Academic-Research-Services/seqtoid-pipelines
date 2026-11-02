@@ -1004,99 +1004,26 @@ async fn filter_with_kraken(
     temp_dirs.push(fifo_temp_dir);
 
     // -------------------------------------------------------------------------
-    // Create a classified-output FIFO.
-    //
-    // Increment 1 does not parse this output yet. We MUST drain it, however,
-    // otherwise Kraken can block trying to write classified reads.
-    //
-    // Increment 2 will replace this with the paired classified-output
-    // arrangement.
+    // Kraken requires '#' in --classified-out when using --paired.
+    // For increment 1, let Kraken write its paired classified output to
+    // temporary files. Increment 2 will replace this with streaming output.
     // -------------------------------------------------------------------------
 
-    let mut classified_builder = tempfile::Builder::new();
-    classified_builder.suffix(".fq");
-
-    let classified_temp = classified_builder
-        .tempfile_in(&config.ram_temp_dir)
+    let classified_temp_dir = tempfile::Builder::new()
+        .prefix("consensus_kraken_classified_")
+        .tempdir_in(&config.ram_temp_dir)
         .map_err(|e| {
             PipelineError::Other(anyhow!(
-                "Failed to create classified FIFO placeholder in {}: {}",
-                config.ram_temp_dir.display(),
-                e
-            ))
+            "Failed to create Kraken classified temp dir in {}: {}",
+            config.ram_temp_dir.display(),
+            e
+        ))
         })?;
 
-    let classified_fifo = classified_temp.path().to_path_buf();
+    let classified_path =
+        classified_temp_dir.path().join("classified#.fq");
 
-    classified_temp
-        .close()
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-                "Failed to close classified FIFO placeholder: {}",
-                e
-            ))
-        })?;
-
-    let _ = tokio::fs::remove_file(&classified_fifo).await;
-
-    create_fifo(&classified_fifo)
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
-
-    // -------------------------------------------------------------------------
-    // Start a drain for the classified-output FIFO BEFORE Kraken.
-    //
-    // Opening the FIFO reader may block until Kraken opens the writer, so
-    // perform the open inside its own task.
-    // -------------------------------------------------------------------------
-
-    let classified_fifo_for_drain = classified_fifo.clone();
-
-    let classified_drain_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-
-        let mut file = tokio::fs::File::open(
-            &classified_fifo_for_drain
-        )
-            .await
-            .map_err(|e| {
-                anyhow!(
-                "Failed to open Kraken classified FIFO {}: {}",
-                classified_fifo_for_drain.display(),
-                e
-            )
-            })?;
-
-        let mut buffer = vec![0u8; 1024 * 1024];
-        let mut total_bytes: u64 = 0;
-
-        loop {
-            let n = file
-                .read(&mut buffer)
-                .await
-                .map_err(|e| {
-                    anyhow!(
-                        "Failed reading Kraken classified FIFO: {}",
-                        e
-                    )
-                })?;
-
-            if n == 0 {
-                break;
-            }
-
-            total_bytes += n as u64;
-        }
-
-        debug!(
-            "FilterReads increment-1 classified FIFO drained {} bytes",
-            total_bytes
-        );
-
-        Ok::<(), anyhow::Error>(())
-    });
-
-    cleanup_tasks.push(classified_drain_task);
+    temp_dirs.push(classified_temp_dir);
 
     // -------------------------------------------------------------------------
     // samtools fastq
@@ -1180,7 +1107,7 @@ async fn filter_with_kraken(
 
     let kraken2_config = Kraken2Config {
         report_path: kraken_report_path.clone(),
-        classified_path: classified_fifo.clone(),
+        classified_path: classified_path.clone(),
         fastq_path: fq1_fifo.clone(),
         fastq_path_2: Some(fq2_fifo.clone()),
     };
