@@ -1358,13 +1358,33 @@ async fn filter_with_kraken(
         let mut lines = BufReader::new(kraken_stdout).lines();
         let mut count = 0u64;
 
+        let target = "\t2697049\t";
+        let mut target_count = 0u64;
+
         while let Some(line) = lines.next_line().await? {
             if count < 10 {
                 debug!("KRAKEN CLASSIFICATION OUTPUT: {}", line);
             }
 
+            if line.contains(target) {
+                target_count += 1;
+
+                if target_count <= 5 {
+                    debug!(
+                "KRAKEN TARGET CLASSIFICATION: {}",
+                line
+            );
+                }
+            }
+
             count += 1;
         }
+
+        debug!(
+    "Kraken classification output: {} lines, {} assigned directly to target taxid",
+    count,
+    target_count
+);
 
         debug!("Kraken classification output: {} lines", count);
 
