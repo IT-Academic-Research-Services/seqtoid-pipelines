@@ -1267,8 +1267,8 @@ pub mod kraken2 {
             args_vec.push(config.report_path.to_string_lossy().to_string());
             args_vec.push("--classified-out".to_string());
             args_vec.push(config.classified_path.to_string_lossy().to_string());
-            args_vec.push("--output".to_string());
-            args_vec.push("-".to_string()); // "-" will suppress normal output
+            // args_vec.push("--output".to_string());
+            // args_vec.push("-".to_string()); // "-" will suppress normal output
 
             if let Some(fastq_path_2) = &config.fastq_path_2 {
                 args_vec.push("--paired".to_string());
