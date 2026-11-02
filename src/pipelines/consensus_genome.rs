@@ -793,6 +793,7 @@ async fn process_ercc(
 async fn filter_with_kraken(
     config: Arc<RunConfig>,
     input_stream: ReceiverStream<ParseOutput>,
+    target_index_path: PathBuf,
     out_dir: &PathBuf,
     no_ext_sample_base_buf: &PathBuf,
     _target_taxid: &str,
@@ -825,44 +826,6 @@ async fn filter_with_kraken(
     // This test stops after Kraken completes successfully.
     // -------------------------------------------------------------------------
 
-    // -------------------------------------------------------------------------
-    // Prepare target minimap2 index
-    // -------------------------------------------------------------------------
-
-    let (
-        _target_ref_fasta_path,
-        target_index_path,
-        target_ref_temp,
-        target_index_temp,
-        target_temp_dir,
-        target_ref_tasks,
-    ) = minimap2_index_prep(
-        &config,
-        &config.ram_temp_dir,
-        config.args.target_sequence.clone(),
-        config.args.target_index.clone(),
-        "target",
-    )
-        .await?;
-
-    try_join_all(target_ref_tasks).await?;
-
-    debug!(
-        "filter_with_kraken target index: {}",
-        target_index_path.display()
-    );
-
-    if let Some(temp) = target_ref_temp {
-        named_temp_files.push(temp);
-    }
-
-    if let Some(temp) = target_index_temp {
-        named_temp_files.push(temp);
-    }
-
-    if let Some(temp_dir) = target_temp_dir {
-        temp_dirs.push(temp_dir);
-    }
 
     // -------------------------------------------------------------------------
     // minimap2 -ax sr TARGET -
@@ -2676,6 +2639,7 @@ pub async fn run(config: Arc<RunConfig>) -> Result<(), PipelineError> {
             ) = filter_with_kraken(
                 config.clone(),
                 filter_reads_input_stream,
+                target_ref_index_path.clone(),
                 &out_dir,
                 &no_ext_sample_base_buf,
                 config
