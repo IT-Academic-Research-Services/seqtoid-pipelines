@@ -821,25 +821,22 @@ async fn filter_with_kraken(
     //   -> minimap2 against target
     //   -> samtools sort -n
     //   -> samtools fastq -G 12 -N
-    //   -> validate explicit /1 + /2 mate identity
+    //   -> route explicit /1 and /2 mate identities
     //   -> R1 FIFO + R2 FIFO
     //   -> kraken2 --paired
     //
     // IMPORTANT:
     //
-    // We DO NOT assign R1/R2 by odd/even position alone.
+    // We do NOT infer mate identity from FASTQ record position or adjacency.
     //
     // samtools fastq -N appends /1 or /2 based on BAM READ1/READ2 flags.
-    // For every pair below we verify:
-    //
-    //   record A ends in /1
-    //   record B ends in /2
-    //   base QNAME(A) == base QNAME(B)
-    //
-    // Only after those checks are the records sent to their respective FIFOs.
+    // Each FASTQ record is routed independently according to that explicit
+    // marker.
     //
     // The temporary /1 and /2 suffixes are stripped again before Kraken so
     // the read names match the WDL's `samtools fastq -n` naming behavior.
+    //
+    // At EOF, R1 and R2 counts must be identical.
     //
     // This test stops intentionally after paired Kraken completes.
     // -------------------------------------------------------------------------
@@ -986,21 +983,10 @@ async fn filter_with_kraken(
     // -------------------------------------------------------------------------
     // samtools fastq -G 12 -N
     //
-    // WDL uses:
+    // -N exposes BAM mate identity explicitly as /1 or /2.
     //
-    //   samtools fastq -G 12 ... -n
-    //
-    // For this streaming bridge we intentionally use -N instead.
-    //
-    // -N makes samtools expose BAM mate identity explicitly:
-    //
-    //     READ1 -> QNAME/1
-    //     READ2 -> QNAME/2
-    //
-    // We use those suffixes only for validation/routing and strip them before
-    // sending the records to Kraken.
-    //
-    // No -1/-2 paths are used here. FASTQ is emitted on stdout.
+    // No -1/-2 paths are used here. FASTQ is emitted on stdout and Rust
+    // routes each record independently by its explicit mate marker.
     // -------------------------------------------------------------------------
 
     let fastq_config = SamtoolsConfig::new(SamtoolsSubcommand::Fastq)
@@ -1023,7 +1009,7 @@ async fn filter_with_kraken(
             })?;
 
     debug!(
-        "FilterReads starting samtools fastq -G 12 -N -> validated paired router"
+        "FilterReads starting samtools fastq -G 12 -N -> explicit mate router"
     );
 
     let (
@@ -1066,16 +1052,6 @@ async fn filter_with_kraken(
 
     // -------------------------------------------------------------------------
     // Create R1/R2 FIFOs.
-    //
-    // Unlike the previous attempt, samtools itself does NOT open these.
-    //
-    // Rust has two independent writer tasks:
-    //
-    //     R1 channel -> R1 FIFO writer
-    //     R2 channel -> R2 FIFO writer
-    //
-    // Therefore one blocked FIFO open cannot prevent the other writer task
-    // from attempting its own open.
     // -------------------------------------------------------------------------
 
     let fifo_temp_dir = tempfile::Builder::new()
@@ -1109,14 +1085,12 @@ async fn filter_with_kraken(
     temp_dirs.push(fifo_temp_dir);
 
     // -------------------------------------------------------------------------
-    // Explicit mate-validation router.
+    // Explicit mate router.
     //
-    // DO NOT replace this with the current
-    // deinterleave_fastq_stream_to_fifos() helper.
+    // There is deliberately NO assumption about FASTQ stdout ordering.
     //
-    // That helper currently routes records using only an alternating boolean.
-    // Here every pair is validated using the /1 and /2 identities emitted by
-    // samtools fastq -N.
+    // Every record is independently routed according to the /1 or /2 marker
+    // emitted by samtools fastq -N.
     // -------------------------------------------------------------------------
 
     let fifo_channel_buffer = crate::utils::system::compute_buffer_size(
@@ -1132,45 +1106,26 @@ async fn filter_with_kraken(
     let mate_router_task = tokio::spawn(async move {
         let mut stream = ReceiverStream::new(fastq_out_stream);
 
-        let mut pair_count: u64 = 0;
+        let mut total_count: u64 = 0;
+        let mut r1_count: u64 = 0;
+        let mut r2_count: u64 = 0;
 
-        loop {
-            let r1_item = match stream.next().await {
-                Some(item) => item,
-                None => break,
-            };
-
-            let r2_item = stream.next().await.ok_or_else(|| {
-                anyhow!(
-                    "FilterReads paired FASTQ ended after R1 of pair {}; missing R2",
-                    pair_count + 1
-                )
-            })?;
-
-            let r1_record = match r1_item {
+        while let Some(item) = stream.next().await {
+            let record = match item {
                 ParseOutput::Fastq(record) => record,
                 _ => {
                     return Err(anyhow!(
-                        "FilterReads paired router received non-FASTQ item for R1"
-                    ));
-                }
-            };
-
-            let r2_record = match r2_item {
-                ParseOutput::Fastq(record) => record,
-                _ => {
-                    return Err(anyhow!(
-                        "FilterReads paired router received non-FASTQ item for R2"
+                        "FilterReads paired router received non-FASTQ item"
                     ));
                 }
             };
 
             let (
-                r1_id,
-                r1_desc,
-                r1_seq,
-                r1_qual,
-            ) = match r1_record {
+                id,
+                desc,
+                seq,
+                qual,
+            ) = match record {
                 SequenceRecord::Fastq {
                     id,
                     desc,
@@ -1179,103 +1134,68 @@ async fn filter_with_kraken(
                 } => (id, desc, seq, qual),
                 _ => {
                     return Err(anyhow!(
-                        "FilterReads paired router received non-FASTQ SequenceRecord for R1"
+                        "FilterReads paired router received non-FASTQ SequenceRecord"
                     ));
                 }
             };
 
-            let (
-                r2_id,
-                r2_desc,
-                r2_seq,
-                r2_qual,
-            ) = match r2_record {
-                SequenceRecord::Fastq {
-                    id,
-                    desc,
-                    seq,
-                    qual,
-                } => (id, desc, seq, qual),
-                _ => {
-                    return Err(anyhow!(
-                        "FilterReads paired router received non-FASTQ SequenceRecord for R2"
-                    ));
-                }
-            };
+            total_count += 1;
 
-            let r1_base = r1_id.strip_suffix("/1").ok_or_else(|| {
-                anyhow!(
-                    "FilterReads expected READ1 marker '/1', got FASTQ id '{}'",
-                    r1_id
-                )
-            })?;
+            if let Some(base_id) = id.strip_suffix("/1") {
+                let output = ParseOutput::Fastq(
+                    SequenceRecord::Fastq {
+                        id: base_id.to_string(),
+                        desc,
+                        seq,
+                        qual,
+                    }
+                );
 
-            let r2_base = r2_id.strip_suffix("/2").ok_or_else(|| {
-                anyhow!(
-                    "FilterReads expected READ2 marker '/2', got FASTQ id '{}'",
-                    r2_id
-                )
-            })?;
+                r1_tx
+                    .send(output)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "FilterReads R1 FIFO channel closed after {} R1 records",
+                            r1_count
+                        )
+                    })?;
 
-            if r1_base != r2_base {
+                r1_count += 1;
+            } else if let Some(base_id) = id.strip_suffix("/2") {
+                let output = ParseOutput::Fastq(
+                    SequenceRecord::Fastq {
+                        id: base_id.to_string(),
+                        desc,
+                        seq,
+                        qual,
+                    }
+                );
+
+                r2_tx
+                    .send(output)
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "FilterReads R2 FIFO channel closed after {} R2 records",
+                            r2_count
+                        )
+                    })?;
+
+                r2_count += 1;
+            } else {
                 return Err(anyhow!(
-                    "FilterReads mate identity mismatch at pair {}: R1='{}', R2='{}'",
-                    pair_count + 1,
-                    r1_id,
-                    r2_id
+                    "FilterReads FASTQ record lacks explicit /1 or /2 mate marker: '{}'",
+                    id
                 ));
             }
 
-            // Restore the original QNAME before Kraken.
-            //
-            // The /1 and /2 markers were introduced only by samtools fastq -N
-            // so that this router could validate mate identity.
-            let original_id = r1_base.to_string();
-
-            let r1_output = ParseOutput::Fastq(
-                SequenceRecord::Fastq {
-                    id: original_id.clone(),
-                    desc: r1_desc,
-                    seq: r1_seq,
-                    qual: r1_qual,
-                }
-            );
-
-            let r2_output = ParseOutput::Fastq(
-                SequenceRecord::Fastq {
-                    id: original_id,
-                    desc: r2_desc,
-                    seq: r2_seq,
-                    qual: r2_qual,
-                }
-            );
-
-            r1_tx
-                .send(r1_output)
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "FilterReads R1 FIFO channel closed at pair {}",
-                        pair_count + 1
-                    )
-                })?;
-
-            r2_tx
-                .send(r2_output)
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "FilterReads R2 FIFO channel closed at pair {}",
-                        pair_count + 1
-                    )
-                })?;
-
-            pair_count += 1;
-
-            if pair_count % 100_000 == 0 {
+            if total_count % 100_000 == 0 {
                 debug!(
-                    "FilterReads validated and routed {} read pairs",
-                    pair_count
+                    "FilterReads mate router: {} records routed (R1={}, R2={})",
+                    total_count,
+                    r1_count,
+                    r2_count
                 );
             }
         }
@@ -1283,22 +1203,36 @@ async fn filter_with_kraken(
         drop(r1_tx);
         drop(r2_tx);
 
+        if r1_count != r2_count {
+            return Err(anyhow!(
+                "FilterReads mate imbalance after samtools fastq: R1={} R2={} total={}",
+                r1_count,
+                r2_count,
+                total_count
+            ));
+        }
+
+        if total_count != r1_count + r2_count {
+            return Err(anyhow!(
+                "FilterReads mate accounting mismatch: total={} R1={} R2={}",
+                total_count,
+                r1_count,
+                r2_count
+            ));
+        }
+
         debug!(
-            "FilterReads paired router completed cleanly: {} validated pairs / {} reads",
-            pair_count,
-            pair_count * 2
+            "FilterReads mate router completed cleanly: total={} R1={} R2={}",
+            total_count,
+            r1_count,
+            r2_count
         );
 
         Ok::<(), anyhow::Error>(())
     });
 
-
-
     // -------------------------------------------------------------------------
     // Independent FIFO writer tasks.
-    //
-    // These are separate Tokio tasks. Each can independently block waiting
-    // for Kraken to open its corresponding FIFO.
     // -------------------------------------------------------------------------
 
     let r1_fifo_for_writer = fq1_fifo.clone();
@@ -1320,12 +1254,10 @@ async fn filter_with_kraken(
             .await
     });
 
-
     // -------------------------------------------------------------------------
     // Increment 1: Kraken classified output goes to temporary files.
     //
-    // Kraken requires '#' in --classified-out for paired input.
-    // We are not testing classified-output streaming yet.
+    // Kraken requires '#' in --classified-out when using --paired.
     // -------------------------------------------------------------------------
 
     let classified_temp_dir = tempfile::Builder::new()
@@ -1399,13 +1331,7 @@ async fn filter_with_kraken(
     cleanup_tasks.push(kraken2_err_task);
 
     // -------------------------------------------------------------------------
-    // Drain Kraken's normal stdout.
-    //
-    // Kraken2Config currently emits:
-    //
-    //     --output -
-    //
-    // so stdout must be consumed.
+    // Drain Kraken normal stdout.
     // -------------------------------------------------------------------------
 
     let kraken_stdout = kraken2_child
@@ -1479,107 +1405,82 @@ async fn filter_with_kraken(
 
     // -------------------------------------------------------------------------
     // TEST ACCOUNTING CHECK
-    //
-    // Kraken has reached EOF on both query FIFOs and exited successfully.
-    // Therefore both FIFO writers should now be able to finish, which in turn
-    // allows the mate router to finish.
-    //
-    // Explicitly join all three here so that this test cannot report success
-    // until every FASTQ record emitted by samtools fastq has been accounted for.
     // -------------------------------------------------------------------------
 
     debug!(
-    "FilterReads accounting test: Kraken exited successfully; \
-     waiting for mate router and both FIFO writers"
-);
+        "FilterReads accounting test: Kraken exited successfully; \
+         waiting for mate router and both FIFO writers"
+    );
 
     match mate_router_task.await {
         Ok(Ok(())) => {
             debug!(
-            "FilterReads accounting test: mate router completed successfully"
-        );
+                "FilterReads accounting test: mate router completed successfully"
+            );
         }
         Ok(Err(e)) => {
             return Err(PipelineError::Other(anyhow!(
-            "FilterReads mate router failed: {}",
-            e
-        )));
+                "FilterReads mate router failed: {}",
+                e
+            )));
         }
         Err(e) => {
             return Err(PipelineError::Other(anyhow!(
-            "FilterReads mate router task join failed: {}",
-            e
-        )));
+                "FilterReads mate router task join failed: {}",
+                e
+            )));
         }
     }
 
     match r1_write_task.await {
         Ok(Ok(())) => {
             debug!(
-            "FilterReads accounting test: R1 FIFO writer completed successfully"
-        );
+                "FilterReads accounting test: R1 FIFO writer completed successfully"
+            );
         }
         Ok(Err(e)) => {
             return Err(PipelineError::Other(anyhow!(
-            "FilterReads R1 FIFO writer failed: {}",
-            e
-        )));
+                "FilterReads R1 FIFO writer failed: {}",
+                e
+            )));
         }
         Err(e) => {
             return Err(PipelineError::Other(anyhow!(
-            "FilterReads R1 FIFO writer task join failed: {}",
-            e
-        )));
+                "FilterReads R1 FIFO writer task join failed: {}",
+                e
+            )));
         }
     }
 
     match r2_write_task.await {
         Ok(Ok(())) => {
             debug!(
-            "FilterReads accounting test: R2 FIFO writer completed successfully"
-        );
+                "FilterReads accounting test: R2 FIFO writer completed successfully"
+            );
         }
         Ok(Err(e)) => {
             return Err(PipelineError::Other(anyhow!(
-            "FilterReads R2 FIFO writer failed: {}",
-            e
-        )));
+                "FilterReads R2 FIFO writer failed: {}",
+                e
+            )));
         }
         Err(e) => {
             return Err(PipelineError::Other(anyhow!(
-            "FilterReads R2 FIFO writer task join failed: {}",
-            e
-        )));
+                "FilterReads R2 FIFO writer task join failed: {}",
+                e
+            )));
         }
     }
 
     info!(
-    "FilterReads increment-1 ACCOUNTING SUCCESS: \
-     mate router + R1 writer + R2 writer + paired Kraken2 all completed; \
-     report={}",
-    kraken_report_path.display()
-);
+        "FilterReads increment-1 ACCOUNTING SUCCESS: \
+         mate router + R1 writer + R2 writer + paired Kraken2 all completed; \
+         report={}",
+        kraken_report_path.display()
+    );
 
     // -------------------------------------------------------------------------
     // TEST STOP
-    //
-    // A successful run to here proves:
-    //
-    //   target minimap2
-    //       ↓
-    //   samtools sort -n
-    //       ↓
-    //   samtools fastq -G 12 -N
-    //       ↓
-    //   explicit READ1/READ2 identity validation
-    //       ↓
-    //   independent Rust FIFO writers
-    //       ↓
-    //   Kraken2 --paired
-    //
-    // Increment 2 will replace the temporary classified files with the paired
-    // classified-output streaming/filtering path and return the real FASTQ
-    // stream to align_to_target().
     // -------------------------------------------------------------------------
 
     Err(PipelineError::Other(anyhow!(
