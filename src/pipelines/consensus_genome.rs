@@ -1605,6 +1605,27 @@ async fn filter_with_kraken(
                 let r1_id = r1_record.id();
                 let r2_id = r2_record.id();
 
+
+
+
+                if classified_pairs < 100 {
+                    debug!(
+            "FilterReads classified pair {}: R1 id={:?}",
+            classified_pairs + 1,
+            r1_record.id(),
+        );
+
+                    debug!(
+            "FilterReads classified pair {}: R2 id={:?}",
+            classified_pairs + 1,
+            r2_record.id(),
+        );
+                }
+
+
+
+
+
                 if r1_id != r2_id {
                     return Err(PipelineError::Other(anyhow!(
                         "Kraken classified mate ID mismatch at pair {}: R1='{}' R2='{}'",
