@@ -1292,7 +1292,7 @@ async fn filter_with_kraken(
         Ok::<(), anyhow::Error>(())
     });
 
-    cleanup_tasks.push(mate_router_task);
+
 
     // -------------------------------------------------------------------------
     // Independent FIFO writer tasks.
@@ -1320,8 +1320,6 @@ async fn filter_with_kraken(
             .await
     });
 
-    cleanup_tasks.push(r1_write_task);
-    cleanup_tasks.push(r2_write_task);
 
     // -------------------------------------------------------------------------
     // Increment 1: Kraken classified output goes to temporary files.
@@ -1479,10 +1477,88 @@ async fn filter_with_kraken(
         });
     }
 
+    // -------------------------------------------------------------------------
+    // TEST ACCOUNTING CHECK
+    //
+    // Kraken has reached EOF on both query FIFOs and exited successfully.
+    // Therefore both FIFO writers should now be able to finish, which in turn
+    // allows the mate router to finish.
+    //
+    // Explicitly join all three here so that this test cannot report success
+    // until every FASTQ record emitted by samtools fastq has been accounted for.
+    // -------------------------------------------------------------------------
+
+    debug!(
+    "FilterReads accounting test: Kraken exited successfully; \
+     waiting for mate router and both FIFO writers"
+);
+
+    match mate_router_task.await {
+        Ok(Ok(())) => {
+            debug!(
+            "FilterReads accounting test: mate router completed successfully"
+        );
+        }
+        Ok(Err(e)) => {
+            return Err(PipelineError::Other(anyhow!(
+            "FilterReads mate router failed: {}",
+            e
+        )));
+        }
+        Err(e) => {
+            return Err(PipelineError::Other(anyhow!(
+            "FilterReads mate router task join failed: {}",
+            e
+        )));
+        }
+    }
+
+    match r1_write_task.await {
+        Ok(Ok(())) => {
+            debug!(
+            "FilterReads accounting test: R1 FIFO writer completed successfully"
+        );
+        }
+        Ok(Err(e)) => {
+            return Err(PipelineError::Other(anyhow!(
+            "FilterReads R1 FIFO writer failed: {}",
+            e
+        )));
+        }
+        Err(e) => {
+            return Err(PipelineError::Other(anyhow!(
+            "FilterReads R1 FIFO writer task join failed: {}",
+            e
+        )));
+        }
+    }
+
+    match r2_write_task.await {
+        Ok(Ok(())) => {
+            debug!(
+            "FilterReads accounting test: R2 FIFO writer completed successfully"
+        );
+        }
+        Ok(Err(e)) => {
+            return Err(PipelineError::Other(anyhow!(
+            "FilterReads R2 FIFO writer failed: {}",
+            e
+        )));
+        }
+        Err(e) => {
+            return Err(PipelineError::Other(anyhow!(
+            "FilterReads R2 FIFO writer task join failed: {}",
+            e
+        )));
+        }
+    }
+
     info!(
-        "FilterReads increment-1 SUCCESS: paired Kraken2 completed; report={}",
-        kraken_report_path.display()
-    );
+    "FilterReads increment-1 ACCOUNTING SUCCESS: \
+     mate router + R1 writer + R2 writer + paired Kraken2 all completed; \
+     report={}",
+    kraken_report_path.display()
+);
 
     // -------------------------------------------------------------------------
     // TEST STOP
