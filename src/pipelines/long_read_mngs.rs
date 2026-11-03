@@ -2920,7 +2920,9 @@ async fn diamond_non_host_align(
 
 /// Long-read equivalent of:
 ///
-///     idseq_dag.util.contig_hitsummary.summarize_hits
+/// ```text
+/// idseq_dag.util.contig_hitsummary.summarize_hits
+/// ```
 ///
 /// Input is the output of FindTopHitsNT / FindTopHitsNR.
 ///
@@ -3434,21 +3436,23 @@ where
 ///
 /// Legacy semantics:
 ///
-///   mapped_hits =
-///       IDs appearing in NT hit summary
-///       UNION
-///       IDs appearing in NR hit summary
+/// ```text
+/// mapped_hits =
+///     IDs appearing in NT hit summary
+///     UNION
+///     IDs appearing in NR hit summary
 ///
-///   for (read, contig) in reads_to_contigs:
-///       if read not in mapped_hits
-///          && contig not in mapped_hits:
-///           retain read
+/// for (read, contig) in reads_to_contigs:
+///     if read not in mapped_hits
+///        && contig not in mapped_hits:
+///         retain read
 ///
-///   extract retained reads from the subsampled FASTQ and emit:
+/// extract retained reads from the subsampled FASTQ and emit:
 ///
-///       unmapped_reads.fastq
-///       unmapped_reads.count
-///       unmapped_bases.count
+///     unmapped_reads.fastq
+///     unmapped_reads.count
+///     unmapped_bases.count
+/// ```
 ///
 /// ReducedRead.summary contains the reassigned read ID in field 0 and the
 /// originating contig ID in field 7. Collecting both preserves the legacy

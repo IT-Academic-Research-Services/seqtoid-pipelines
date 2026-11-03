@@ -424,12 +424,16 @@ pub async fn compute_insert_size_stats_from_bam(
 /// Pileup depth deliberately uses `unfiltered_depth()`, matching the legacy
 /// Python:
 ///
-///     pileup_column.get_num_aligned()
+/// ```text
+/// pileup_column.get_num_aligned()
+/// ```
 ///
 /// The alignment filter is explicitly configured to match the legacy pysam
 /// pileup flag filter:
 ///
-///     UNMAPPED | SECONDARY | QC_FAIL | DUPLICATE
+/// ```text
+/// UNMAPPED | SECONDARY | QC_FAIL | DUPLICATE
+/// ```
 ///
 /// Supplementary alignments are therefore retained.
 ///
@@ -438,12 +442,16 @@ pub async fn compute_insert_size_stats_from_bam(
 ///
 /// JSON uses the legacy Python field names:
 ///
-///     coverage, avg, p0, p100, p25, p50, p75,
-///     avg2xcnt, cnt0, cnt1, cnt2, contig_len
+/// ```text
+/// coverage, avg, p0, p100, p25, p50, p75,
+/// avg2xcnt, cnt0, cnt1, cnt2, contig_len
+/// ```
 ///
 /// CSV uses the legacy Python column names:
 ///
-///     contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2
+/// ```text
+/// contig_name,avg,min,max,p25,p50,p75,avg2xcnt,cnt0,cnt1,cnt2
+/// ```
 pub async fn generate_assembly_coverage(
     config: Arc<RunConfig>,
     assembly_bam_rx: ReceiverStream<ParseOutput>,
@@ -1182,20 +1190,26 @@ pub async fn filter_clipped_alignments(
 ///
 /// Returns:
 ///
-///     (clipping_length, hard_clipping_length)
+/// ```text
+/// (clipping_length, hard_clipping_length)
+/// ```
 ///
 /// Examples:
 ///
-///     100M          -> (0, 0)
-///     20S100M       -> front: (20, 0)
-///     20H100M       -> front: (20, 20)
-///     100M30S       -> end:   (30, 0)
-///     100M30H       -> end:   (30, 30)
+/// ```text
+/// 100M          -> (0, 0)
+/// 20S100M       -> front: (20, 0)
+/// 20H100M       -> front: (20, 20)
+/// 100M30S       -> end:   (30, 0)
+/// 100M30H       -> end:   (30, 30)
+/// ```
 ///
 /// This deliberately matches the legacy regular expressions:
 ///
-///     ^\d+[SH]
-///     \d+[SH]$
+/// ```text
+/// ^\d+[SH]
+/// \d+[SH]$
+/// ```
 ///
 /// It does NOT combine adjacent clipping operations. For example,
 /// `10H20S100M` matches only `10H` at the front, just as the Python

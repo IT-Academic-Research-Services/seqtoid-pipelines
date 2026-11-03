@@ -123,7 +123,9 @@ pub struct ShardedMinimap2Config {
 ///
 /// The returned stream contains:
 ///
-///     ParseOutput::Bytes
+/// ```text
+/// ParseOutput::Bytes
+/// ```
 ///
 /// where each item is one newline-terminated PAF record.
 ///
