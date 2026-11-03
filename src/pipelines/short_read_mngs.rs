@@ -5272,17 +5272,18 @@ fn parse_fasta_batch_to_annotated_streaming(
 ///
 /// Existing short-read Rust behavior is preserved:
 ///
-///   mapped:
-///       NR:<nr_accessession>:NT:<nt_accession>:<read_id>
+/// ```text
+/// mapped:
+///     NR:<nr_accessession>:NT:<nt_accession>:<read_id>
 ///
-///   unidentified:
-///       <read_id>
+/// unidentified:
+///     <read_id>
+/// ```
 ///
 /// For each unidentified deduplicated representative:
 ///
-///   - `unique_rx` receives the representative once.
-///   - `expanded_rx` receives the representative `ClusterInfo.size` times.
-///
+/// - `unique_rx` receives the representative once.
+/// - `expanded_rx` receives the representative `ClusterInfo.size` times.
 ///
 /// The only behavioral change from the previous Rust implementation is that
 /// an unidentified representative missing from `duplicate_clusters` is now

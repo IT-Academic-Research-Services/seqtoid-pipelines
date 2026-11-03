@@ -493,14 +493,17 @@ async fn align_to_host(
 }
 
 /// Quantifies ERCC spike-in sequences from a side-branch copy of the
+/// Quantifies ERCC spike-in sequences from a side-branch copy of the
 /// host-removed FASTQ stream.
 ///
 /// This mirrors the WDL QuantifyERCCs task:
 ///
-///   host-removed FASTQs
-///       -> minimap2 against ERCC reference
-///       -> samtools view (BAM)
-///       -> samtools stats
+/// ```text
+/// host-removed FASTQs
+///     -> minimap2 against ERCC reference
+///     -> samtools view (BAM)
+///     -> samtools stats
+/// ```
 ///
 /// ERCC processing does NOT filter or transform the main read stream.
 /// The caller is responsible for fanout before calling this function.

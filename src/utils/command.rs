@@ -394,9 +394,9 @@ pub mod minimap2 {
     ///
     /// This helper retains the existing host/human-reference behavior:
     ///
-    ///   - if an existing `.mmi` is supplied, use/copy it;
-    ///   - if a FASTA is supplied, copy it into RAM scratch and build
-    ///     a temporary `.mmi`.
+    /// - if an existing `.mmi` is supplied, use/copy it;
+    /// - if a FASTA is supplied, copy it into RAM scratch and build
+    ///   a temporary `.mmi`.
     ///
     /// This helper is NOT required when a caller intentionally wants
     /// minimap2 to consume a FASTA reference directly. Such callers can
@@ -906,23 +906,30 @@ pub mod samtools {
         /// Ordered command-line options and flags.
         ///
         /// Examples:
-        ///     ("-@", Some("16"))
-        ///     ("--no-PG", None)
-        ///     ("-F", Some("0x900"))
+        ///
+        /// ```text
+        /// ("-@", Some("16"))
+        /// ("--no-PG", None)
+        /// ("-F", Some("0x900"))
+        /// ```
         ///
         /// Vec is intentional:
-        ///   - preserves command-line order;
-        ///   - permits repeated options;
-        ///   - does not conflate options with positional operands.
+        ///
+        /// - preserves command-line order;
+        /// - permits repeated options;
+        /// - does not conflate options with positional operands.
         pub subcommand_fields: Vec<(String, Option<String>)>,
 
         /// Ordered positional operands.
         ///
         /// Examples:
-        ///     "-"
-        ///     "input.sam"
-        ///     "input.bam"
-        ///     "output.bai"
+        ///
+        /// ```text
+        /// "-"
+        /// "input.sam"
+        /// "input.bam"
+        /// "output.bai"
+        /// ```
         ///
         /// Order is part of the command's semantics and must therefore
         /// be represented explicitly.
@@ -1053,22 +1060,29 @@ pub mod bcftools {
         /// Ordered command-line options and flags.
         ///
         /// Examples:
-        ///     ("-a", Some("AD"))
-        ///     ("-Ou", None)
-        ///     ("--ploidy", Some("1"))
+        ///
+        /// ```text
+        /// ("-a", Some("AD"))
+        /// ("-Ou", None)
+        /// ("--ploidy", Some("1"))
+        /// ```
         ///
         /// Vec is intentional:
-        ///   - preserves command-line order;
-        ///   - permits repeated options;
-        ///   - does not conflate options with positional operands.
+        ///
+        /// - preserves command-line order;
+        /// - permits repeated options;
+        /// - does not conflate options with positional operands.
         pub subcommand_fields: Vec<(String, Option<String>)>,
 
         /// Ordered positional operands.
         ///
         /// Examples:
-        ///     "-"
-        ///     "input.bcf"
-        ///     "reference.fa"
+        ///
+        /// ```text
+        /// "-"
+        /// "input.bcf"
+        /// "reference.fa"
+        /// ```
         ///
         /// Order is part of the command's semantics and must therefore
         /// be represented explicitly.
@@ -2927,18 +2941,21 @@ pub mod diamond {
     ///
     /// The caller supplies the resources for the machine that will actually
     /// execute Diamond:
-    ///   - `threads`
-    ///   - `available_ram_bytes`
-    ///   - `tmpdir`
+    ///
+    /// - `threads`
+    /// - `available_ram_bytes`
+    /// - `tmpdir`
     ///
     /// Diamond-specific tuning is then calculated here using the existing
     /// shared algorithms:
-    ///   - block size from RAM + DB size + scratch availability
-    ///   - index chunk count from threads + RAM
+    ///
+    /// - block size from RAM + DB size + scratch availability
+    /// - index chunk count from threads + RAM
     ///
     /// `output` controls only where Diamond writes its M8 output:
-    ///   - `None`  -> Diamond writes to stdout (existing single-node behavior)
-    ///   - `Some` -> Diamond receives `--out <path>` (distributed worker behavior)
+    ///
+    /// - `None` -> Diamond writes to stdout (existing single-node behavior)
+    /// - `Some` -> Diamond receives `--out <path>` (distributed worker behavior)
     pub async fn build_diamond_config(
         db: PathBuf,
         query: PathBuf,
