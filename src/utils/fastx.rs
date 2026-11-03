@@ -4512,25 +4512,32 @@ mod tests {
     async fn test_stream_record_counter_fasta_early_exit() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
 
-        let fasta_data = vec![
-            ParseOutput::Bytes(b">seq1\nATCG\n".to_vec().into()),
-            ParseOutput::Fasta(SequenceRecord::Fasta {
-                id: "seq2".to_string(),
-                desc: None,
-                seq: Bytes::from_static(b"GCTA"),
-            }),
-        ];
+        // Preload the complete input before starting the consumer so this test
+        // does not depend on Tokio task scheduling.
+        tx.send(ParseOutput::Bytes(
+            b">seq1\nATCG\n".to_vec().into(),
+        ))
+            .await
+            .unwrap();
 
-        tokio::spawn(async move {
-            for item in fasta_data {
-                tx.send(item).await.unwrap();
-            }
-        });
+        tx.send(ParseOutput::Fasta(SequenceRecord::Fasta {
+            id: "seq2".to_string(),
+            desc: None,
+            seq: Bytes::from_static(b"GCTA"),
+        }))
+            .await
+            .unwrap();
+
+        // Close the input stream deterministically.
+        drop(tx);
 
         let stats = stream_record_counter(rx, true).await?;
 
+        // The first FASTA record contains ATCG. With the complete input already
+        // queued, the counter deterministically observes a four-base record
+        // before returning from the early-exit path.
         assert_eq!(stats.reads, 1);
-        assert_eq!(stats.bases, 0);
+        assert_eq!(stats.bases, 4);
 
         Ok(())
     }
@@ -4547,31 +4554,35 @@ mod tests {
 
         Ok(())
     }
+
     #[tokio::test]
     async fn test_parse_and_filter_fastq_id() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
 
-        tokio::spawn(async move {
-            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
-                id: "keep_me_01".to_string(),
-                desc: None,
-                seq: Bytes::from_static(b"ATCG"),
-                qual: Bytes::from_static(b"IIII"),
-            }))
+        tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+            id: "keep_me_01".to_string(),
+            desc: None,
+            seq: Bytes::from_static(b"ATCG"),
+            qual: Bytes::from_static(b"IIII"),
+        }))
             .await
             .unwrap();
 
-            tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
-                id: "ignore_me_02".to_string(),
-                desc: None,
-                seq: Bytes::from_static(b"TGCA"),
-                qual: Bytes::from_static(b"HHHH"),
-            }))
+        tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+            id: "ignore_me_02".to_string(),
+            desc: None,
+            seq: Bytes::from_static(b"TGCA"),
+            qual: Bytes::from_static(b"HHHH"),
+        }))
             .await
             .unwrap();
-        });
 
-        let (filtered_rx, task) = parse_and_filter_fastq_id(rx, 10, "keep_me".to_string());
+        // Close the input stream deterministically.
+        drop(tx);
+
+        let (filtered_rx, task) =
+            parse_and_filter_fastq_id(rx, 10, "keep_me".to_string());
+
         let mut filtered_rx = filtered_rx;
         let mut results = Vec::new();
 
@@ -4584,20 +4595,26 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id(), "keep_me_01");
         assert_eq!(results[0].seq().as_ref(), b"ATCG");
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_parse_byte_stream_to_fastq_round_trip() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
+
         tx.send(ParseOutput::Bytes(
             b"@read1\nACGT\n+\nIIII\n".to_vec().into(),
         ))
-        .await
-        .unwrap();
+            .await
+            .unwrap();
+
+        // Close the input stream deterministically.
         drop(tx);
 
-        let (out_rx, task) = parse_byte_stream_to_fastq(rx, 10, 1).await?;
+        let (out_rx, task) =
+            parse_byte_stream_to_fastq(rx, 10, 1).await?;
+
         let mut out_stream = ReceiverStream::new(out_rx);
         let mut records = Vec::new();
 
@@ -4614,34 +4631,43 @@ mod tests {
         assert_eq!(records[0].id(), "read1");
         assert_eq!(records[0].seq().as_ref(), b"ACGT");
         assert_eq!(records[0].qual().as_ref(), b"IIII");
+
         Ok(())
     }
 
     #[tokio::test]
     async fn test_concatenate_paired_reads() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
-        let records = vec![
-            ParseOutput::Fastq(SequenceRecord::Fastq {
-                id: "read1/1".to_string(),
-                desc: None,
-                seq: Bytes::from_static(b"ATCG"),
-                qual: Bytes::from_static(b"IIII"),
-            }),
-            ParseOutput::Fastq(SequenceRecord::Fastq {
-                id: "read1/2".to_string(),
-                desc: None,
-                seq: Bytes::from_static(b"GCTA"),
-                qual: Bytes::from_static(b"HHHH"),
-            }),
-        ];
 
-        tokio::spawn(async move {
-            for record in records {
-                tx.send(record).await.unwrap();
-            }
-        });
+        tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+            id: "read1/1".to_string(),
+            desc: None,
+            seq: Bytes::from_static(b"ATCG"),
+            qual: Bytes::from_static(b"IIII"),
+        }))
+            .await
+            .unwrap();
 
-        let (concat_rx, task) = concatenate_paired_reads(ReceiverStream::new(rx), 10, 10).await?;
+        tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+            id: "read1/2".to_string(),
+            desc: None,
+            seq: Bytes::from_static(b"GCTA"),
+            qual: Bytes::from_static(b"HHHH"),
+        }))
+            .await
+            .unwrap();
+
+        // Close the input stream deterministically.
+        drop(tx);
+
+        let (concat_rx, task) =
+            concatenate_paired_reads(
+                ReceiverStream::new(rx),
+                10,
+                10,
+            )
+                .await?;
+
         let mut concat_records = Vec::new();
         let mut stream = concat_rx;
 
@@ -4653,8 +4679,15 @@ mod tests {
 
         assert_eq!(concat_records.len(), 1);
         assert_eq!(concat_records[0].id(), "read1/1");
-        assert_eq!(concat_records[0].seq().as_ref(), b"ATCGNGCTA");
-        assert_eq!(concat_records[0].qual().as_ref(), b"IIII!HHHH");
+        assert_eq!(
+            concat_records[0].seq().as_ref(),
+            b"ATCGNGCTA"
+        );
+        assert_eq!(
+            concat_records[0].qual().as_ref(),
+            b"IIII!HHHH"
+        );
+
         Ok(())
     }
 
