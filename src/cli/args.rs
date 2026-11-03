@@ -133,7 +133,7 @@ pub struct Arguments {
     #[arg(long, default_value_t = 0.0006)] // assumes about 20 mutations between 2 random samples
     pub bcftools_call_theta: f64,  // (this is an overestimate to increase sensitivity)
 
-    #[arg(long, default_value = "artic_v3_primers.bed")]
+    #[arg(long)]
     pub primer_bed_path : Option<String>,
 
     #[arg(long, default_value = "ercc.bowtie2.tar")]
