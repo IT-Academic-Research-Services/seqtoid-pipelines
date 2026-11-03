@@ -1335,16 +1335,18 @@ async fn count_fastx_sequences(path: &PathBuf) -> Result<u64> {
     handle.await?
 }
 
-/// Generates FASTQ (not yet FASTA) records
+/// Generates FASTQ (not yet FASTA) records.
+///
 /// # Arguments
 ///
-/// * `num_records` - Number of SequenceRecords to make.
-/// * 'seq_len' = Length of each seq.
-/// * 'mean' = Mean quality of bases
-/// * 'stdev' = St Dev of quality of bases.
+/// * `num_records` - Number of `SequenceRecord`s to make.
+/// * `seq_len` - Length of each sequence.
+/// * `mean` - Mean quality of bases.
+/// * `stdev` - Standard deviation of base quality.
 ///
 /// # Returns
-/// Stream<Item = SequenceRecord>
+///
+/// A stream whose items are `SequenceRecord` values.
 pub fn fastx_generator(
     num_records: usize,
     seq_len: usize,
@@ -3565,20 +3567,26 @@ pub async fn chunk_paired_fastq(
         .await
         .map_err(|e| anyhow!("Paired FASTQ chunking task failed: {}", e))?
 }
+
 /// Parse a FASTA batch, look up NT/NR accessions, annotate mapped records,
 /// and tag records for routing.
 ///
 /// Tag meanings:
-///   0 = mapped/identified (has an NT and/or NR accession)
-///   1 = unidentified (has neither an NT nor NR accession)
+///
+/// ```text
+/// 0 = mapped/identified (has an NT and/or NR accession)
+/// 1 = unidentified (has neither an NT nor NR accession)
+/// ```
 ///
 /// Existing Rust behavior is preserved:
 ///
-///   mapped:
-///       NR:<nr_accession>:NT:<nt_accession>:<read_id>
+/// ```text
+/// mapped:
+///     NR:<nr_accession>:NT:<nt_accession>:<read_id>
 ///
-///   unidentified:
-///       <read_id>
+/// unidentified:
+///     <read_id>
+/// ```
 ///
 /// Duplicate-cluster handling is intentionally not performed here. That is
 /// short-read-specific behavior and belongs in the short-read pipeline.
@@ -3691,19 +3699,23 @@ fn parse_fasta_batch_to_annotated_streaming(
 ///
 /// Existing Rust behavior is preserved:
 ///
-///   mapped records:
-///       NR:<nr_accession>:NT:<nt_accession>:<read_id>
+/// ```text
+/// mapped records:
+///     NR:<nr_accession>:NT:<nt_accession>:<read_id>
 ///
-///   unidentified records:
-///       <read_id>
+/// unidentified records:
+///     <read_id>
+/// ```
 ///
 /// This function intentionally knows nothing about:
 ///
-///   - duplicate clusters
-///   - duplicate expansion
-///   - cluster member IDs
-///   - /1 or /2 cluster-key handling
-///   - missing-cluster policy
+/// ```text
+/// - duplicate clusters
+/// - duplicate expansion
+/// - cluster member IDs
+/// - /1 or /2 cluster-key handling
+/// - missing-cluster policy
+/// ```
 ///
 /// Those are short-read-specific concerns and belong in the short-read
 /// pipeline wrapper.
@@ -4076,7 +4088,9 @@ pub async fn fastq_bytes_to_fasta_stream(
 
 /// Collects ReducedRead hit-summary records into:
 ///
-///     read_id -> accession
+/// ```text
+/// read_id -> accession
+/// ```
 ///
 /// The ReducedRead stream is expected to have already undergone any
 /// pipeline-specific reassignment/propagation.
