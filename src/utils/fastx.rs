@@ -4482,21 +4482,23 @@ mod tests {
     async fn test_stream_record_counter_fastq() -> Result<()> {
         let (tx, rx) = mpsc::channel(10);
 
-        let fastq_data = vec![
-            ParseOutput::Bytes(b"@read1\nATCG\n+\nIIII\n".to_vec().into()),
-            ParseOutput::Fastq(SequenceRecord::Fastq {
-                id: "read2".to_string(),
-                desc: None,
-                seq: Bytes::from_static(b"GCTA"),
-                qual: Bytes::from_static(b"HHHH"),
-            }),
-        ];
+        tx.send(ParseOutput::Bytes(
+            b"@read1\nATCG\n+\nIIII\n".to_vec().into(),
+        ))
+            .await
+            .unwrap();
 
-        tokio::spawn(async move {
-            for item in fastq_data {
-                tx.send(item).await.unwrap();
-            }
-        });
+        tx.send(ParseOutput::Fastq(SequenceRecord::Fastq {
+            id: "read2".to_string(),
+            desc: None,
+            seq: Bytes::from_static(b"GCTA"),
+            qual: Bytes::from_static(b"HHHH"),
+        }))
+            .await
+            .unwrap();
+
+        // Close the input stream deterministically.
+        drop(tx);
 
         let stats = stream_record_counter(rx, false).await?;
 
