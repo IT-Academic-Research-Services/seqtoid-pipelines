@@ -1975,7 +1975,7 @@ async fn align_to_target(
             }
         })?;
 
-    let (minimap2_child, _minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
+    let (minimap2_child, minimap2_stream_task, minimap2_err_task) = stream_to_cmd(
         config.clone(),
         input_stream.into_inner(), // Convert to Receiver<ParseOutput> for streaming
         MINIMAP2_TAG,
@@ -1989,6 +1989,7 @@ async fn align_to_target(
             tool: MINIMAP2_TAG.to_string(),
             error: e.to_string(),
         })?;
+    cleanup_tasks.push(minimap2_stream_task);
     cleanup_tasks.push(minimap2_err_task);
 
     let minimap2_out_stream = {
