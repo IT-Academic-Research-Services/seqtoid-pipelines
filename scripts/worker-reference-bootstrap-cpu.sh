@@ -80,8 +80,20 @@ setup_thp() {
 install_packages() {
   log "Packages - critical"
 
-  if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic fontconfig-devel pkgconf-pkg-config; then
+  if ! dnf_retry mdadm xfsprogs nfs-utils amazon-ssm-agent libatomic fontconfig-devel pkgconf-pkg-config numactl; then
     log "ERROR: critical package installation failed"
+    return 1
+  fi
+
+  if ! command -v numactl >/dev/null 2>&1; then
+    log "ERROR: numactl is not available after package installation"
+    return 1
+  fi
+
+  log "numactl: $(command -v numactl)"
+
+  if ! numactl --hardware; then
+    log "ERROR: numactl --hardware failed"
     return 1
   fi
 

@@ -14,6 +14,13 @@ pub enum TargetType {
     Bacterial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum,  Default)]
+pub enum LibraryType {
+    #[default]
+    DNA,
+    RNA,
+}
+
 #[derive(Parser, Debug, Clone, Default)]
 #[command(name = "myapp", version = "1.0")]
 pub struct Arguments {
@@ -78,8 +85,14 @@ pub struct Arguments {
     #[arg(short = 'a', long)]  // For host removal
     pub host_sequence : Option<String>,
 
+    #[arg(long)]  // For human removal
+    pub human_sequence : Option<String>,
+
     #[arg(long, help = "Optional path to pre-built minimap2 index for host reference (e.g., hg38.mmi)")]
-    pub host_index: Option<String>,
+    pub host_mm2_index: Option<String>,
+
+    #[arg(long, help = "Optional path to pre-built minimap2 index for human reference (e.g., hg38.mmi)")]
+    pub human_mm2_index: Option<String>,
 
     #[arg(short = 't', long)] // For target aligning
     pub target_sequence : Option<String>,
@@ -120,7 +133,7 @@ pub struct Arguments {
     #[arg(long, default_value_t = 0.0006)] // assumes about 20 mutations between 2 random samples
     pub bcftools_call_theta: f64,  // (this is an overestimate to increase sensitivity)
 
-    #[arg(long, default_value = "artic_v3_primers.bed")]
+    #[arg(long)]
     pub primer_bed_path : Option<String>,
 
     #[arg(long, default_value = "ercc.bowtie2.tar")]
@@ -243,5 +256,22 @@ pub struct Arguments {
 
     #[arg(long, default_value_t = false)]
     pub no_version_check: bool,
+
+    #[arg(long = "library_type", default_value = "dna", value_enum)]
+    pub library_type: LibraryType,
+
+    #[arg(
+        long = "guppy-basecaller-setting",
+        default_value = "hac",
+        help = "Guppy basecaller setting. 'super' uses Flye --nano-hq; all other values use --nano-raw."
+    )]
+    pub guppy_basecaller_setting: String,
+
+    #[arg(
+        long = "polishing-iterations",
+        default_value_t = 1,
+        help = "Number of Flye polishing iterations."
+    )]
+    pub polishing_iterations: usize,
 
 }

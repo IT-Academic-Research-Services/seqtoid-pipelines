@@ -45,6 +45,7 @@ use crate::utils::system::{
 use pipelines::consensus_genome;
 use pipelines::db;
 use pipelines::short_read_mngs;
+use pipelines::long_read_mngs;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -219,8 +220,8 @@ async fn main() -> Result<()> {
     let base_buffer_size = compute_buffer_size(&run_config, "global_default", sdt, 1.0);
 
     let run_config = Arc::new(RunConfig {
-        base_buffer_size,        // now correct
-        ..(*run_config).clone()  // copy everything else
+        base_buffer_size,
+        ..(*run_config).clone()
     });
 
     if let Err(e) = match module.as_str() {
@@ -229,6 +230,7 @@ async fn main() -> Result<()> {
         "build_taxid_lineages" => build_taxid_lineages_run(run_config).await,
         "build_accession2taxid" => build_accession2taxid_run(run_config).await,
         "build_fasta_offset" => build_fasta_offset_db_run(run_config).await,
+        "long_read_mngs" => long_read_mngs_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!(
             "Invalid module: {}",
             module
@@ -267,6 +269,10 @@ async fn build_accession2taxid_run(run_config: Arc<RunConfig>) -> Result<(), Pip
 
 async fn build_fasta_offset_db_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     db::fasta_offset_db(run_config).await
+}
+
+async fn long_read_mngs_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    long_read_mngs::run(run_config).await
 }
 
 /// Sets up output directory

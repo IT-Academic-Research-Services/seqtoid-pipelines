@@ -12,7 +12,7 @@ use crate::config::defs::{
     RunConfig, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG,
     FASTP_TAG, H5DUMP_TAG, HISAT2_TAG, IVAR_TAG, KALLISTO_TAG, KRAKEN2_TAG, MAFFT_TAG,
     MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, MUSCLE_TAG, NUCMER_TAG, PIGZ_TAG, QUAST_TAG,
-    SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, TOOL_VERSIONS,
+    SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, FLYE_TAG, TOOL_VERSIONS,
 };
 use crate::utils::streams::spawn_cmd;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
@@ -138,18 +138,41 @@ pub async fn version_check(
 pub mod fastp {
     use crate::config::defs::{RunConfig, FASTP_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
-    use crate::utils::file::file_path_manipulator;
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use log::{self, debug};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct FastpConfig {
-        pub command_fields: HashMap<String, Option<String>>,
-        pub paired: bool,
+        /// Ordered command-line options and flags.
+        pub command_fields: Vec<(String, Option<String>)>,
     }
+
+    impl FastpConfig {
+        pub fn new() -> Self {
+            Self {
+                command_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.command_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.command_fields.push((flag.into(), None));
+            self
+        }
+    }
+
     pub struct FastpArgGenerator;
 
     /// Checks if `fastp` is present and returns its version.
@@ -161,7 +184,9 @@ pub mod fastp {
     /// # Returns
     ///
     /// Result<f32>: the fastp version
-    pub async fn fastp_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn fastp_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             FASTP_TAG,
             vec!["-v"],
@@ -171,69 +196,33 @@ pub mod fastp {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for FastpArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            debug!(
-                "Allocating {} threads for fastp",
-                RunConfig::thread_allocation(run_config, FASTP_TAG, None)
-            );
-
             let config = extra
                 .and_then(|e| e.downcast_ref::<FastpConfig>())
-                .ok_or_else(|| anyhow!("FASTP requires a FaspConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "FASTP requires a FastpConfig as extra argument"
+                    )
+                })?;
 
-            let args = &run_config.args;
-            let mut args_vec: Vec<String> = Vec::new();
-            args_vec.push("--stdin".to_string());
-            args_vec.push("--stdout".to_string());
-            args_vec.push("--interleaved_in".to_string());
-            // args_vec.push("-q".to_string());
-            // args_vec.push(args.quality.to_string());
+            let mut args_vec = Vec::new();
 
-            let json_out = run_config.out_dir.join("fastp.json");
-            args_vec.push("-j".to_string());
-            args_vec.push(json_out.as_os_str().to_str().unwrap().to_string());
-            let html_out = run_config.out_dir.join("fastp.html");
-            args_vec.push("-h".to_string());
-            args_vec.push(html_out.as_os_str().to_str().unwrap().to_string());
-            args_vec.push("-w".to_string());
-            args_vec.push(RunConfig::thread_allocation(run_config, FASTP_TAG, None).to_string());
-
-            if let Some(adapter_fasta) = &args.adapter_fasta {
-                let cwd = std::env::current_dir()?;
-                let adapter_path = file_path_manipulator(
-                    &PathBuf::from(adapter_fasta),
-                    Some(&cwd.clone()),
-                    None,
-                    None,
-                    "",
-                );
-                if !adapter_path.exists() {
-                    return Err(anyhow!(
-                        "Adapter FASTA file does not exist: {}",
-                        adapter_path.display()
-                    ));
-                }
-                args_vec.push("--adapter_fasta".to_string());
-                args_vec.push(adapter_path.to_string_lossy().into_owned());
-            }
-
-            if args.adapter_fasta.is_some() && config.paired {
-                args_vec.push("--detect_adapter_for_pe".to_string());
-            }
-
-            for (key, value) in config.command_fields.iter() {
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.command_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
@@ -318,39 +307,70 @@ mod h5dump {
 }
 
 pub mod minimap2 {
-    use crate::config::defs::{PipelineError, RunConfig, FASTA_EXTS, MINIMAP2_TAG};
-    use crate::utils::command::{spawn_cmd, version_check, ArgGenerator};
+    use crate::config::defs::{
+        PipelineError, RunConfig, FASTA_EXTS, MINIMAP2_TAG,
+    };
+    use crate::utils::command::{
+        spawn_cmd, version_check, ArgGenerator,
+    };
     use crate::utils::file::available_space_for_path;
     use crate::utils::streams::ChildStream;
+
     use anyhow::{anyhow, Result};
-    use log::{self, debug, info};
-    use std::collections::HashMap;
+    use log::{debug, info};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tempfile::{NamedTempFile, TempDir};
     use tokio::fs;
     use tokio::task::JoinHandle;
 
+    #[derive(Debug)]
     pub struct Minimap2Config {
-        pub minimap2_index_path: PathBuf,
-        pub r1_path: Option<PathBuf>, // ← NEW: optional query file (None = stdin)
-        pub r2_path: Option<PathBuf>, // ← NEW: optional query file (None = stdin)
-        pub option_fields: HashMap<String, Option<String>>,
-        pub num_threads: Option<usize>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        pub positional_args: Vec<String>,
+    }
+
+    impl Minimap2Config {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct Minimap2ArgGenerator;
 
+
     /// Checks if `minimap2` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    /// * `version_file`: optional path to a file containing the version
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the minimap2 version
     pub async fn minimap2_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
@@ -362,25 +382,25 @@ pub mod minimap2 {
             0,
             ChildStream::Stdout,
             version_file,
-            &config,
+            config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
-    /// Prepares the minimap2 index for a reference sequence.
+
+    /// Prepares a minimap2 index for a reference sequence.
     ///
-    /// # Arguments
+    /// This helper retains the existing host/human-reference behavior:
     ///
-    /// * `config`: the run configuration
-    /// * `ram_temp_dir`: temporary directory in RAM
-    /// * `sequence`: optional path to the reference sequence FASTA
-    /// * `index_path`: optional path to an existing index
-    /// * `ref_type`: type of reference (e.g., "host")
+    /// - if an existing `.mmi` is supplied, use/copy it;
+    /// - if a FASTA is supplied, copy it into RAM scratch and build
+    ///   a temporary `.mmi`.
     ///
-    /// # Returns
-    ///
-    /// Result containing paths to FASTA and index, temporary files, and a vector of preparation tasks
+    /// This helper is NOT required when a caller intentionally wants
+    /// minimap2 to consume a FASTA reference directly. Such callers can
+    /// put the FASTA directly in `Minimap2Config::minimap2_index_path`.
     pub async fn minimap2_index_prep(
         config: &RunConfig,
         ram_temp_dir: &PathBuf,
@@ -393,61 +413,102 @@ pub mod minimap2 {
             PathBuf,               // index path (.mmi)
             Option<NamedTempFile>, // FASTA temp
             Option<NamedTempFile>, // Index temp
-            Option<TempDir>,       // temp dir for splits
+            Option<TempDir>,       // temp dir for split indexes
             Vec<JoinHandle<Result<(), anyhow::Error>>>,
         ),
         PipelineError,
     > {
         let mut tasks = Vec::new();
+
         let mut ref_fasta_path: Option<PathBuf> = None;
         let mut ref_temp: Option<NamedTempFile> = None;
-        let mut final_index_path: PathBuf = PathBuf::new();
+
+        let final_index_path: PathBuf;
+
         let mut index_temp_file: Option<NamedTempFile> = None;
         let mut index_temp_dir: Option<TempDir> = None;
 
         match index_path {
-            // pre-existing .mmi index, maybe w split parts
+            // ----------------------------------------------------------
+            // Existing .mmi index, possibly with split index parts.
+            // ----------------------------------------------------------
             Some(index) => {
                 let orig_index_path = PathBuf::from(&index);
+
                 if !orig_index_path.exists() {
-                    return Err(PipelineError::FileNotFound(orig_index_path));
-                }
-                if orig_index_path.extension().map_or(true, |ext| ext != "mmi") {
-                    return Err(PipelineError::InvalidConfig(format!(
-                        "{} index must have .mmi extension: {}",
-                        ref_type,
-                        orig_index_path.display()
-                    )));
+                    return Err(PipelineError::FileNotFound(
+                        orig_index_path,
+                    ));
                 }
 
-                let orig_dir = orig_index_path.parent().ok_or_else(|| {
-                    PipelineError::InvalidConfig("Invalid index path".to_string())
-                })?;
+                if orig_index_path
+                    .extension()
+                    .map_or(true, |ext| ext != "mmi")
+                {
+                    return Err(PipelineError::InvalidConfig(
+                        format!(
+                            "{} index must have .mmi extension: {}",
+                            ref_type,
+                            orig_index_path.display()
+                        ),
+                    ));
+                }
+
+                let orig_dir =
+                    orig_index_path.parent().ok_or_else(|| {
+                        PipelineError::InvalidConfig(
+                            "Invalid index path".to_string(),
+                        )
+                    })?;
+
                 let basename = orig_index_path
                     .file_stem()
                     .ok_or_else(|| {
-                        PipelineError::InvalidConfig("Invalid index filename".to_string())
+                        PipelineError::InvalidConfig(
+                            "Invalid index filename".to_string(),
+                        )
                     })?
                     .to_str()
                     .ok_or_else(|| {
-                        PipelineError::InvalidConfig("Invalid UTF-8 in filename".to_string())
+                        PipelineError::InvalidConfig(
+                            "Invalid UTF-8 in filename".to_string(),
+                        )
                     })?;
 
-                // find split parts: {basename}.part_001.mmi, etc.
+                // Find split index files:
+                //
+                //     basename.part_001.mmi
+                //     basename.part_002.mmi
+                //     ...
                 let mut split_files: Vec<PathBuf> = Vec::new();
-                let split_prefix = format!("{}.part_", basename);
-                let mut dir_entries = fs::read_dir(orig_dir)
-                    .await
-                    .map_err(|e| PipelineError::Other(e.into()))?;
+
+                let split_prefix =
+                    format!("{}.part_", basename);
+
+                let mut dir_entries =
+                    fs::read_dir(orig_dir)
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?;
+
                 while let Some(entry) = dir_entries
                     .next_entry()
                     .await
-                    .map_err(|e| PipelineError::Other(e.into()))?
+                    .map_err(|e| {
+                        PipelineError::Other(e.into())
+                    })?
                 {
                     let path = entry.path();
+
                     if path.is_file() {
-                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                            if name.starts_with(&split_prefix) && name.ends_with(".mmi") {
+                        if let Some(name) =
+                            path.file_name()
+                                .and_then(|n| n.to_str())
+                        {
+                            if name.starts_with(&split_prefix)
+                                && name.ends_with(".mmi")
+                            {
                                 split_files.push(path);
                             }
                         }
@@ -456,167 +517,336 @@ pub mod minimap2 {
 
                 let is_split = !split_files.is_empty();
 
-                let mut files_to_copy: Vec<(PathBuf, String)> = Vec::new();
+                let mut files_to_copy:
+                    Vec<(PathBuf, String)> = Vec::new();
+
                 let mmi_name = orig_index_path
                     .file_name()
                     .unwrap()
                     .to_string_lossy()
                     .to_string();
-                files_to_copy.push((orig_index_path.clone(), mmi_name.clone()));
+
+                files_to_copy.push((
+                    orig_index_path.clone(),
+                    mmi_name.clone(),
+                ));
+
                 for split in &split_files {
-                    let name = split.file_name().unwrap().to_string_lossy().to_string();
-                    files_to_copy.push((split.clone(), name));
+                    let name = split
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+
+                    files_to_copy.push((
+                        split.clone(),
+                        name,
+                    ));
                 }
 
-                // calc size of all index files
+                // Calculate total index size.
                 let mut total_size: u64 = 0;
-                for (p, _) in &files_to_copy {
-                    let meta = fs::metadata(p)
-                        .await
-                        .map_err(|e| PipelineError::Other(e.into()))?;
-                    total_size += meta.len();
+
+                for (path, _) in &files_to_copy {
+                    let metadata =
+                        fs::metadata(path)
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(
+                                    e.into(),
+                                )
+                            })?;
+
+                    total_size += metadata.len();
                 }
 
-                let buffer = 10 * 1024 * 1024; // 10 megs buffer
-                let avail = available_space_for_path(ram_temp_dir)
-                    .await
-                    .map_err(|e| PipelineError::Other(e))?;
-                let enough_space = avail >= total_size + buffer;
+                // Keep a little breathing room in RAM scratch.
+                let buffer = 10 * 1024 * 1024;
+
+                let available =
+                    available_space_for_path(ram_temp_dir)
+                        .await
+                        .map_err(PipelineError::Other)?;
+
+                let enough_space =
+                    available >= total_size + buffer;
 
                 if enough_space {
                     if is_split {
-                        let temp_dir = TempDir::new_in(ram_temp_dir)
-                            .map_err(|e| PipelineError::Other(e.into()))?;
-                        let temp_index_path = temp_dir.path().join(&mmi_name);
-
-                        for (src, name) in files_to_copy {
-                            let dest = temp_dir.path().join(&name);
-                            let src_cl = src.clone();
-                            let dest_cl = dest.clone();
-                            let ref_type_cl = ref_type.to_string();
-                            let task = tokio::spawn(async move {
-                                fs::copy(&src_cl, &dest_cl).await.map_err(|e| {
-                                    anyhow!(
-                                        "Failed to copy {} index file {}: {}",
-                                        ref_type_cl,
-                                        name,
-                                        e
+                        let temp_dir =
+                            TempDir::new_in(ram_temp_dir)
+                                .map_err(|e| {
+                                    PipelineError::Other(
+                                        e.into(),
                                     )
                                 })?;
-                                Ok(())
-                            });
+
+                        let temp_index_path =
+                            temp_dir.path().join(&mmi_name);
+
+                        for (src, name) in files_to_copy {
+                            let dest =
+                                temp_dir.path().join(&name);
+
+                            let src_cl = src.clone();
+                            let dest_cl = dest.clone();
+                            let ref_type_cl =
+                                ref_type.to_string();
+
+                            let task =
+                                tokio::spawn(async move {
+                                    fs::copy(
+                                        &src_cl,
+                                        &dest_cl,
+                                    )
+                                        .await
+                                        .map_err(|e| {
+                                            anyhow!(
+                                            "Failed to copy {} index file {}: {}",
+                                            ref_type_cl,
+                                            name,
+                                            e
+                                        )
+                                        })?;
+
+                                    Ok(())
+                                });
+
                             tasks.push(task);
                         }
 
-                        final_index_path = temp_index_path;
-                        index_temp_dir = Some(temp_dir);
+                        final_index_path =
+                            temp_index_path;
+
+                        index_temp_dir =
+                            Some(temp_dir);
                     } else {
-                        let temp_file = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                            .map_err(|e| PipelineError::Other(e.into()))?;
-                        let temp_index_path = temp_file.path().to_path_buf();
-                        let temp_index_path_cl = temp_index_path.clone();
-                        let ref_type_cl = ref_type.to_string();
-                        let task = tokio::spawn(async move {
-                            fs::copy(&orig_index_path, &temp_index_path_cl)
-                                .await
+                        let temp_file =
+                            NamedTempFile::with_suffix_in(
+                                ".mmi",
+                                ram_temp_dir,
+                            )
                                 .map_err(|e| {
-                                    anyhow!("Failed to copy {} index: {}", ref_type_cl, e)
+                                    PipelineError::Other(
+                                        e.into(),
+                                    )
                                 })?;
-                            Ok(())
-                        });
+
+                        let temp_index_path =
+                            temp_file.path().to_path_buf();
+
+                        let temp_index_path_cl =
+                            temp_index_path.clone();
+
+                        let ref_type_cl =
+                            ref_type.to_string();
+
+                        let task =
+                            tokio::spawn(async move {
+                                fs::copy(
+                                    &orig_index_path,
+                                    &temp_index_path_cl,
+                                )
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow!(
+                                        "Failed to copy {} index: {}",
+                                        ref_type_cl,
+                                        e
+                                    )
+                                    })?;
+
+                                Ok(())
+                            });
+
                         tasks.push(task);
-                        final_index_path = temp_index_path;
-                        index_temp_file = Some(temp_file);
+
+                        final_index_path =
+                            temp_index_path;
+
+                        index_temp_file =
+                            Some(temp_file);
                     }
                 } else {
                     info!(
-                        "Not enough space in RAM temp dir for {} index (need: {} bytes, have: {} bytes). Using original path.",
-                        ref_type, total_size, avail
+                        "Not enough space in RAM temp dir for {} index \
+                         (need: {} bytes, have: {} bytes). \
+                         Using original path.",
+                        ref_type,
+                        total_size,
+                        available
                     );
-                    final_index_path = orig_index_path;
+
+                    final_index_path =
+                        orig_index_path;
                 }
             }
 
-            // or build index from FASTA
+
+            // ----------------------------------------------------------
+            // Build .mmi from FASTA.
+            //
+            // This remains the existing behavior for callers using
+            // minimap2_index_prep(), such as host filtering.
+            // ----------------------------------------------------------
             None => {
-                let sequence_path = sequence.ok_or_else(|| {
-                    PipelineError::InvalidConfig(
-                        "No FASTA or index provided for minimap2".to_string(),
-                    )
-                })?;
-                let sequence_path = PathBuf::from(&sequence_path);
+                let sequence_path =
+                    sequence.ok_or_else(|| {
+                        PipelineError::InvalidConfig(
+                            "No FASTA or index provided for minimap2"
+                                .to_string(),
+                        )
+                    })?;
+
+                let sequence_path =
+                    PathBuf::from(sequence_path);
+
                 if !sequence_path.exists() {
-                    return Err(PipelineError::FileNotFound(sequence_path));
+                    return Err(
+                        PipelineError::FileNotFound(
+                            sequence_path,
+                        ),
+                    );
                 }
+
                 let is_fasta = sequence_path
                     .extension()
                     .and_then(|ext| ext.to_str())
-                    .map(|ext| FASTA_EXTS.iter().any(|&f| ext.eq_ignore_ascii_case(f)))
+                    .map(|ext| {
+                        FASTA_EXTS.iter().any(|&f| {
+                            ext.eq_ignore_ascii_case(f)
+                        })
+                    })
                     .unwrap_or(false);
+
                 if !is_fasta {
-                    return Err(PipelineError::InvalidConfig(format!(
-                        "Sequence file must have a FASTA extension ({}): {}",
-                        FASTA_EXTS.join(", "),
-                        sequence_path.display()
-                    )));
+                    return Err(
+                        PipelineError::InvalidConfig(
+                            format!(
+                                "Sequence file must have a FASTA extension ({}): {}",
+                                FASTA_EXTS.join(", "),
+                                sequence_path.display()
+                            ),
+                        ),
+                    );
                 }
 
-                let temp_fasta = NamedTempFile::with_suffix_in(".fasta", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                let temp_fasta_path = temp_fasta.path().to_path_buf();
-                let temp_fasta_path_cl = temp_fasta_path.clone();
-                let ref_type_cl = ref_type.to_string();
-                let copy_task = tokio::spawn(async move {
-                    fs::copy(&sequence_path, &temp_fasta_path_cl)
-                        .await
-                        .map_err(|e| anyhow!("Failed to copy {} FASTA: {}", ref_type_cl, e))?;
-                    Ok(())
-                });
-                tasks.push(copy_task);
-                ref_fasta_path = Some(temp_fasta_path.clone());
-                ref_temp = Some(temp_fasta);
+                let temp_fasta =
+                    NamedTempFile::with_suffix_in(
+                        ".fasta",
+                        ram_temp_dir,
+                    )
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?;
 
-                let index_temp = NamedTempFile::with_suffix_in(".mmi", ram_temp_dir)
-                    .map_err(|e| PipelineError::Other(e.into()))?;
-                let index_temp_path = index_temp.path().to_path_buf();
+                let temp_fasta_path =
+                    temp_fasta.path().to_path_buf();
+
+                let temp_fasta_path_cl =
+                    temp_fasta_path.clone();
+
+                let ref_type_cl =
+                    ref_type.to_string();
+
+                let copy_task =
+                    tokio::spawn(async move {
+                        fs::copy(
+                            &sequence_path,
+                            &temp_fasta_path_cl,
+                        )
+                            .await
+                            .map_err(|e| {
+                                anyhow!(
+                                "Failed to copy {} FASTA: {}",
+                                ref_type_cl,
+                                e
+                            )
+                            })?;
+
+                        Ok(())
+                    });
+
+                tasks.push(copy_task);
+
+                ref_fasta_path =
+                    Some(temp_fasta_path.clone());
+
+                ref_temp =
+                    Some(temp_fasta);
+
+                let index_temp =
+                    NamedTempFile::with_suffix_in(
+                        ".mmi",
+                        ram_temp_dir,
+                    )
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?;
+
+                let index_temp_path =
+                    index_temp.path().to_path_buf();
 
                 let minimap2_args = vec![
                     "-d".to_string(),
-                    index_temp_path.to_string_lossy().to_string(),
-                    temp_fasta_path.to_string_lossy().to_string(),
+                    index_temp_path
+                        .to_string_lossy()
+                        .to_string(),
+                    temp_fasta_path
+                        .to_string_lossy()
+                        .to_string(),
                 ];
 
-                let (mut child, err_task) = spawn_cmd(
-                    Arc::new(config.clone()),
-                    MINIMAP2_TAG,
-                    minimap2_args,
-                    config.args.verbose,
-                    None,
-                )
-                .await
-                .map_err(|e| PipelineError::ToolExecution {
-                    tool: MINIMAP2_TAG.to_string(),
-                    error: e.to_string(),
-                })?;
+                let (mut child, err_task) =
+                    spawn_cmd(
+                        Arc::new(config.clone()),
+                        MINIMAP2_TAG,
+                        minimap2_args,
+                        config.args.verbose,
+                        None,
+                    )
+                        .await
+                        .map_err(|e| {
+                            PipelineError::ToolExecution {
+                                tool:
+                                MINIMAP2_TAG.to_string(),
+                                error: e.to_string(),
+                            }
+                        })?;
 
-                let index_task = tokio::spawn(async move {
-                    let status = child.wait().await?;
-                    if !status.success() {
-                        return Err(anyhow!(
-                            "minimap2 index creation failed with exit code: {:?}",
-                            status.code()
-                        ));
-                    }
-                    Ok(())
-                });
+                let index_task =
+                    tokio::spawn(async move {
+                        let status =
+                            child.wait().await?;
+
+                        if !status.success() {
+                            return Err(anyhow!(
+                                "minimap2 index creation failed with exit code: {:?}",
+                                status.code()
+                            ));
+                        }
+
+                        Ok(())
+                    });
+
                 index_task
                     .await
-                    .map_err(|e| PipelineError::Other(e.into()))??;
-                debug!("{} mmi created in RAM", ref_type);
+                    .map_err(|e| {
+                        PipelineError::Other(e.into())
+                    })??;
+
+                debug!(
+                    "{} mmi created in RAM",
+                    ref_type
+                );
+
                 tasks.push(err_task);
 
-                final_index_path = index_temp_path;
-                index_temp_file = Some(index_temp);
+                final_index_path =
+                    index_temp_path;
+
+                index_temp_file =
+                    Some(index_temp);
             }
         }
 
@@ -630,92 +860,127 @@ pub mod minimap2 {
         ))
     }
 
+
     impl ArgGenerator for Minimap2ArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<Minimap2Config>())
-                .ok_or_else(|| anyhow!("Minimap2 requires a Minimap2Config as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Minimap2 requires a Minimap2Config as extra argument"
+                    )
+                })?;
 
-            let index_path = config.minimap2_index_path.clone();
-            if !index_path.exists() {
-                return Err(anyhow!(
-                    "Minimap2 index file does not exist: {}",
-                    index_path.display()
-                ));
-            }
-            if index_path.extension().map_or(true, |ext| ext != "mmi") {
-                return Err(anyhow!(
-                    "Minimap2 index must have .mmi extension, got: {}",
-                    index_path.display()
-                ));
-            }
+            let mut args_vec = Vec::new();
 
-            let mut args_vec: Vec<String> = Vec::new();
-
-            let threads = if let Some(override_threads) = config.num_threads {
-                override_threads
-            } else {
-                run_config.thread_allocation(MINIMAP2_TAG, None)
-            };
-
-            // let num_cores: usize = RunConfig::thread_allocation(run_config, MINIMAP2_TAG, None);
-            args_vec.push("-t".to_string());
-            args_vec.push(threads.to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            // Index path
-            args_vec.push(index_path.to_string_lossy().to_string());
-
-            // Input: file if provided, otherwise stdin
-            if let Some(r1_path) = &config.r1_path {
-                args_vec.push(r1_path.to_string_lossy().to_string());
-                if let Some(r2_path) = &config.r2_path {
-                    args_vec.push(r2_path.to_string_lossy().to_string());
-                }
-            } else {
-                args_vec.push("-".to_string()); // stdin
-            }
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
     }
 }
 
+
 pub mod samtools {
     use crate::config::defs::{RunConfig, SamtoolsSubcommand, SAMTOOLS_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
 
     #[derive(Debug)]
     pub struct SamtoolsConfig {
         pub subcommand: SamtoolsSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
+
+        /// Ordered command-line options and flags.
+        ///
+        /// Examples:
+        ///
+        /// ```text
+        /// ("-@", Some("16"))
+        /// ("--no-PG", None)
+        /// ("-F", Some("0x900"))
+        /// ```
+        ///
+        /// Vec is intentional:
+        ///
+        /// - preserves command-line order;
+        /// - permits repeated options;
+        /// - does not conflate options with positional operands.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        ///
+        /// Examples:
+        ///
+        /// ```text
+        /// "-"
+        /// "input.sam"
+        /// "input.bam"
+        /// "output.bai"
+        /// ```
+        ///
+        /// Order is part of the command's semantics and must therefore
+        /// be represented explicitly.
+        pub positional_args: Vec<String>,
+    }
+
+    impl SamtoolsConfig {
+        pub fn new(subcommand: SamtoolsSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        /// Add an option with a value.
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        /// Add a flag without a value.
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        /// Add an ordered positional operand.
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct SamtoolsArgGenerator;
 
     /// Checks if `samtools` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the samtools version
-    pub async fn samtools_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn samtools_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             SAMTOOLS_TAG,
             vec!["--version"],
@@ -723,115 +988,59 @@ pub mod samtools {
             1,
             ChildStream::Stdout,
             None,
-            &config,
+            config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for SamtoolsArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<SamtoolsConfig>())
-                .ok_or_else(|| anyhow!("Samtools requires a SamtoolsConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Samtools requires a SamtoolsConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                SamtoolsSubcommand::View => {
-                    args_vec.push("view".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("view"))
-                            .to_string(),
-                    );
-                    args_vec.push("--no-PG".to_string());
+            // The generator owns only translation of the typed
+            // subcommand into its CLI spelling.
+            args_vec.push(
+                match config.subcommand {
+                    SamtoolsSubcommand::View => "view",
+                    SamtoolsSubcommand::Fastq => "fastq",
+                    SamtoolsSubcommand::Stats => "stats",
+                    SamtoolsSubcommand::Sort => "sort",
+                    SamtoolsSubcommand::Index => "index",
+                    SamtoolsSubcommand::Mpileup => "mpileup",
+                    SamtoolsSubcommand::Consensus => "consensus",
+                    SamtoolsSubcommand::Depth => "depth",
+                    SamtoolsSubcommand::Ampliconclip => "ampliconclip",
+                    SamtoolsSubcommand::Fixmate => "fixmate",
                 }
-                SamtoolsSubcommand::Fastq => {
-                    args_vec.push("fastq".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fastq"))
-                            .to_string(),
-                    );
-                    args_vec.push("-c".to_string());
-                    args_vec.push("6".to_string());
-                }
-                SamtoolsSubcommand::Stats => {
-                    args_vec.push("stats".to_string());
-                }
-                SamtoolsSubcommand::Sort => {
-                    args_vec.push("sort".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("sort"))
-                            .to_string(),
-                    );
-                    args_vec.push("-m".to_string());
-                    args_vec.push("2G".to_string());
-                }
-                SamtoolsSubcommand::Index => {
-                    args_vec.push("index".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("index"))
-                            .to_string(),
-                    );
-                }
-                SamtoolsSubcommand::Mpileup => {
-                    args_vec.push("mpileup".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("mpileup"))
-                            .to_string(),
-                    );
-                }
-                SamtoolsSubcommand::Consensus => {
-                    args_vec.push("consensus".to_string());
-                    args_vec.push("-f".to_string());
-                    args_vec.push("fasta".to_string());
-                    args_vec.push("-m".to_string());
-                    args_vec.push("simple".to_string());
-                    args_vec.push("--min-BQ".to_string());
-                    args_vec.push(args.quality.to_string());
-                    args_vec.push("-d".to_string());
-                    args_vec.push(args.min_depth.to_string());
-                }
-                SamtoolsSubcommand::Depth => {
-                    args_vec.push("depth".to_string());
-                }
-                SamtoolsSubcommand::Ampliconclip => {
-                    args_vec.push("ampliconclip".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(
-                            run_config,
-                            SAMTOOLS_TAG,
-                            Some("ampliconclip"),
-                        )
-                        .to_string(),
-                    );
-                }
-                SamtoolsSubcommand::Fixmate => {
-                    args_vec.push("fixmate".to_string());
-                    args_vec.push("-@".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, SAMTOOLS_TAG, Some("fixmate"))
-                            .to_string(),
-                    );
-                }
-            }
-            for (key, value) in config.subcommand_fields.iter() {
+                    .to_string(),
+            );
+
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
+
+            // Positional operands always follow the options and retain
+            // their caller-specified order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
@@ -843,12 +1052,80 @@ pub mod bcftools {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
 
     #[derive(Debug)]
     pub struct BcftoolsConfig {
         pub subcommand: BcftoolsSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
+
+        /// Ordered command-line options and flags.
+        ///
+        /// Examples:
+        ///
+        /// ```text
+        /// ("-a", Some("AD"))
+        /// ("-Ou", None)
+        /// ("--ploidy", Some("1"))
+        /// ```
+        ///
+        /// Vec is intentional:
+        ///
+        /// - preserves command-line order;
+        /// - permits repeated options;
+        /// - does not conflate options with positional operands.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        ///
+        /// Examples:
+        ///
+        /// ```text
+        /// "-"
+        /// "input.bcf"
+        /// "reference.fa"
+        /// ```
+        ///
+        /// Order is part of the command's semantics and must therefore
+        /// be represented explicitly.
+        pub positional_args: Vec<String>,
+    }
+
+    impl BcftoolsConfig {
+        pub fn new(subcommand: BcftoolsSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        /// Add an option with a value.
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        /// Add a flag without a value.
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        /// Add an ordered positional operand.
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct BcftoolsArgGenerator;
@@ -862,7 +1139,9 @@ pub mod bcftools {
     /// # Returns
     ///
     /// Result<f32>: the bcftools version
-    pub async fn bcftools_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn bcftools_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             BCFTOOLS_TAG,
             vec!["-v"],
@@ -872,58 +1151,50 @@ pub mod bcftools {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for BcftoolsArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<BcftoolsConfig>())
-                .ok_or_else(|| anyhow!("Bcftools requires a BcftoolsConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Bcftools requires a BcftoolsConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                BcftoolsSubcommand::Consensus => {
-                    args_vec.push("consensus".to_string());
+            // The generator owns only translation of the typed
+            // subcommand into its CLI spelling.
+            args_vec.push(
+                match config.subcommand {
+                    BcftoolsSubcommand::Consensus => "consensus",
+                    BcftoolsSubcommand::Call => "call",
+                    BcftoolsSubcommand::Mpileup => "mpileup",
+                    BcftoolsSubcommand::View => "view",
                 }
-                BcftoolsSubcommand::Call => {
-                    args_vec.push("call".to_string());
-                }
-                BcftoolsSubcommand::Mpileup => {
-                    args_vec.push("mpileup".to_string());
-                    args_vec.push("-a".to_string());
-                    args_vec.push("AD".to_string()); // include allele depth (AD) for all positions, including those with zero coverage, mimicking -aa.
-                    args_vec.push("-d".to_string());
-                    args_vec.push("10000".to_string()); // max depth essentially without limit
-                    args_vec.push("-L".to_string());
-                    args_vec.push("100000000".to_string()); // max per-file depth essentially without limit
-                    args_vec.push("-Q".to_string());
-                    args_vec.push(args.quality.to_string()); // skip bases with baseQ/BAQ smaller than INT [13]
-                    args_vec.push("--threads".to_string());
-                    args_vec.push(
-                        RunConfig::thread_allocation(run_config, BCFTOOLS_TAG, Some("mpileup"))
-                            .to_string(),
-                    );
-                }
-                BcftoolsSubcommand::View => {
-                    args_vec.push("view".to_string());
+                    .to_string(),
+            );
+
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            for (key, value) in config.subcommand_fields.iter() {
-                args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => {}
-                }
-            }
+            // Positional operands always retain their caller-specified order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
@@ -943,6 +1214,7 @@ pub mod kraken2 {
         pub report_path: PathBuf,
         pub classified_path: PathBuf,
         pub fastq_path: PathBuf,
+        pub fastq_path_2: Option<PathBuf>,
     }
 
     pub struct Kraken2ArgGenerator;
@@ -966,7 +1238,7 @@ pub mod kraken2 {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -1009,10 +1281,16 @@ pub mod kraken2 {
             args_vec.push(config.report_path.to_string_lossy().to_string());
             args_vec.push("--classified-out".to_string());
             args_vec.push(config.classified_path.to_string_lossy().to_string());
-            args_vec.push("--output".to_string());
-            args_vec.push("-".to_string()); // "-" will suppress normal output
+            // args_vec.push("--output".to_string());
+            // args_vec.push("-".to_string()); // "-" will suppress normal output
 
-            args_vec.push(config.fastq_path.to_string_lossy().to_string());
+            if let Some(fastq_path_2) = &config.fastq_path_2 {
+                args_vec.push("--paired".to_string());
+                args_vec.push(config.fastq_path.to_string_lossy().to_string());
+                args_vec.push(fastq_path_2.to_string_lossy().to_string());
+            } else {
+                args_vec.push(config.fastq_path.to_string_lossy().to_string());
+            }
 
             Ok(args_vec)
         }
@@ -1332,12 +1610,55 @@ pub mod seqkit {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
 
     #[derive(Debug)]
     pub struct SeqkitConfig {
         pub subcommand: SeqkitSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
+
+        /// Ordered command-line options and flags.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        pub positional_args: Vec<String>,
+    }
+
+    impl SeqkitConfig {
+        pub fn new(subcommand: SeqkitSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        /// Add an option with a value.
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        /// Add a flag without a value.
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        /// Add an ordered positional operand.
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct SeqkitArgGenerator;
@@ -1351,7 +1672,9 @@ pub mod seqkit {
     /// # Returns
     ///
     /// Result<f32>: the seqkit version
-    pub async fn seqkit_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn seqkit_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             SEQKIT_TAG,
             vec!["--help"],
@@ -1361,7 +1684,8 @@ pub mod seqkit {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
@@ -1373,29 +1697,33 @@ pub mod seqkit {
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<SeqkitConfig>())
-                .ok_or_else(|| anyhow!("Seqkit requires a SeqkitConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Seqkit requires a SeqkitConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                SeqkitSubcommand::Stats => {
-                    args_vec.push("stats".to_string());
+            args_vec.push(
+                match config.subcommand {
+                    SeqkitSubcommand::Stats => "stats",
+                    SeqkitSubcommand::Rmdup => "rmdup",
                 }
+                    .to_string(),
+            );
 
-                SeqkitSubcommand::Rmdup => {
-                    args_vec.push("rmdup".to_string());
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            for (key, value) in config.subcommand_fields.iter() {
-                args_vec.push(format!("{}", key));
-                match value {
-                    Some(v) => args_vec.push(format!("{}", v)),
-                    None => {}
-                }
-            }
-
-            args_vec.push("-".to_string());
+            // Serialize positional operands exactly and in order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
@@ -1408,17 +1736,52 @@ pub mod bowtie2 {
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
     use log::{self, debug};
-    use std::collections::HashMap;
     use std::fs::{self, DirEntry};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    #[derive(Debug)]
     pub struct Bowtie2Config {
-        pub bt2_index_path: PathBuf,
-        pub paired: bool,
-        pub r1_path: Option<PathBuf>,
-        pub r2_path: Option<PathBuf>,
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands, if any.
+        pub positional_args: Vec<String>,
+    }
+
+    impl Bowtie2Config {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct Bowtie2ArgGenerator;
@@ -1432,7 +1795,9 @@ pub mod bowtie2 {
     /// # Returns
     ///
     /// Result<f32>: the bowtie2 version
-    pub async fn bowtie2_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn bowtie2_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             BOWTIE2_TAG,
             vec!["-h"],
@@ -1442,23 +1807,18 @@ pub mod bowtie2 {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     /// Prepares the Bowtie2 index by handling directory, tar, or tar.gz inputs.
-    /// Returns the PathBuf to the basename (e.g., /path/to/ercc for files ercc.1.bt2, etc.).
-    /// Prepares a Bowtie2 index for the given input sequence.
-    ///
-    /// # Arguments
-    ///
-    /// * `input_path`: path to the reference sequence FASTA
-    /// * `cwd`: current working directory for temporary files
-    ///
-    /// # Returns
-    ///
-    /// Result<PathBuf>: path to the generated Bowtie2 index
-    pub fn bowtie2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+    /// Returns the PathBuf to the basename
+    /// (e.g., /path/to/ercc for files ercc.1.bt2, etc.).
+    pub fn bowtie2_index_prep(
+        input_path: impl AsRef<Path>,
+        cwd: &PathBuf,
+    ) -> Result<PathBuf> {
         let input = input_path.as_ref();
 
         // Generate unique unpack directory
@@ -1475,12 +1835,16 @@ pub mod bowtie2 {
                 .to_string_lossy()
                 .to_string()
         };
-        let unpack_dir = cwd.join(format!("unpacked_index_bt2_{}", unique_id));
+
+        let unpack_dir =
+            cwd.join(format!("unpacked_index_bt2_{}", unique_id));
 
         if unpack_dir.exists() {
             fs::remove_dir_all(&unpack_dir)?;
         }
+
         fs::create_dir_all(&unpack_dir)?;
+
         debug!(
             "Bowtie2: Created unpack directory: {}",
             unpack_dir.display()
@@ -1495,6 +1859,7 @@ pub mod bowtie2 {
                 .extension()
                 .map(|s| s.to_str().unwrap_or(""))
                 .unwrap_or("");
+
             let stem_ext = input
                 .file_stem()
                 .and_then(|s| Path::new(s).extension())
@@ -1502,7 +1867,11 @@ pub mod bowtie2 {
                 .unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                debug!("Bowtie2: Unpacking GZIP TAR: {}", input.display());
+                debug!(
+                    "Bowtie2: Unpacking GZIP TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -1510,7 +1879,11 @@ pub mod bowtie2 {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                debug!("Bowtie2: Unpacking TAR: {}", input.display());
+                debug!(
+                    "Bowtie2: Unpacking TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -1538,40 +1911,66 @@ pub mod bowtie2 {
         }
 
         // Strip single top-level subdir (e.g., "ercc/")
-        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let entries: Vec<DirEntry> =
+            fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+
         let dirs: Vec<DirEntry> = entries
             .into_iter()
-            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .filter(|e| {
+                e.file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false)
+            })
             .collect();
 
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
+
             if fs::read_dir(&subdir)?.next().is_some() {
                 index_dir = subdir;
             }
         }
-        debug!("Bowtie2 index directory: {}", index_dir.display());
+
+        debug!(
+            "Bowtie2 index directory: {}",
+            index_dir.display()
+        );
 
         // Validate
-        let extensions = vec!["bt2".to_string(), "bt2l".to_string()];
-        let required_suffixes = vec!["1", "2", "3", "4", "rev.1", "rev.2"];
+        let extensions =
+            vec!["bt2".to_string(), "bt2l".to_string()];
+
+        let required_suffixes =
+            vec!["1", "2", "3", "4", "rev.1", "rev.2"];
 
         for suffix in &required_suffixes {
             let mut found = false;
+
             for ext in &extensions {
-                let pattern = format!("{}.{}", suffix, ext);
+                let pattern =
+                    format!("{}.{}", suffix, ext);
+
                 let mut candidates = Vec::new();
+
                 for entry in fs::read_dir(&index_dir)? {
                     let path = entry?.path();
-                    if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+
+                    if path.is_file()
+                        && path
+                        .to_str()
+                        .unwrap_or("")
+                        .ends_with(&pattern)
+                    {
                         candidates.push(path);
                     }
                 }
+
                 if !candidates.is_empty() {
                     found = true;
                     break;
                 }
             }
+
             if !found {
                 return Err(anyhow!(
                     "Missing Bowtie2 index file for suffix '{}' in: {}",
@@ -1584,104 +1983,101 @@ pub mod bowtie2 {
         // Derive basename using suffix "1", avoiding "rev"
         let pattern_suffix = "1";
         let mut basename = None;
+
         for ext in &extensions {
-            let pattern = format!("{}.{}", pattern_suffix, ext);
+            let pattern =
+                format!("{}.{}", pattern_suffix, ext);
+
             let mut candidates = Vec::new();
+
             for entry in fs::read_dir(&index_dir)? {
                 let path = entry?.path();
+
                 if path.is_file()
-                    && path.to_str().unwrap_or("").ends_with(&pattern)
-                    && !path.to_str().unwrap_or("").contains("rev")
+                    && path
+                    .to_str()
+                    .unwrap_or("")
+                    .ends_with(&pattern)
+                    && !path
+                    .to_str()
+                    .unwrap_or("")
+                    .contains("rev")
                 {
                     candidates.push(path);
                 }
             }
+
             if let Some(file) = candidates.first() {
                 let file_name = file
                     .file_name()
                     .ok_or(anyhow!("Invalid file path"))?
                     .to_str()
                     .ok_or(anyhow!("Invalid UTF-8"))?;
+
                 let stripped = file_name
                     .strip_suffix(&pattern)
-                    .ok_or(anyhow!("Suffix mismatch in Bowtie2 file: {}", file_name))?;
-                basename = Some(stripped.trim_end_matches('.').to_string());
+                    .ok_or(anyhow!(
+                        "Suffix mismatch in Bowtie2 file: {}",
+                        file_name
+                    ))?;
+
+                basename =
+                    Some(stripped.trim_end_matches('.').to_string());
+
                 break;
             }
         }
+
         let basename = basename.ok_or(anyhow!(
             "No Bowtie2 index file with suffix '1' avoiding 'rev' found in: {}",
             index_dir.display()
         ))?;
 
-        let final_path = index_dir.join(&basename);
-        debug!("Final Bowtie2 index path: {}", final_path.display());
+        let final_path =
+            index_dir.join(&basename);
+
+        debug!(
+            "Final Bowtie2 index path: {}",
+            final_path.display()
+        );
+
         Ok(final_path)
     }
 
     impl ArgGenerator for Bowtie2ArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| e.downcast_ref::<Bowtie2Config>())
-                .ok_or_else(|| anyhow!("Bowtie2 requires a Bowtie2Config as extra argument"))?;
+                .and_then(|e| {
+                    e.downcast_ref::<Bowtie2Config>()
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Bowtie2 requires a Bowtie2Config as extra argument"
+                    )
+                })?;
 
-            let mut args: Vec<String> = Vec::new();
+            let mut args = Vec::new();
 
+            // Serialize caller-specified options exactly and in order.
             for (key, value) in &config.option_fields {
                 args.push(key.clone());
-                if let Some(v) = value {
-                    args.push(v.clone());
+
+                if let Some(value) = value {
+                    args.push(value.clone());
                 }
             }
 
-            // Index
-            args.push("-x".to_string());
-            args.push(config.bt2_index_path.to_string_lossy().to_string());
+            // Serialize positional operands exactly and in order.
+            args.extend(config.positional_args.iter().cloned());
 
-            // Threads
-            args.push("-p".to_string());
-            let num_cores = RunConfig::thread_allocation(run_config, BOWTIE2_TAG, None);
-            args.push(num_cores.to_string());
-
-            // Input handling
-            match (config.r1_path.as_ref(), config.r2_path.as_ref()) {
-                (Some(r1), Some(r2)) => {
-                    // Paired files
-                    args.push("-1".to_string());
-                    args.push(r1.to_string_lossy().to_string());
-                    args.push("-2".to_string());
-                    args.push(r2.to_string_lossy().to_string());
-                }
-                (Some(r1), None) => {
-                    // Single-end file
-                    args.push("-U".to_string());
-                    args.push(r1.to_string_lossy().to_string());
-                }
-                (None, _) => {
-                    // Stdin mode
-                    if config.paired {
-                        args.push("--interleaved".to_string());
-                    } else {
-                        args.push("-U".to_string());
-                    }
-                    args.push("-".to_string()); // stdin
-                }
-            }
-
-            // Safety check: paired flag should match input
-            if config.paired && config.r1_path.is_none() && config.r2_path.is_none() {
-                debug!("Bowtie2: using --interleaved for paired stdin input");
-            } else if config.paired && (config.r1_path.is_none() || config.r2_path.is_none()) {
-                return Err(anyhow!(
-                    "Bowtie2 paired mode requires both R1 and R2 paths (or stdin)"
-                ));
-            }
-
-            debug!("Bowtie2 final args: {}", args.join(" "));
+            debug!(
+                "Bowtie2 final args: {}",
+                args.join(" ")
+            );
 
             Ok(args)
         }
@@ -1694,22 +2090,59 @@ pub mod hisat2 {
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
     use log::{self, debug};
-    use std::collections::HashMap;
     use std::fs::{self, DirEntry};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
     #[derive(Debug)]
     pub struct Hisat2Config {
-        pub hisat2_index_path: PathBuf,
-        pub option_fields: HashMap<String, Option<String>>,
-        pub r1_path: String,
-        pub r2_path: Option<String>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands, if any.
+        pub positional_args: Vec<String>,
+    }
+
+    impl Hisat2Config {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct Hisat2ArgGenerator;
 
-    pub async fn hisat2_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn hisat2_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             HISAT2_TAG,
             vec!["--version"],
@@ -1719,13 +2152,18 @@ pub mod hisat2 {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     /// Prepares the HISAT2 index by handling directory, tar, or tar.gz inputs.
-    /// Returns the PathBuf to the basename (e.g., /path/to/human for files human.1.ht2, etc.).
-    pub fn hisat2_index_prep(input_path: impl AsRef<Path>, cwd: &PathBuf) -> Result<PathBuf> {
+    /// Returns the PathBuf to the basename
+    /// (e.g., /path/to/human for files human.1.ht2, etc.).
+    pub fn hisat2_index_prep(
+        input_path: impl AsRef<Path>,
+        cwd: &PathBuf,
+    ) -> Result<PathBuf> {
         let input = input_path.as_ref();
 
         // Generate unique unpack directory
@@ -1742,14 +2180,21 @@ pub mod hisat2 {
                 .to_string_lossy()
                 .to_string()
         };
-        let unpack_dir = cwd.join(format!("unpacked_index_ht2_{}", unique_id));
+
+        let unpack_dir =
+            cwd.join(format!("unpacked_index_ht2_{}", unique_id));
 
         // Clean unpack_dir
         if unpack_dir.exists() {
             fs::remove_dir_all(&unpack_dir)?;
         }
+
         fs::create_dir_all(&unpack_dir)?;
-        debug!("HISAT2: Created unpack directory: {}", unpack_dir.display());
+
+        debug!(
+            "HISAT2: Created unpack directory: {}",
+            unpack_dir.display()
+        );
 
         let mut index_dir = unpack_dir.clone();
 
@@ -1761,6 +2206,7 @@ pub mod hisat2 {
                 .extension()
                 .map(|s| s.to_str().unwrap_or(""))
                 .unwrap_or("");
+
             let stem_ext = input
                 .file_stem()
                 .and_then(|s| Path::new(s).extension())
@@ -1768,7 +2214,11 @@ pub mod hisat2 {
                 .unwrap_or("");
 
             let unpack_cmd = if ext == "gz" && stem_ext == "tar" {
-                debug!("HISAT2: Unpacking GZIP TAR: {}", input.display());
+                debug!(
+                    "HISAT2: Unpacking GZIP TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xzf")
                     .arg(input)
@@ -1776,7 +2226,11 @@ pub mod hisat2 {
                     .arg(&unpack_dir)
                     .output()?
             } else if ext == "tar" {
-                debug!("HISAT2: Unpacking TAR: {}", input.display());
+                debug!(
+                    "HISAT2: Unpacking TAR: {}",
+                    input.display()
+                );
+
                 Command::new("tar")
                     .arg("xf")
                     .arg(input)
@@ -1797,43 +2251,68 @@ pub mod hisat2 {
                 ));
             }
         } else {
-            return Err(anyhow!("HISAT2 index input not found: {}", input.display()));
+            return Err(anyhow!(
+                "HISAT2 index input not found: {}",
+                input.display()
+            ));
         }
 
         // Strip single top-level subdir (e.g., "human/")
-        let entries: Vec<DirEntry> = fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+        let entries: Vec<DirEntry> =
+            fs::read_dir(&index_dir)?.collect::<Result<_, _>>()?;
+
         let dirs: Vec<DirEntry> = entries
             .into_iter()
-            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .filter(|e| {
+                e.file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(false)
+            })
             .collect();
 
         if dirs.len() == 1 {
             let subdir = dirs[0].path();
+
             if fs::read_dir(&subdir)?.next().is_some() {
                 index_dir = subdir;
             }
         }
 
         // Validate required files
-        let extensions = vec!["ht2".to_string(), "ht2l".to_string()];
-        let required_suffixes = vec!["1", "2", "3", "4", "5", "6", "7", "8"];
+        let extensions =
+            vec!["ht2".to_string(), "ht2l".to_string()];
+
+        let required_suffixes =
+            vec!["1", "2", "3", "4", "5", "6", "7", "8"];
 
         for suffix in &required_suffixes {
             let mut found = false;
+
             for ext in &extensions {
-                let pattern = format!("{}.{}", suffix, ext);
+                let pattern =
+                    format!("{}.{}", suffix, ext);
+
                 let mut candidates = Vec::new();
+
                 for entry in fs::read_dir(&index_dir)? {
                     let path = entry?.path();
-                    if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+
+                    if path.is_file()
+                        && path
+                        .to_str()
+                        .unwrap_or("")
+                        .ends_with(&pattern)
+                    {
                         candidates.push(path);
                     }
                 }
+
                 if !candidates.is_empty() {
                     found = true;
                     break;
                 }
             }
+
             if !found {
                 return Err(anyhow!(
                     "Missing HISAT2 index file for suffix '{}' in: {}",
@@ -1843,75 +2322,100 @@ pub mod hisat2 {
             }
         }
 
-        // Derive basename using suffix "1", avoiding any unexpected patterns
+        // Derive basename using suffix "1"
         let pattern_suffix = "1";
         let mut basename = None;
+
         for ext in &extensions {
-            let pattern = format!("{}.{}", pattern_suffix, ext);
+            let pattern =
+                format!("{}.{}", pattern_suffix, ext);
+
             let mut candidates = Vec::new();
+
             for entry in fs::read_dir(&index_dir)? {
                 let path = entry?.path();
-                if path.is_file() && path.to_str().unwrap_or("").ends_with(&pattern) {
+
+                if path.is_file()
+                    && path
+                    .to_str()
+                    .unwrap_or("")
+                    .ends_with(&pattern)
+                {
                     candidates.push(path);
                 }
             }
+
             if let Some(file) = candidates.first() {
                 let file_name = file
                     .file_name()
                     .ok_or(anyhow!("Invalid file path"))?
                     .to_str()
                     .ok_or(anyhow!("Invalid UTF-8"))?;
+
                 let stripped = file_name
                     .strip_suffix(&pattern)
-                    .ok_or(anyhow!("Suffix mismatch in HISAT2 file: {}", file_name))?;
-                basename = Some(stripped.trim_end_matches('.').to_string());
+                    .ok_or(anyhow!(
+                        "Suffix mismatch in HISAT2 file: {}",
+                        file_name
+                    ))?;
+
+                basename =
+                    Some(stripped.trim_end_matches('.').to_string());
+
                 break;
             }
         }
+
         let basename = basename.ok_or(anyhow!(
             "No HISAT2 index file with suffix '1' found in: {}",
             index_dir.display()
         ))?;
 
-        let final_path = index_dir.join(&basename);
-        debug!("Final HISAT2 index path: {}", final_path.display());
+        let final_path =
+            index_dir.join(&basename);
+
+        debug!(
+            "Final HISAT2 index path: {}",
+            final_path.display()
+        );
+
         Ok(final_path)
     }
 
     impl ArgGenerator for Hisat2ArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
-                .and_then(|e| e.downcast_ref::<Hisat2Config>())
-                .ok_or_else(|| anyhow!("HISAT2 requires a Hisat2Config as extra argument"))?;
+                .and_then(|e| {
+                    e.downcast_ref::<Hisat2Config>()
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "HISAT2 requires a Hisat2Config as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            for (key, value) in config.option_fields.iter() {
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
-            args_vec.push("-x".to_string());
-            args_vec.push(config.hisat2_index_path.to_string_lossy().to_string());
-            args_vec.push("-p".to_string());
-            let num_cores: usize = RunConfig::thread_allocation(run_config, HISAT2_TAG, None);
-            args_vec.push(num_cores.to_string());
+            // Serialize positional operands exactly and in order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
-            if config.r2_path.is_some() {
-                args_vec.push("-1".to_string());
-                args_vec.push(config.r1_path.clone());
-                args_vec.push("-2".to_string());
-                args_vec.push(config.r2_path.clone().unwrap());
-            } else {
-                args_vec.push("-U".to_string());
-                args_vec.push(config.r1_path.clone());
-            }
+            debug!(
+                "HISAT2 final args: {}",
+                args_vec.join(" ")
+            );
 
             Ok(args_vec)
         }
@@ -1923,19 +2427,62 @@ pub mod kallisto {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::anyhow;
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
+    #[derive(Debug)]
     pub struct KallistoConfig {
         pub subcommand: KallistoSubcommand,
-        pub subcommand_fields: HashMap<String, Option<String>>,
-        pub output_dir: PathBuf,
-        pub reproducible: bool,
+
+        /// Ordered command-line options and flags.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands.
+        ///
+        /// For `kallisto quant`, these are the input read files in
+        /// their required order.
+        pub positional_args: Vec<String>,
+    }
+
+    impl KallistoConfig {
+        pub fn new(subcommand: KallistoSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
     }
 
     pub struct KallistoArgGenerator;
 
-    pub async fn kallisto_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn kallisto_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
         let version = version_check(
             KALLISTO_TAG,
             vec!["version"],
@@ -1945,74 +2492,46 @@ pub mod kallisto {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for KallistoArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
-            let args = &run_config.args;
             let config = extra
                 .and_then(|e| e.downcast_ref::<KallistoConfig>())
-                .ok_or_else(|| anyhow!("Kallisto requires a KallistoConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Kallisto requires a KallistoConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            match config.subcommand {
-                KallistoSubcommand::Index => {
-                    args_vec.push("index".to_string());
+            args_vec.push(
+                match config.subcommand {
+                    KallistoSubcommand::Index => "index",
+                    KallistoSubcommand::Quant => "quant",
                 }
-                KallistoSubcommand::Quant => {
-                    args_vec.push("quant".to_string());
-                    args_vec.push("-i".to_string());
-                    args_vec.push(
-                        args.kallisto_index
-                            .clone()
-                            .expect("Must provide kallisto index with --kallisto-index arg.")
-                            .to_string(),
-                    );
-                    args_vec.push("-o".to_string());
-                    args_vec.push(config.output_dir.to_string_lossy().to_string());
-                    args_vec.push("--plaintext".to_string());
-                    if config.reproducible {
-                        args_vec.push("--threads".to_string());
-                        args_vec.push("1".to_string());
-                        args_vec.push("--seed".to_string());
-                        args_vec.push("42".to_string());
-                    } else {
-                        args_vec.push("--threads".to_string());
-                        let num_cores: usize =
-                            RunConfig::thread_allocation(run_config, KALLISTO_TAG, None);
-                        args_vec.push(num_cores.to_string());
-                    }
+                    .to_string(),
+            );
 
-                    // Add non-file options from subcommand_fields (e.g., --single, -l, -s)
-                    for (key, value) in config.subcommand_fields.iter() {
-                        if key != "R1" && key != "R2" {
-                            args_vec.push(key.clone());
-                            if let Some(v) = value {
-                                args_vec.push(v.clone());
-                            }
-                        }
-                    }
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
 
-                    // Add R1 and R2 paths in order as positional arguments
-                    if let Some(r1_path) =
-                        config.subcommand_fields.get("R1").and_then(|v| v.as_ref())
-                    {
-                        args_vec.push(r1_path.clone());
-                    }
-                    if let Some(r2_path) =
-                        config.subcommand_fields.get("R2").and_then(|v| v.as_ref())
-                    {
-                        args_vec.push(r2_path.clone());
-                    }
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
+
+            // Serialize positional operands exactly and in order.
+            args_vec.extend(config.positional_args.iter().cloned());
 
             Ok(args_vec)
         }
@@ -2415,6 +2934,116 @@ pub mod diamond {
         Ok((path.with_extension(""), vec![]))
     }
 
+    /// Build the complete Diamond configuration for one invocation.
+    ///
+    /// This is the shared Diamond-parameter construction used by both the
+    /// single-node pipeline and distributed workers.
+    ///
+    /// The caller supplies the resources for the machine that will actually
+    /// execute Diamond:
+    ///
+    /// - `threads`
+    /// - `available_ram_bytes`
+    /// - `tmpdir`
+    ///
+    /// Diamond-specific tuning is then calculated here using the existing
+    /// shared algorithms:
+    ///
+    /// - block size from RAM + DB size + scratch availability
+    /// - index chunk count from threads + RAM
+    ///
+    /// `output` controls only where Diamond writes its M8 output:
+    ///
+    /// - `None` -> Diamond writes to stdout (existing single-node behavior)
+    /// - `Some` -> Diamond receives `--out <path>` (distributed worker behavior)
+    pub async fn build_diamond_config(
+        db: PathBuf,
+        query: PathBuf,
+        tmpdir: PathBuf,
+        threads: usize,
+        available_ram_bytes: u64,
+        output: Option<PathBuf>,
+    ) -> Result<DiamondConfig> {
+        let block_size = compute_optimal_diamond_block_size(
+            &db,
+            &tmpdir,
+            available_ram_bytes,
+        )
+            .await
+            .unwrap_or(12.0);
+
+        let index_chunks = compute_diamond_index_chunks(
+            threads,
+            available_ram_bytes,
+        );
+
+        let mut subcommand_fields = HashMap::from([
+            (
+                "--mid-sensitive".to_string(),
+                None,
+            ),
+            (
+                "--block-size".to_string(),
+                Some(format!("{:.1}", block_size)),
+            ),
+            (
+                "-c".to_string(),
+                Some(index_chunks.to_string()),
+            ),
+            (
+                "-f".to_string(),
+                Some("6".to_string()),
+            ),
+            (
+                "--tmpdir".to_string(),
+                Some(
+                    tmpdir
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            ),
+            (
+                "--query".to_string(),
+                Some(
+                    query
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            ),
+            (
+                "--unal".to_string(),
+                Some("0".to_string()),
+            ),
+        ]);
+
+        if let Some(output_path) = output {
+            subcommand_fields.insert(
+                "--out".to_string(),
+                Some(
+                    output_path
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            );
+        }
+
+        info!(
+        "Diamond config: threads={}, index-chunks={}, block-size={:.1} GB, tmpdir={}",
+        threads,
+        index_chunks,
+        block_size,
+        tmpdir.display(),
+    );
+
+        Ok(DiamondConfig {
+            subcommand: DiamondSubcommand::Blastx,
+            db,
+            r1_path: Some(query),
+            r2_path: None,
+            subcommand_fields,
+        })
+    }
+
     /// Generates Diamond command-line arguments without requiring RunConfig.
     ///
     /// Worker code should call this directly.
@@ -2477,30 +3106,32 @@ pub mod diamond {
     /// This remains a pipeline-level resource-planning helper because it
     /// currently inspects system RAM, scratch space, and the configured
     /// pipeline database.
-    pub async fn compute_optimal_block_size(
-        run_config: &RunConfig,
+    pub async fn compute_optimal_diamond_block_size(
+        diamond_db: &PathBuf,
+        scratch_path: &PathBuf,
+        available_ram_bytes: u64,
     ) -> Result<f64> {
-        let (_, available_ram) = detect_ram()?;
         let available_ram_gb =
-            available_ram as f64 / 1_073_741_824.0;
+            available_ram_bytes as f64 / 1_073_741_824.0;
 
-        let db_path = run_config
-            .args
-            .diamond_db
-            .as_deref()
-            .ok_or_else(|| anyhow!("--diamond-db required"))?;
-
-        let db_path = if db_path.ends_with(".dmnd") {
-            db_path.to_string()
+        let db_path = if diamond_db.extension()
+            == Some(std::ffi::OsStr::new("dmnd"))
+        {
+            diamond_db.clone()
         } else {
-            format!("{}.dmnd", db_path)
+            diamond_db.with_extension("dmnd")
         };
 
-        let db_stats = get_diamond_db_stats(&db_path)
+        let db_path_str = db_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Diamond DB path is not valid UTF-8"))?;
+
+        let db_stats = get_diamond_db_stats(db_path_str)
             .await
             .unwrap_or((0, 300_000_000_000));
 
-        let total_letters_billions = db_stats.1 as f64 / 1e9;
+        let total_letters_billions =
+            db_stats.1 as f64 / 1e9;
 
         let ram_factor = if available_ram_gb >= 1400.0 {
             9.0
@@ -2519,16 +3150,8 @@ pub mod diamond {
         block_size = block_size.max(6.0);
         block_size = block_size.min(200.0);
 
-        let scratch_path = PathBuf::from(
-            run_config
-                .args
-                .nvme_scratch
-                .as_deref()
-                .unwrap_or("."),
-        );
-
         let scratch_avail =
-            available_space_for_path(&scratch_path)
+            available_space_for_path(scratch_path)
                 .await
                 .unwrap_or(0);
 
@@ -2540,32 +3163,86 @@ pub mod diamond {
 
         if scratch_avail_gib < estimated_scratch_gib * 1.2 {
             warn!(
-                "Low scratch space — need {:.1} GiB, have {:.1} GiB; \
-                 reducing block size by 50%",
-                estimated_scratch_gib,
-                scratch_avail_gib
-            );
+            "Low scratch space - need {:.1} GiB, have {:.1} GiB; \
+             reducing Diamond block size by 50%",
+            estimated_scratch_gib,
+            scratch_avail_gib
+        );
+
             block_size *= 0.5;
         } else if scratch_avail_gib < estimated_scratch_gib * 1.5 {
             warn!(
-                "Low scratch space — need {:.1} GiB, have {:.1} GiB; \
-                 reducing block size by 30%",
-                estimated_scratch_gib,
-                scratch_avail_gib
-            );
+            "Low scratch space - need {:.1} GiB, have {:.1} GiB; \
+             reducing Diamond block size by 30%",
+            estimated_scratch_gib,
+            scratch_avail_gib
+        );
+
             block_size *= 0.7;
         }
 
         info!(
-            "Diamond block size: {:.1} \
-             (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
-            block_size,
-            available_ram_gb,
-            total_letters_billions,
-            scratch_avail as f64 / 1e9 / 1_073_741_824.0
-        );
+        "Diamond block size: {:.1} \
+         (RAM {:.0} GB, DB ~{:.0}B letters, scratch {:.1} GB free)",
+        block_size,
+        available_ram_gb,
+        total_letters_billions,
+        scratch_avail_gib
+    );
 
         Ok(block_size)
+    }
+
+    pub async fn compute_optimal_block_size(
+        run_config: &RunConfig,
+    ) -> Result<f64> {
+        let diamond_db = run_config
+            .args
+            .diamond_db
+            .as_ref()
+            .ok_or_else(|| anyhow!("--diamond-db required"))?;
+
+        let diamond_db = PathBuf::from(diamond_db);
+
+        let scratch_path = PathBuf::from(
+            run_config
+                .args
+                .nvme_scratch
+                .as_deref()
+                .unwrap_or("."),
+        );
+
+        let (_, available_ram) = detect_ram()?;
+
+        compute_optimal_diamond_block_size(
+            &diamond_db,
+            &scratch_path,
+            available_ram,
+        )
+            .await
+    }
+
+    pub fn compute_diamond_index_chunks(
+        threads: usize,
+        available_ram_bytes: u64,
+    ) -> usize {
+        let mut index_chunks = if threads >= 192 {
+            32
+        } else if threads >= 128 {
+            24
+        } else if threads >= 96 {
+            16
+        } else if threads >= 64 {
+            12
+        } else {
+            4
+        };
+
+        index_chunks = index_chunks
+            .min((available_ram_bytes / 12_000_000_000) as usize)
+            .max(1);
+
+        index_chunks
     }
 
     async fn get_diamond_db_stats(
@@ -2745,29 +3422,45 @@ pub mod makeblastdb {
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct MakeblastdbConfig {
-        pub input: PathBuf,  // reference_fasta
-        pub dbtype: String,  // "nucl" or "prot"
-        pub output: PathBuf, // blast_index_path (without extension)
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl MakeblastdbConfig {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
     }
 
     pub struct MakeblastdbArgGenerator;
 
     /// Checks if `makeblastdb` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the makeblastdb version
-    pub async fn makeblastdb_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn makeblastdb_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             MAKEBLASTDB_TAG,
             vec!["-version"],
@@ -2777,7 +3470,8 @@ pub mod makeblastdb {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
@@ -2790,24 +3484,18 @@ pub mod makeblastdb {
             let config = extra
                 .and_then(|e| e.downcast_ref::<MakeblastdbConfig>())
                 .ok_or_else(|| {
-                    anyhow!("makeblastdb requires MakeblastdbConfig as extra argument")
+                    anyhow!(
+                        "makeblastdb requires MakeblastdbConfig as extra argument"
+                    )
                 })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            args_vec.push("-in".to_string());
-            args_vec.push(config.input.to_string_lossy().to_string());
-
-            args_vec.push("-dbtype".to_string());
-            args_vec.push(config.dbtype.clone());
-
-            args_vec.push("-out".to_string());
-            args_vec.push(config.output.to_string_lossy().to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
@@ -2816,36 +3504,51 @@ pub mod makeblastdb {
     }
 }
 
+
 pub mod blastn {
     use crate::config::defs::{RunConfig, BLASTN_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct BlastnConfig {
-        pub query: PathBuf,       // assembled_contig
-        pub db: PathBuf,          // blast_index_path (without extension)
-        pub outfmt: String, // e.g., "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen"
-        pub evalue: f64,    // e.g. 1e-10
-        pub max_target_seqs: u32, // e.g. 5000
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl BlastnConfig {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
     }
 
     pub struct BlastnArgGenerator;
 
     /// Checks if `blastn` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the blastn version
-    pub async fn blastn_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn blastn_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             BLASTN_TAG,
             vec!["-version"],
@@ -2855,45 +3558,32 @@ pub mod blastn {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for BlastnArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<BlastnConfig>())
-                .ok_or_else(|| anyhow!("blastn requires BlastnConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "blastn requires BlastnConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            args_vec.push("-query".to_string());
-            args_vec.push(config.query.to_string_lossy().to_string());
-
-            args_vec.push("-db".to_string());
-            args_vec.push(config.db.to_string_lossy().to_string());
-
-            args_vec.push("-outfmt".to_string());
-            args_vec.push(config.outfmt.clone());
-
-            args_vec.push("-evalue".to_string());
-            args_vec.push(config.evalue.to_string());
-
-            args_vec.push("-max_target_seqs".to_string());
-            args_vec.push(config.max_target_seqs.to_string());
-
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BLASTN_TAG, None);
-            args_vec.push("-num_threads".to_string());
-            args_vec.push(num_cores.to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
@@ -2902,36 +3592,51 @@ pub mod blastn {
     }
 }
 
+
 pub mod blastx {
     use crate::config::defs::{RunConfig, BLASTX_TAG};
     use crate::utils::command::{version_check, ArgGenerator};
     use crate::utils::streams::ChildStream;
     use anyhow::{anyhow, Result};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
 
     #[derive(Debug)]
     pub struct BlastxConfig {
-        pub query: PathBuf,      // assembled_contig
-        pub db: PathBuf,         // blast_index_path (without extension)
-        pub outfmt: u32,         // 6 (standard tabular)
-        pub evalue: f64,         // e.g. 1e-10
-        pub num_alignments: u32, // e.g. 5
-        pub option_fields: HashMap<String, Option<String>>,
+        /// Ordered command-line options and flags.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl BlastxConfig {
+        pub fn new() -> Self {
+            Self {
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
     }
 
     pub struct BlastxArgGenerator;
 
     /// Checks if `blastx` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the blastx version
-    pub async fn blastx_presence_check(config: &RunConfig) -> Result<f32> {
+    pub async fn blastx_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
         let version = version_check(
             BLASTX_TAG,
             vec!["-version"],
@@ -2941,45 +3646,32 @@ pub mod blastx {
             None,
             &config,
         )
-        .await?;
+            .await?;
+
         Ok(version)
     }
 
     impl ArgGenerator for BlastxArgGenerator {
         fn generate_args(
             &self,
-            run_config: &RunConfig,
+            _run_config: &RunConfig,
             extra: Option<&dyn std::any::Any>,
         ) -> anyhow::Result<Vec<String>> {
             let config = extra
                 .and_then(|e| e.downcast_ref::<BlastxConfig>())
-                .ok_or_else(|| anyhow!("blastx requires BlastxConfig as extra argument"))?;
+                .ok_or_else(|| {
+                    anyhow!(
+                        "blastx requires BlastxConfig as extra argument"
+                    )
+                })?;
 
-            let mut args_vec: Vec<String> = Vec::new();
+            let mut args_vec = Vec::new();
 
-            args_vec.push("-query".to_string());
-            args_vec.push(config.query.to_string_lossy().to_string());
-
-            args_vec.push("-db".to_string());
-            args_vec.push(config.db.to_string_lossy().to_string());
-
-            args_vec.push("-outfmt".to_string());
-            args_vec.push(config.outfmt.to_string());
-
-            args_vec.push("-evalue".to_string());
-            args_vec.push(config.evalue.to_string());
-
-            args_vec.push("-num_alignments".to_string());
-            args_vec.push(config.num_alignments.to_string());
-
-            let num_cores: usize = RunConfig::thread_allocation(run_config, BLASTX_TAG, None);
-            args_vec.push("-num_threads".to_string());
-            args_vec.push(num_cores.to_string());
-
-            for (key, value) in config.option_fields.iter() {
+            for (key, value) in &config.option_fields {
                 args_vec.push(key.clone());
-                if let Some(v) = value {
-                    args_vec.push(v.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
                 }
             }
 
@@ -3183,6 +3875,106 @@ pub mod mmseqs {
                 option_fields: HashMap::new(),
                 gpu_server: false,
             }
+        }
+    }
+
+    pub fn build_mmseqs_cpu_search_config(
+        input: PathBuf,
+        target_db: PathBuf,
+        result_db: PathBuf,
+        tmp_dir: PathBuf,
+        threads: usize,
+    ) -> MmseqsConfig {
+        MmseqsConfig {
+            subcommand: MmseqsSubcommand::Search,
+            backend: MmseqsBackend::Cpu,
+
+            input: Some(input),
+            target_db: Some(target_db),
+            result_db: Some(result_db),
+            output: None,
+            tmp_dir: Some(tmp_dir),
+
+            threads: Some(threads),
+
+            // Established production CPU sensitivity.
+            sensitivity: Some("5.7".to_string()),
+
+            // Established production search parameters.
+            search_type: Some("3".to_string()),
+            max_seqs: Some("1000".to_string()),
+            prefilter_mode: Some("0".to_string()),
+            alignment_mode: Some("3".to_string()),
+
+            // Not used for CPU search.
+            db_load_mode: None,
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+            gpu_server: false,
+
+            // Established production filtering parameters.
+            option_fields: HashMap::from([
+                (
+                    "-e".to_string(),
+                    Some("0.001".to_string()),
+                ),
+                (
+                    "--min-seq-id".to_string(),
+                    Some("0.25".to_string()),
+                ),
+            ]),
+        }
+    }
+
+    pub fn build_mmseqs_gpu_search_config(
+        input: PathBuf,
+        target_db: PathBuf,
+        result_db: PathBuf,
+        tmp_dir: PathBuf,
+        threads: usize,
+    ) -> MmseqsConfig {
+        MmseqsConfig {
+            subcommand: MmseqsSubcommand::Search,
+            backend: MmseqsBackend::Gpu,
+
+            input: Some(input),
+            target_db: Some(target_db),
+            result_db: Some(result_db),
+            output: None,
+            tmp_dir: Some(tmp_dir),
+
+            threads: Some(threads),
+
+            // GPU search does not use the CPU sensitivity setting.
+            sensitivity: None,
+
+            search_type: Some("3".to_string()),
+            max_seqs: Some("3000".to_string()),
+
+            // Let command.rs apply the GPU-server default of 1.
+            prefilter_mode: None,
+
+            // Established GPU-server settings.
+            db_load_mode: Some("2".to_string()),
+            alignment_mode: Some("3".to_string()),
+
+            index_subset: None,
+            format_output: None,
+            cuda_visible_devices: None,
+
+            option_fields: HashMap::from([
+                (
+                    "-e".to_string(),
+                    Some("0.001".to_string()),
+                ),
+                (
+                    "--min-seq-id".to_string(),
+                    Some("0.25".to_string()),
+                ),
+            ]),
+
+            gpu_server: true,
         }
     }
 
@@ -3945,6 +4737,96 @@ pub mod mmseqs {
     }
 }
 
+
+pub mod flye {
+    use crate::config::defs::{RunConfig, FLYE_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    use anyhow::{anyhow, Result};
+    use std::path::PathBuf;
+
+    #[derive(Debug)]
+    pub struct FlyeConfig {
+        pub input_fastq: PathBuf,
+        pub outdir_path: PathBuf,
+        pub guppy_basecaller_setting: String,
+        pub polishing_iterations: usize,
+    }
+
+    pub struct FlyeArgGenerator;
+
+    /// Checks if `flye` is present and returns its version.
+    pub async fn flye_presence_check(
+        config: &RunConfig,
+        version_file: Option<PathBuf>,
+    ) -> Result<f32> {
+        let version = version_check(
+            FLYE_TAG,
+            vec!["--version"],
+            0,
+            0,
+            ChildStream::Stdout,
+            version_file,
+            config,
+        )
+            .await?;
+
+        Ok(version)
+    }
+
+    impl ArgGenerator for FlyeArgGenerator {
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<FlyeConfig>())
+                .ok_or_else(|| anyhow!("Flye requires a FlyeConfig as extra argument"))?;
+
+            if !config.input_fastq.exists() {
+                return Err(anyhow!(
+                    "Flye input FASTQ does not exist: {}",
+                    config.input_fastq.display()
+                ));
+            }
+
+            let mut args_vec: Vec<String> = Vec::new();
+
+            // Legacy RunAssembly:
+            //     flye --threads $(nproc) --meta ...
+            args_vec.push("--threads".to_string());
+            args_vec.push(
+                RunConfig::thread_allocation(run_config, FLYE_TAG, None).to_string(),
+            );
+
+            // Legacy pipeline always runs metaFlye.
+            args_vec.push("--meta".to_string());
+
+            // Legacy WDL:
+            //     default -> --nano-raw
+            //     "super" -> --nano-hq
+            if config.guppy_basecaller_setting == "super" {
+                args_vec.push("--nano-hq".to_string());
+            } else {
+                args_vec.push("--nano-raw".to_string());
+            }
+
+            // Flye nanopore input is positional after the read-type option.
+            args_vec.push(config.input_fastq.to_string_lossy().to_string());
+
+            args_vec.push("--out-dir".to_string());
+            args_vec.push(config.outdir_path.to_string_lossy().to_string());
+
+            args_vec.push("--iterations".to_string());
+            args_vec.push(config.polishing_iterations.to_string());
+
+            Ok(args_vec)
+        }
+    }
+}
+
 /// Generates the command-line arguments for a given tool.
 ///
 /// # Arguments
@@ -3986,6 +4868,7 @@ pub fn generate_cli(
         MAKEBLASTDB_TAG => Box::new(makeblastdb::MakeblastdbArgGenerator),
         SORT_TAG => Box::new(sort::SortArgGenerator),
         MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
+        FLYE_TAG => Box::new(flye::FlyeArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -4021,6 +4904,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 SPADES_TAG => Some(assembly_dir.join("assembly_version.txt")),
                 MINIMAP2_TAG => Some(out_dir.join("minimap2_version.txt")),
                 DIAMOND_TAG => Some(out_dir.join("diamond_version.txt")),
+                FLYE_TAG => Some(assembly_dir.join("assembly_version.txt")),
                 _ => None,
             };
 
@@ -4049,6 +4933,8 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 MAKEBLASTDB_TAG => makeblastdb::makeblastdb_presence_check(&config).await,
                 SORT_TAG => sort::sort_presence_check(&config).await,
                 MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
+                FLYE_TAG => flye::flye_presence_check(&config, version_file).await,
+                PIGZ_TAG => pigz::pigz_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

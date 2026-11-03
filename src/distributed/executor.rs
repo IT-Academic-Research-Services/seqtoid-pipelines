@@ -22,6 +22,8 @@ use tokio::process::Child;
 
 use crate::config::defs::{DiamondSubcommand, DIAMOND_TAG, MMSEQS_TAG};
 use crate::utils::command::diamond::{
+    compute_diamond_index_chunks,
+    compute_optimal_diamond_block_size,
     generate_diamond_args,
     DiamondConfig,
     DiamondExecutionConfig,
@@ -33,7 +35,7 @@ use crate::utils::command::mmseqs::{
     MmseqsBackend,
     MmseqsConfig,
     MmseqsExecutionConfig,
-    MmseqsSubcommand,
+    MmseqsSubcommand, build_mmseqs_cpu_search_config, build_mmseqs_gpu_search_config,
 };
 use crate::utils::fastx::write_combined_fastq;
 use crate::utils::streams::spawn_external_cmd;
@@ -775,17 +777,23 @@ impl WorkerExecutor {
             .clone()
             .ok_or_else(|| {
                 anyhow!(
-                    "MMseqs backend selected but no worker-local MMseqs DB configured"
-                )
+                "MMseqs backend selected but no worker-local MMseqs DB configured"
+            )
             })?;
 
-        let query_fastq = attempt_dir.join("query.fastq");
-        let query_db = attempt_dir.join("queryDB");
-        let result_db = attempt_dir.join("resultDB");
-        let tmp_dir = attempt_dir.join("tmp");
-        let output_m8 = attempt_dir.join("result.m8");
+        let query_fastq =
+            attempt_dir.join("query.fastq");
+        let query_db =
+            attempt_dir.join("queryDB");
+        let result_db =
+            attempt_dir.join("resultDB");
+        let tmp_dir =
+            attempt_dir.join("tmp");
+        let output_m8 =
+            attempt_dir.join("result.m8");
 
-        fs::create_dir_all(&tmp_dir).await?;
+        fs::create_dir_all(&tmp_dir)
+            .await?;
 
         // Work units carry separate R1/R2 chunk paths. Preserve the same
         // combined-FASTQ boundary used by the existing single-node MMseqs path.
@@ -795,7 +803,9 @@ impl WorkerExecutor {
             &query_fastq,
         )
             .await
-            .context("failed to create combined FASTQ for MMseqs")?;
+            .context(
+                "failed to create combined FASTQ for MMseqs",
+            )?;
 
         let execution = MmseqsExecutionConfig {
             threads: self.config.threads,
@@ -805,41 +815,50 @@ impl WorkerExecutor {
         // ------------------------------------------------------------
         // 1. FASTQ -> query DB
         // ------------------------------------------------------------
-        let createdb_config = MmseqsConfig {
-            subcommand: MmseqsSubcommand::Createdb,
-            backend: MmseqsBackend::Cpu,
-            input: Some(query_fastq),
-            target_db: None,
-            result_db: None,
-            output: Some(query_db.clone()),
-            tmp_dir: None,
-            threads: Some(self.config.threads),
-            sensitivity: None,
-            search_type: None,
-            max_seqs: None,
-            prefilter_mode: None,
-            db_load_mode: None,
-            alignment_mode: None,
-            index_subset: None,
-            format_output: None,
-            cuda_visible_devices: None,
-            option_fields: HashMap::from([
-                (
+
+        let createdb_config =
+            MmseqsConfig {
+                subcommand: MmseqsSubcommand::Createdb,
+                backend: MmseqsBackend::Cpu,
+
+                input: Some(query_fastq),
+                target_db: None,
+                result_db: None,
+                output: Some(query_db.clone()),
+                tmp_dir: None,
+
+                threads: Some(self.config.threads),
+                sensitivity: None,
+
+                search_type: None,
+                max_seqs: None,
+                prefilter_mode: None,
+                db_load_mode: None,
+                alignment_mode: None,
+                index_subset: None,
+
+                format_output: None,
+                cuda_visible_devices: None,
+
+                option_fields: HashMap::from([(
                     "--dbtype".to_string(),
                     Some("2".to_string()),
-                ),
-            ]),
-            gpu_server: false,
-        };
+                )]),
+
+                gpu_server: false,
+            };
 
         let createdb_args =
-            generate_mmseqs_args(&execution, &createdb_config)?;
+            generate_mmseqs_args(
+                &execution,
+                &createdb_config,
+            )?;
 
         info!(
-            "[worker:{}] MMseqs createdb args: {:?}",
-            self.worker_id(),
-            createdb_args
-        );
+        "[worker:{}] MMseqs createdb args: {:?}",
+        self.worker_id(),
+        createdb_args
+    );
 
         self.run_external(
             MMSEQS_TAG,
@@ -858,144 +877,110 @@ impl WorkerExecutor {
         // ------------------------------------------------------------
         // 2. Start gpuserver for GPU backend
         // ------------------------------------------------------------
+
         let mut gpu_server: Option<Child> = None;
 
         if backend == MmseqsBackend::Gpu {
             info!(
-                "[worker:{}] Starting MMseqs GPU server for {}",
-                self.worker_id(),
-                target_db.display()
-            );
+            "[worker:{}] Starting MMseqs GPU server for {}",
+            self.worker_id(),
+            target_db.display()
+        );
 
             let server = spawn_gpuserver(
                 &target_db,
                 None,
             )
                 .await
-                .context("failed to start MMseqs GPU server")?;
+                .context(
+                    "failed to start MMseqs GPU server",
+                )?;
 
             gpu_server = Some(server);
 
             // Give gpuserver a bounded warm-up period while verifying that it
             // has not exited prematurely.
             for second in 1..=20 {
-                if let Some(server) = gpu_server.as_mut() {
+                if let Some(server) =
+                    gpu_server.as_mut()
+                {
                     match server.try_wait() {
                         Ok(Some(status)) => {
                             return Err(anyhow!(
-                                "MMseqs GPU server exited during warmup after {}s \
-                                 with status {:?}",
-                                second,
-                                status
-                            ));
+                            "MMseqs GPU server exited during warmup after {}s \
+                             with status {:?}",
+                            second,
+                            status
+                        ));
                         }
 
                         Ok(None) => {}
 
                         Err(e) => {
                             return Err(anyhow!(
-                                "failed checking MMseqs GPU server during warmup: {}",
-                                e
-                            ));
+                            "failed checking MMseqs GPU server during warmup: {}",
+                            e
+                        ));
                         }
                     }
                 }
 
                 tokio::time::sleep(
-                    tokio::time::Duration::from_secs(1)
+                    tokio::time::Duration::from_secs(1),
                 )
                     .await;
             }
 
             info!(
-                "[worker:{}] MMseqs GPU server remained running through warmup",
-                self.worker_id()
-            );
+            "[worker:{}] MMseqs GPU server remained running through warmup",
+            self.worker_id()
+        );
         }
 
         // ------------------------------------------------------------
         // 3. Search
         // ------------------------------------------------------------
+
+        // Use the same shared MMseqs search-config builders as single-node.
         //
-        // IMPORTANT:
-        // Do not manually append GPU flags here.
-        //
-        // command.rs owns MMseqs CLI construction. For GPU + gpu_server=true,
-        // it supplies:
-        //
-        //   --gpu 1
-        //   --gpu-server 1
-        //   --db-load-mode 2
-        //   --prefilter-mode 1 (when not explicitly overridden)
-        //
-        // The worker therefore only expresses the configuration.
-        let search_config = MmseqsConfig {
-            subcommand: MmseqsSubcommand::Search,
-            backend,
+        // The worker supplies worker-local paths and the worker-local
+        // thread allocation. The builder owns the actual MMseqs search
+        // parameter set.
+        let search_config =
+            match backend {
+                MmseqsBackend::Cpu => {
+                    build_mmseqs_cpu_search_config(
+                        query_db.clone(),
+                        target_db.clone(),
+                        result_db.clone(),
+                        tmp_dir.clone(),
+                        self.config.threads,
+                    )
+                }
 
-            input: Some(query_db.clone()),
-            target_db: Some(target_db.clone()),
-            result_db: Some(result_db.clone()),
-            output: None,
-            tmp_dir: Some(tmp_dir.clone()),
-
-            threads: Some(self.config.threads),
-
-            // CPU retains the established production sensitivity.
-            // GPU leaves sensitivity unset because the GPU command path
-            // does not use the CPU -s setting here.
-            sensitivity: match backend {
-                MmseqsBackend::Cpu => Some("5.7".to_string()),
-                MmseqsBackend::Gpu => None,
-            },
-
-            // Preserve the established distributed search parameters.
-            search_type: Some("3".to_string()),
-
-            max_seqs: Some(match backend {
-                MmseqsBackend::Cpu => "1000".to_string(),
-                MmseqsBackend::Gpu => "3000".to_string(),
-            }),
-
-            // IMPORTANT:
-            // Leave GPU prefilter_mode as None so command.rs applies the
-            // GPU-server default of 1. CPU retains the existing 0.
-            prefilter_mode: match backend {
-                MmseqsBackend::Cpu => Some("0".to_string()),
-                MmseqsBackend::Gpu => None,
-            },
-
-            db_load_mode: Some("2".to_string()),
-
-            alignment_mode: Some("3".to_string()),
-
-            index_subset: None,
-            format_output: None,
-            cuda_visible_devices: None,
-
-            option_fields: HashMap::from([
-                (
-                    "-e".to_string(),
-                    Some("0.001".to_string()),
-                ),
-                (
-                    "--min-seq-id".to_string(),
-                    Some("0.25".to_string()),
-                ),
-            ]),
-
-            gpu_server: backend == MmseqsBackend::Gpu,
-        };
+                MmseqsBackend::Gpu => {
+                    build_mmseqs_gpu_search_config(
+                        query_db.clone(),
+                        target_db.clone(),
+                        result_db.clone(),
+                        tmp_dir.clone(),
+                        self.config.threads,
+                    )
+                }
+            };
 
         let search_args =
-            generate_mmseqs_args(&execution, &search_config)?;
+            generate_mmseqs_args(
+                &execution,
+                &search_config,
+            )?;
 
         info!(
-            "[worker:{}] MMseqs {:?} search args: {:?}",
-            self.worker_id(),
-            backend,
-            search_args
-        );
+        "[worker:{}] MMseqs {:?} search args: {:?}",
+        self.worker_id(),
+        backend,
+        search_args
+    );
 
         let search_result = self
             .run_external(
@@ -1008,27 +993,32 @@ impl WorkerExecutor {
 
         // Always shut down the per-attempt GPU server after search, whether
         // search succeeded or failed.
-        if let Some(mut server) = gpu_server {
+        if let Some(mut server) =
+            gpu_server
+        {
             info!(
-                "[worker:{}] Stopping MMseqs GPU server",
-                self.worker_id()
-            );
+            "[worker:{}] Stopping MMseqs GPU server",
+            self.worker_id()
+        );
 
             let stop_result =
-                stop_gpuserver(&mut server).await;
+                stop_gpuserver(&mut server)
+                    .await;
 
-            if let Err(stop_err) = stop_result {
+            if let Err(stop_err) =
+                stop_result
+            {
                 warn!(
-                    "[worker:{}] MMseqs GPU server shutdown failed: {}",
-                    self.worker_id(),
-                    stop_err
-                );
+                "[worker:{}] MMseqs GPU server shutdown failed: {}",
+                self.worker_id(),
+                stop_err
+            );
 
                 if search_result.is_ok() {
                     return Err(anyhow!(
-                        "MMseqs search completed but GPU server shutdown failed: {}",
-                        stop_err
-                    ));
+                    "MMseqs search completed but GPU server shutdown failed: {}",
+                    stop_err
+                ));
                 }
             }
         }
@@ -1044,44 +1034,50 @@ impl WorkerExecutor {
         // ------------------------------------------------------------
         // 4. convertalis -> m8
         // ------------------------------------------------------------
-        let convert_config = MmseqsConfig {
-            subcommand: MmseqsSubcommand::ConvertAlis,
-            backend: MmseqsBackend::Cpu,
 
-            input: Some(query_db),
-            target_db: Some(target_db),
-            result_db: Some(result_db),
-            output: Some(output_m8.clone()),
-            tmp_dir: None,
+        let convert_config =
+            MmseqsConfig {
+                subcommand:
+                MmseqsSubcommand::ConvertAlis,
+                backend: MmseqsBackend::Cpu,
 
-            threads: None,
-            sensitivity: None,
-            search_type: None,
-            max_seqs: None,
-            prefilter_mode: None,
-            db_load_mode: None,
-            alignment_mode: None,
-            index_subset: None,
+                input: Some(query_db),
+                target_db: Some(target_db),
+                result_db: Some(result_db),
+                output: Some(output_m8.clone()),
+                tmp_dir: None,
 
-            format_output: Some(
-                "query,target,pident,alnlen,mismatch,gapopen,\
+                threads: None,
+                sensitivity: None,
+                search_type: None,
+                max_seqs: None,
+                prefilter_mode: None,
+                db_load_mode: None,
+                alignment_mode: None,
+                index_subset: None,
+
+                format_output: Some(
+                    "query,target,pident,alnlen,mismatch,gapopen,\
                  qstart,qend,tstart,tend,evalue,bits"
-                    .replace(' ', ""),
-            ),
+                        .replace(' ', ""),
+                ),
 
-            cuda_visible_devices: None,
-            option_fields: HashMap::new(),
-            gpu_server: false,
-        };
+                cuda_visible_devices: None,
+                option_fields: HashMap::new(),
+                gpu_server: false,
+            };
 
         let convert_args =
-            generate_mmseqs_args(&execution, &convert_config)?;
+            generate_mmseqs_args(
+                &execution,
+                &convert_config,
+            )?;
 
         info!(
-            "[worker:{}] MMseqs convertalis args: {:?}",
-            self.worker_id(),
-            convert_args
-        );
+        "[worker:{}] MMseqs convertalis args: {:?}",
+        self.worker_id(),
+        convert_args
+    );
 
         self.run_external(
             MMSEQS_TAG,
@@ -1092,14 +1088,15 @@ impl WorkerExecutor {
             .await?;
 
         let m8_validation =
-            validate_m8(&output_m8).await?;
+            validate_m8(&output_m8)
+                .await?;
 
         info!(
-            "[worker:{}] MMseqs result validated: rows={} path={}",
-            self.worker_id(),
-            m8_validation.rows,
-            output_m8.display()
-        );
+        "[worker:{}] MMseqs result validated: rows={} path={}",
+        self.worker_id(),
+        m8_validation.rows,
+        output_m8.display()
+    );
 
         self.publish_result(
             work_unit,
@@ -1122,9 +1119,17 @@ impl WorkerExecutor {
             .clone()
             .ok_or_else(|| {
                 anyhow!(
-                    "Diamond backend selected but no worker-local Diamond DB configured"
-                )
+                "Diamond backend selected but no worker-local Diamond DB configured"
+            )
             })?;
+
+        // self.config.threads was resolved at worker startup using the same
+        // shared thread-allocation policy as the single-node pipeline.
+        //
+        // The remaining Diamond tuning is calculated by the same shared
+        // Diamond configuration builder used by single-node execution.
+        let (_, available_ram) =
+            crate::utils::system::detect_ram()?;
 
         let execution = DiamondExecutionConfig {
             threads: self.config.threads,
@@ -1132,46 +1137,39 @@ impl WorkerExecutor {
 
         let mut output_parts = Vec::new();
 
+        // ------------------------------------------------------------
         // R1
+        // ------------------------------------------------------------
+
         let r1_out =
             attempt_dir.join("diamond_R1.m8");
 
-        let r1_config = DiamondConfig {
-            subcommand: DiamondSubcommand::Blastx,
-            db: diamond_db.clone(),
-            r1_path: Some(work_unit.r1_path.clone()),
-            r2_path: None,
-            subcommand_fields: HashMap::from([
-                (
-                    "--query".to_string(),
-                    Some(
-                        work_unit
-                            .r1_path
-                            .to_string_lossy()
-                            .to_string(),
-                    ),
-                ),
-                (
-                    "--out".to_string(),
-                    Some(
-                        r1_out
-                            .to_string_lossy()
-                            .to_string(),
-                    ),
-                ),
-                (
-                    "-f".to_string(),
-                    Some("6".to_string()),
-                ),
-            ]),
-        };
+        let r1_config =
+            crate::utils::command::diamond::build_diamond_config(
+                diamond_db.clone(),
+                work_unit.r1_path.clone(),
+                attempt_dir.to_path_buf(),
+                execution.threads,
+                available_ram,
+                Some(r1_out.clone()),
+            )
+                .await?;
 
-        let args =
-            generate_diamond_args(&execution, &r1_config)?;
+        let r1_args =
+            generate_diamond_args(
+                &execution,
+                &r1_config,
+            )?;
+
+        info!(
+        "[worker:{}] spawning diamond R1: {:?}",
+        self.worker_id(),
+        r1_args
+    );
 
         self.run_external(
             DIAMOND_TAG,
-            args,
+            r1_args,
             attempt_dir,
             "blastx_R1",
         )
@@ -1185,48 +1183,40 @@ impl WorkerExecutor {
 
         output_parts.push(r1_out);
 
+        // ------------------------------------------------------------
         // R2
+        // ------------------------------------------------------------
+
         if let Some(r2) = &work_unit.r2_path {
             let r2_out =
                 attempt_dir.join("diamond_R2.m8");
 
-            let r2_config = DiamondConfig {
-                subcommand: DiamondSubcommand::Blastx,
-                db: diamond_db,
-                r1_path: Some(r2.clone()),
-                r2_path: None,
-                subcommand_fields: HashMap::from([
-                    (
-                        "--query".to_string(),
-                        Some(
-                            r2.to_string_lossy()
-                                .to_string(),
-                        ),
-                    ),
-                    (
-                        "--out".to_string(),
-                        Some(
-                            r2_out
-                                .to_string_lossy()
-                                .to_string(),
-                        ),
-                    ),
-                    (
-                        "-f".to_string(),
-                        Some("6".to_string()),
-                    ),
-                ]),
-            };
+            let r2_config =
+                crate::utils::command::diamond::build_diamond_config(
+                    diamond_db,
+                    r2.clone(),
+                    attempt_dir.to_path_buf(),
+                    execution.threads,
+                    available_ram,
+                    Some(r2_out.clone()),
+                )
+                    .await?;
 
-            let args =
+            let r2_args =
                 generate_diamond_args(
                     &execution,
                     &r2_config,
                 )?;
 
+            info!(
+            "[worker:{}] spawning diamond R2: {:?}",
+            self.worker_id(),
+            r2_args
+        );
+
             self.run_external(
                 DIAMOND_TAG,
-                args,
+                r2_args,
                 attempt_dir,
                 "blastx_R2",
             )
@@ -1241,7 +1231,10 @@ impl WorkerExecutor {
             output_parts.push(r2_out);
         }
 
+        // ------------------------------------------------------------
         // Merge R1/R2 result files.
+        // ------------------------------------------------------------
+
         let merged_m8 =
             attempt_dir.join("result.m8");
 
@@ -1254,7 +1247,8 @@ impl WorkerExecutor {
 
         for part in output_parts {
             let mut input =
-                fs::File::open(&part).await?;
+                fs::File::open(&part)
+                    .await?;
 
             tokio::io::copy(
                 &mut input,
@@ -1266,7 +1260,8 @@ impl WorkerExecutor {
         drop(merged);
 
         let m8_validation =
-            validate_m8(&merged_m8).await?;
+            validate_m8(&merged_m8)
+                .await?;
 
         self.publish_result(
             work_unit,
