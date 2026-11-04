@@ -126,6 +126,38 @@ const REFERENCE_METADATA_PREFIX: &str = "phase2/refs/metadata";
 
 const DISTRIBUTED_WORKER_STALE_SECS: u64 = 30;
 
+
+pub struct HostFilterOutputs {
+    pub non_host_r1: PathBuf,
+    pub non_host_r2: Option<PathBuf>,
+    pub duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+}
+
+struct HostFilterCompletion {
+    outputs: HostFilterOutputs,
+
+    val_count_task: JoinHandle<Result<ReadStats, anyhow::Error>>,
+    qc_count_result_rx: oneshot::Receiver<Result<u64, anyhow::Error>>,
+    ercc_count_rx: oneshot::Receiver<u64>,
+
+    ercc_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
+    host_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
+    optional_human_bam_write_handle: Option<JoinHandle<Result<()>>>,
+
+    host_bt2_count_rx: oneshot::Receiver<u64>,
+
+    ercc_bt2_bam_path: PathBuf,
+    host_hisat2_count_rx: oneshot::Receiver<u64>,
+    host_bt2_bam_path: PathBuf,
+
+    kallisto_exit_task: JoinHandle<Result<(), anyhow::Error>>,
+    kallisto_ercc_tx: oneshot::Sender<KallistoResults>,
+    kallisto_ercc_rx: oneshot::Receiver<KallistoResults>,
+
+    dedup_count_rx: oneshot::Receiver<u64>,
+    subsample_count_rx: oneshot::Receiver<u64>,
+}
+
 /// Holds the results from a Kallisto quantification run.
 #[derive(Debug)]
 pub struct KallistoResults {
@@ -9304,83 +9336,21 @@ async fn write_count_file(
     Ok(())
 }
 
-/// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
-///
-/// # Arguments
-///
-/// * `config`: the run configuration
-///
-/// # Returns
-///
-/// Result<()>: success or error
-pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
-    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
-    let out_dir = config.out_dir.clone();
 
-    let efs_run_dir = config.efs_runs_dir.join(&config.run_id);
-    let efs_work_dir = efs_run_dir.join("work");
+async fn run_host_filter(
+    config: Arc<RunConfig>,
+    cwd: &PathBuf,
+    out_dir: &PathBuf,
+    file1_path: &PathBuf,
+    file2_path: Option<PathBuf>,
+    sample_base_buf: &PathBuf,
+    paired: bool,
+    final_temp_dirs: &mut Vec<TempDir>,
+    cleanup_tasks: &mut Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
+    cleanup_receivers: &mut Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
+) -> Result<HostFilterCompletion, PipelineError> {
 
-    if matches!(config.execution_mode, ExecutionMode::Distributed) {
-        tokio::fs::create_dir_all(&efs_work_dir)
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                "Failed to create distributed EFS work directory {}: {}",
-                efs_work_dir.display(),
-                e
-            ))
-            })?;
-
-        info!(
-        "[run] Distributed NR EFS work directory: {}",
-        efs_work_dir.display()
-    );
-    }
-
-    let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
-    let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> =
-        Vec::new();
-    let mut temp_files: Vec<NamedTempFile> = Vec::new();
     let mut host_filter_temp_dirs: Vec<TempDir> = Vec::new();
-    let mut final_temp_dirs: Vec<TempDir> = Vec::new();
-    let temp_paths: Vec<PathBuf> = Vec::new();
-
-    info!("Starting short read mNGS pipeline.");
-
-    // *******************
-    // Setup and Validation
-    // *******************
-
-    // External tools check
-
-    let mut versions_vec = vec![
-        BOWTIE2_TAG,
-        MINIMAP2_TAG,
-        KALLISTO_TAG,
-        SPADES_TAG,
-        MAKEBLASTDB_TAG,
-        BLASTN_TAG,
-        BLASTX_TAG,
-        SORT_TAG,
-        SAMTOOLS_TAG,
-        FASTP_TAG,
-        HISAT2_TAG,
-    ];
-
-    match config.alignment_backend {
-        NRAlignmentBackend::Diamond => {
-            versions_vec.push(DIAMOND_TAG);
-        }
-        _ => {
-            versions_vec.push(MMSEQS_TAG);
-        }
-    }
-
-    if !config.args.no_version_check {
-        check_versions(versions_vec, &out_dir.clone(), &config)
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?;
-    }
 
     // Check required files
     let host_bowtie2_index: String = config.args.host_bowtie2_index.clone().ok_or_else(|| {
@@ -9390,19 +9360,6 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let host_hisat2_index: String = config.args.host_hisat2_index.clone().ok_or_else(|| {
         PipelineError::MissingArgument("host_hisat2_index is required".to_string())
     })?;
-
-    let (file1_path, file2_path, sample_base_buf, sample_base) =
-        validate_file_inputs(&config, &cwd, true).await?;
-    let paired = file2_path.is_some();
-
-    debug!(
-        "file1 path: {:?}  sample base buf: {:?}  sample base: {:?}",
-        file1_path.display(),
-        sample_base_buf.display(),
-        sample_base
-    );
-
-    let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
 
     // Input Validation
     let (
@@ -9687,20 +9644,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // Non host Alignment
     // *******************
 
-    // Build filter
-    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
-    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
-    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
 
-    let should_keep_filter = Arc::new(
-        build_should_keep_filter(
-            deuterostome_path,
-            taxon_whitelist_path,
-            taxon_blacklist_path,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(e))?,
-    );
 
     //write de-interleaved non-host file. easier for the scatter-gather
     let (r1_rx, r2_rx_opt, deinterleave_handle) =
@@ -9803,6 +9747,180 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     }
     host_filter_temp_dirs.clear();
+
+
+    let outputs = HostFilterOutputs {
+        non_host_r1: non_host_r1_path,
+        non_host_r2: non_host_r2_path_opt,
+        duplicate_clusters,
+    };
+
+    Ok(HostFilterCompletion {
+        outputs,
+        val_count_task,
+        qc_count_result_rx,
+        ercc_count_rx,
+        ercc_bt2_bam_write_handle,
+        host_bt2_bam_write_handle,
+        optional_human_bam_write_handle,
+        host_bt2_count_rx,
+        ercc_bt2_bam_path,
+        host_hisat2_count_rx,
+        host_bt2_bam_path,
+        kallisto_exit_task,
+        kallisto_ercc_tx,
+        kallisto_ercc_rx,
+        dedup_count_rx,
+        subsample_count_rx,
+    })
+
+}
+
+
+/// The main entry point for the short-read metagenomic NGS (mNGS) pipeline.
+///
+/// # Arguments
+///
+/// * `config`: the run configuration
+///
+/// # Returns
+///
+/// Result<()>: success or error
+pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
+    let cwd = std::env::current_dir().map_err(|e| PipelineError::Other(e.into()))?;
+    let out_dir = config.out_dir.clone();
+
+    let efs_run_dir = config.efs_runs_dir.join(&config.run_id);
+    let efs_work_dir = efs_run_dir.join("work");
+
+    if matches!(config.execution_mode, ExecutionMode::Distributed) {
+        tokio::fs::create_dir_all(&efs_work_dir)
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                "Failed to create distributed EFS work directory {}: {}",
+                efs_work_dir.display(),
+                e
+            ))
+            })?;
+
+        info!(
+        "[run] Distributed NR EFS work directory: {}",
+        efs_work_dir.display()
+    );
+    }
+
+    let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>> = Vec::new();
+    let mut cleanup_receivers: Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>> =
+        Vec::new();
+    let mut temp_files: Vec<NamedTempFile> = Vec::new();
+    let mut final_temp_dirs: Vec<TempDir> = Vec::new();
+    let temp_paths: Vec<PathBuf> = Vec::new();
+
+    info!("Starting short read mNGS pipeline.");
+
+    // *******************
+    // Setup and Validation
+    // *******************
+
+    // External tools check
+
+    let mut versions_vec = vec![
+        BOWTIE2_TAG,
+        MINIMAP2_TAG,
+        KALLISTO_TAG,
+        SPADES_TAG,
+        MAKEBLASTDB_TAG,
+        BLASTN_TAG,
+        BLASTX_TAG,
+        SORT_TAG,
+        SAMTOOLS_TAG,
+        FASTP_TAG,
+        HISAT2_TAG,
+    ];
+
+    match config.alignment_backend {
+        NRAlignmentBackend::Diamond => {
+            versions_vec.push(DIAMOND_TAG);
+        }
+        _ => {
+            versions_vec.push(MMSEQS_TAG);
+        }
+    }
+
+    if !config.args.no_version_check {
+        check_versions(versions_vec, &out_dir.clone(), &config)
+            .await
+            .map_err(|e| PipelineError::Other(e.into()))?;
+    }
+
+
+
+    let (file1_path, file2_path, sample_base_buf, sample_base) =
+        validate_file_inputs(&config, &cwd, true).await?;
+    let paired = file2_path.is_some();
+
+    debug!(
+        "file1 path: {:?}  sample base buf: {:?}  sample base: {:?}",
+        file1_path.display(),
+        sample_base_buf.display(),
+        sample_base
+    );
+
+    let taxonomy_handle = tokio::spawn(load_lineage_and_acc2tax_maps(config.clone()));
+
+    // Build filter
+    let deuterostome_path = resolve_optional_path(&config.args.deuterostome_list, &config.cwd)?;
+    let taxon_whitelist_path = resolve_optional_path(&config.args.taxon_whitelist, &config.cwd)?;
+    let taxon_blacklist_path = resolve_optional_path(&config.args.taxon_blacklist, &config.cwd)?;
+
+    let should_keep_filter = Arc::new(
+        build_should_keep_filter(
+            deuterostome_path,
+            taxon_whitelist_path,
+            taxon_blacklist_path,
+        )
+            .await
+            .map_err(|e| PipelineError::Other(e))?,
+    );
+
+
+    let host_filter = run_host_filter(
+        config.clone(),
+        &cwd,
+        &out_dir,
+        &file1_path,
+        file2_path.clone(),
+        &sample_base_buf,
+        paired,
+        &mut final_temp_dirs,
+        &mut cleanup_tasks,
+        &mut cleanup_receivers,
+    )
+        .await?;
+
+    let HostFilterCompletion {
+        outputs,
+        val_count_task,
+        qc_count_result_rx,
+        ercc_count_rx,
+        ercc_bt2_bam_write_handle,
+        host_bt2_bam_write_handle,
+        optional_human_bam_write_handle,
+        host_bt2_count_rx,
+        ercc_bt2_bam_path,
+        host_hisat2_count_rx,
+        host_bt2_bam_path,
+        kallisto_exit_task,
+        kallisto_ercc_tx,
+        kallisto_ercc_rx,
+        dedup_count_rx,
+        subsample_count_rx
+    } = host_filter;
+
+    let non_host_r1_path = outputs.non_host_r1;
+    let non_host_r2_path_opt = outputs.non_host_r2;
+    let duplicate_clusters = outputs.duplicate_clusters;
 
     // Clone paths **before** moving them into async copy tasks
     let non_host_r1_path_clone = non_host_r1_path.clone();
