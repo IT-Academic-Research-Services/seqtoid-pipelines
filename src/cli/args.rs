@@ -274,4 +274,18 @@ pub struct Arguments {
     )]
     pub polishing_iterations: usize,
 
+    /// AMR input mode.
+    ///
+    /// raw:
+    ///   Input FASTQs require host filtering.
+    ///
+    /// filtered:
+    ///   Input is assumed to have already passed the host-filtering stage.
+    #[arg(
+    long = "amr-input-mode",
+    default_value = "raw",
+    value_parser = ["raw", "filtered"]
+    )]
+    pub amr_input_mode: String,
+
 }
