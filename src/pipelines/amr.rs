@@ -12,6 +12,7 @@ use crate::config::defs::{PipelineError, RunConfig};
 use crate::pipelines::short_read_mngs::{
     run_host_filter,
     HostFilterCompletion,
+    kallisto_results,
 };
 use crate::utils::file::{validate_file_inputs, write_count_file};
 use crate::utils::streams::join_with_error_handling;
@@ -286,46 +287,51 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     // settled.
     // ------------------------------------------------------------
 
+    let out_dir_kallisto = out_dir.clone();
+
     let kallisto_fut = async move {
-        match join_with_error_handling(kallisto_exit_task).await {
+        let kallisto_exit =
+            join_with_error_handling(kallisto_exit_task).await;
+
+        match kallisto_exit {
             Ok(_) => {
                 info!("[AMR] Kallisto completed successfully");
             }
 
             Err(e) => {
-                // Preserve existing short-read semantics.
                 warn!(
-                    "[AMR] Kallisto failed (non-fatal, possibly no ERCC spike-in): {}",
-                    e
-                );
+                "[AMR] Kallisto failed \
+                 (non-fatal, possibly no ERCC spike-in): {}",
+                e
+            );
             }
         }
 
-        // We are not using Kallisto quantitatively in AMR yet.
-        //
-        // Drop the sender explicitly so the receiver is resolved rather
-        // than leaving this HostFilterCompletion channel silently alive.
-        drop(kallisto_ercc_tx);
+        let results_task =
+            kallisto_results(
+                out_dir_kallisto.join("kallisto"),
+                kallisto_ercc_tx,
+            )
+                .await?;
 
-        match kallisto_ercc_rx.await {
-            Ok(results) => {
-                info!(
-                    "[AMR] Kallisto results received: {} ERCC entries, \
-                     {} transcript mappings",
-                    results.ercc_counts.len(),
-                    results.transcript_to_gene.len(),
-                );
-            }
+        join_with_error_handling(results_task).await?;
 
-            Err(_) => {
-                // Expected in this milestone because no kallisto_results()
-                // parser is launched after dropping the sender.
-                info!(
-                    "[AMR] Kallisto result channel closed; \
-                     no downstream Kallisto result consumer required"
-                );
-            }
-        }
+        let results =
+            kallisto_ercc_rx
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                "Kallisto results receiver failed: {}",
+                e
+            ))
+                })?;
+
+        info!(
+        "[AMR] Kallisto results drained: \
+         ercc_entries={}, transcript_mappings={}",
+        results.ercc_counts.len(),
+        results.transcript_to_gene.len(),
+    );
 
         Ok::<(), PipelineError>(())
     };

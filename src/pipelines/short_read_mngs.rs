@@ -1930,7 +1930,7 @@ async fn kallisto_quant(
 /// # Returns
 ///
 /// Result containing a handle to the processing task.
-async fn kallisto_results(
+pub(crate) async fn kallisto_results(
     kallisto_out_dir: PathBuf,
     ercc_tx: oneshot::Sender<KallistoResults>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>, PipelineError> {
