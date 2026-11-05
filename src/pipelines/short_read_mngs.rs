@@ -93,7 +93,7 @@ use crate::utils::fastx::{
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
     validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
-    write_vecu8_to_file, copy_file_streaming,
+    write_vecu8_to_file, copy_file_streaming, write_count_file
 };
 use crate::utils::paf::paf_to_m8;
 use crate::utils::plotting::plot_insert_sizes;
@@ -135,29 +135,29 @@ pub struct HostFilterOutputs {
     pub pre_dedup_r2: Option<PathBuf>,
 }
 
-struct HostFilterCompletion {
-    outputs: HostFilterOutputs,
+pub(crate) struct HostFilterCompletion {
+    pub(crate) outputs: HostFilterOutputs,
 
-    val_count_task: JoinHandle<Result<ReadStats, anyhow::Error>>,
-    qc_count_result_rx: oneshot::Receiver<Result<u64, anyhow::Error>>,
-    ercc_count_rx: oneshot::Receiver<u64>,
+    pub(crate) val_count_task: JoinHandle<Result<ReadStats, anyhow::Error>>,
+    pub(crate) qc_count_result_rx: oneshot::Receiver<Result<u64, anyhow::Error>>,
+    pub(crate) ercc_count_rx: oneshot::Receiver<u64>,
 
-    ercc_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
-    host_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
-    optional_human_bam_write_handle: Option<JoinHandle<Result<()>>>,
+    pub(crate) ercc_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
+    pub(crate) host_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
+    pub(crate) optional_human_bam_write_handle: Option<JoinHandle<Result<()>>>,
 
-    host_bt2_count_rx: oneshot::Receiver<u64>,
+    pub(crate) host_bt2_count_rx: oneshot::Receiver<u64>,
 
-    ercc_bt2_bam_path: PathBuf,
-    host_hisat2_count_rx: oneshot::Receiver<u64>,
-    host_bt2_bam_path: PathBuf,
+    pub(crate) ercc_bt2_bam_path: PathBuf,
+    pub(crate) host_hisat2_count_rx: oneshot::Receiver<u64>,
+    pub(crate) host_bt2_bam_path: PathBuf,
 
-    kallisto_exit_task: JoinHandle<Result<(), anyhow::Error>>,
-    kallisto_ercc_tx: oneshot::Sender<KallistoResults>,
-    kallisto_ercc_rx: oneshot::Receiver<KallistoResults>,
+    pub(crate) kallisto_exit_task: JoinHandle<Result<(), anyhow::Error>>,
+    pub(crate) kallisto_ercc_tx: oneshot::Sender<KallistoResults>,
+    pub(crate) kallisto_ercc_rx: oneshot::Receiver<KallistoResults>,
 
-    dedup_count_rx: oneshot::Receiver<u64>,
-    subsample_count_rx: oneshot::Receiver<u64>,
+    pub(crate) dedup_count_rx: oneshot::Receiver<u64>,
+    pub(crate) subsample_count_rx: oneshot::Receiver<u64>,
 }
 
 /// Holds the results from a Kallisto quantification run.
@@ -9316,30 +9316,7 @@ async fn collect_m8_accession_map(
 }
 
 
-async fn write_count_file(
-    out_dir: &PathBuf,
-    filename: &str,
-    count: u64,
-) -> Result<(), PipelineError> {
-    let path = out_dir.join(filename);
-
-    tokio::fs::write(&path, format!("{}\n", count))
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "Failed to write count file {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-    info!("Wrote {}: {}", path.display(), count);
-
-    Ok(())
-}
-
-
-pub async fn run_host_filter(
+pub(crate) async fn run_host_filter(
     config: Arc<RunConfig>,
     cwd: &PathBuf,
     out_dir: &PathBuf,
