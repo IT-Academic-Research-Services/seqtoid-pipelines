@@ -1,6 +1,6 @@
 //! AMR Pipeline
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,15 +14,17 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType};
+use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType, SPADES_TAG};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
     HostFilterCompletion,
 };
-use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fastq, write_fasta_stream_to_file, SequenceRecord};
-use crate::utils::file::{resolve_existing_input_path, validate_file_inputs, write_count_file};
-use crate::utils::streams::{join_with_error_handling, ParseOutput};
+use crate::utils::command::spades::SpadesConfig;
+use crate::utils::command::generate_cli;
+use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
+use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file};
+use crate::utils::streams::{join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
@@ -52,6 +54,13 @@ struct RunRedupHandle {
 
     /// Completes after every per-end producer has reached EOF.
     /// Callers must install consumers for `redups_streams` before awaiting it.
+    completion_task: JoinHandle<Result<(), anyhow::Error>>,
+}
+
+#[derive(Debug)]
+struct RunSpadesHandle {
+    contigs_path: PathBuf,
+    scaffolds_path: PathBuf,
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
 }
 
@@ -232,6 +241,243 @@ async fn run_redup(
 
     Ok(RunRedupHandle {
         redups_streams: output_streams,
+        completion_task,
+    })
+}
+
+
+
+/// RunRedup produces live FASTA streams, but SPAdes inspects and reopens its
+/// read inputs during a run. Materializing the inputs is therefore a genuine
+/// external-tool boundary rather than a pipeline checkpoint. The per-end
+/// writers are installed before this function returns so RunRedup is never
+/// left blocked on an unconsumed bounded output.
+async fn run_spades_amr(
+    config: Arc<RunConfig>,
+    reduplicated_streams: Vec<ReceiverStream<ParseOutput>>,
+) -> Result<RunSpadesHandle, PipelineError> {
+    if reduplicated_streams.is_empty() || reduplicated_streams.len() > 2 {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunSpades expected one or two reduplicated FASTA streams, got {}",
+            reduplicated_streams.len()
+        )));
+    }
+
+    let input_temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        2,
+        false,
+    )
+        .await?;
+
+    let spades_out_dir = config.out_dir.join("spades");
+    let contigs_path = spades_out_dir.join("contigs.fasta");
+    let scaffolds_path = spades_out_dir.join("scaffolds.fasta");
+
+    let mut input_paths = Vec::with_capacity(reduplicated_streams.len());
+    let mut input_write_tasks = Vec::with_capacity(reduplicated_streams.len());
+
+    for (idx, stream) in reduplicated_streams.into_iter().enumerate() {
+        let path = input_temp_dir
+            .path()
+            .join(format!("redups_{}.fa", idx + 1));
+
+        input_write_tasks.push(write_fasta_stream_to_file(
+            stream,
+            path.clone(),
+            config.clone(),
+            StreamDataType::JustBytes,
+            &format!("AMR RunSpades input part {}", idx + 1),
+        ));
+        input_paths.push(path);
+    }
+
+    let completion_config = config.clone();
+    let completion_contigs = contigs_path.clone();
+    let completion_scaffolds = scaffolds_path.clone();
+
+    let completion_task = tokio::spawn(async move {
+        // Keep the scratch directory alive for the entire SPAdes invocation.
+        let _input_temp_dir = input_temp_dir;
+
+        for (idx, task) in input_write_tasks.into_iter().enumerate() {
+            task.await
+                .map_err(|e| anyhow!(
+                    "RunSpades input writer {} panicked: {}",
+                    idx + 1,
+                    e
+                ))??;
+        }
+
+        // A RunRedup/input-adapter failure is an upstream pipeline failure.
+        // From this point onward, match WDL RunSpades: assembly failures are
+        // non-fatal and produce compatibility marker files.
+        async fn write_failure_outputs(
+            contigs_path: &PathBuf,
+            scaffolds_path: &PathBuf,
+        ) -> Result<(), anyhow::Error> {
+            if let Some(parent) = contigs_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(contigs_path, b";ASSEMBLY FAILED\n").await?;
+            tokio::fs::write(scaffolds_path, b";ASSEMBLY FAILED\n").await?;
+            Ok(())
+        }
+
+        if spades_out_dir.exists() {
+            tokio::fs::remove_dir_all(&spades_out_dir).await?;
+        }
+
+        let mut options = HashMap::new();
+        options.insert("--only-assembler".to_string(), None);
+
+        let spades_config = SpadesConfig {
+            r1_path: input_paths[0].clone(),
+            r2_path_opt: input_paths.get(1).cloned(),
+            outdir_path: spades_out_dir.clone(),
+            tempdir_path: Some(_input_temp_dir.path().to_path_buf()),
+            option_fields: options,
+        };
+
+        let spades_args = match generate_cli(
+            SPADES_TAG,
+            &completion_config,
+            Some(&spades_config),
+        ) {
+            Ok(args) => args,
+            Err(e) => {
+                warn!("[AMR] RunSpades command generation failed (non-fatal): {}", e);
+                write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+                return Ok(());
+            }
+        };
+
+        info!("[AMR] RunSpades args: {:?}", spades_args);
+
+        let (mut child, stderr_task) = match spawn_cmd(
+            completion_config.clone(),
+            SPADES_TAG,
+            spades_args,
+            completion_config.args.verbose,
+            None,
+        )
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[AMR] RunSpades spawn failed (non-fatal): {}", e);
+                write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+                return Ok(());
+            }
+        };
+
+        // Drain stdout concurrently so a verbose SPAdes process cannot block on
+        // its pipe. Preserve it as a useful sidecar log.
+        let stdout_task = match parse_child_output(
+            &mut child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            &completion_config,
+        )
+            .await
+        {
+            Ok(stdout_rx) => Some(tokio::spawn(stream_to_file(
+                stdout_rx,
+                spades_out_dir.join("spades_stdout.log"),
+            ))),
+            Err(e) => {
+                warn!("[AMR] RunSpades stdout capture failed (non-fatal): {}", e);
+                None
+            }
+        };
+
+        let status = child.wait().await;
+        let stderr_result = stderr_task.await;
+        if let Some(task) = stdout_task {
+            let _ = task.await;
+        }
+
+        let spades_ok = matches!(status, Ok(ref s) if s.success())
+            && matches!(stderr_result, Ok(Ok(())));
+
+        if !spades_ok || !completion_contigs.is_file() {
+            warn!(
+                "[AMR] RunSpades assembly failed or contigs.fasta is missing; writing WDL-compatible marker"
+            );
+            write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+            return Ok(());
+        }
+
+        let metadata = tokio::fs::metadata(&completion_contigs).await?;
+        if metadata.len() == 0 {
+            warn!("[AMR] RunSpades produced empty contigs.fasta; writing failure marker");
+            write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+            return Ok(());
+        }
+
+        // Match `seqtk seq -L min_contig_length`: read the completed SPAdes
+        // FASTA and rewrite contigs.fasta with records at or above the configured
+        // minimum length. Use a separate path to avoid truncating the input.
+        let unfiltered_contigs = spades_out_dir.join("contigs_unfiltered.fasta");
+        if let Err(e) = tokio::fs::rename(&completion_contigs, &unfiltered_contigs).await {
+            warn!("[AMR] RunSpades could not stage contigs for filtering: {}", e);
+            write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+            return Ok(());
+        }
+
+        let filtered_rx = match read_fasta(
+            unfiltered_contigs.clone(),
+            u64::MAX,
+            Some(completion_config.args.min_contig_length),
+            None,
+            &completion_config,
+        ) {
+            Ok(rx) => rx,
+            Err(e) => {
+                warn!("[AMR] RunSpades contig filtering read failed: {}", e);
+                write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+                return Ok(());
+            }
+        };
+
+        let filter_write_task = write_fasta_stream_to_file(
+            ReceiverStream::new(filtered_rx),
+            completion_contigs.clone(),
+            completion_config.clone(),
+            StreamDataType::JustBytes,
+            "AMR RunSpades contig filtering",
+        );
+
+        match filter_write_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!("[AMR] RunSpades contig filtering write failed: {}", e);
+                write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("[AMR] RunSpades contig filtering writer panicked: {}", e);
+                write_failure_outputs(&completion_contigs, &completion_scaffolds).await?;
+                return Ok(());
+            }
+        }
+
+        let _ = tokio::fs::remove_file(unfiltered_contigs).await;
+
+        info!(
+            "[AMR] RunSpades complete: contigs={}, scaffolds={}",
+            completion_contigs.display(),
+            completion_scaffolds.display()
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok(RunSpadesHandle {
+        contigs_path,
+        scaffolds_path,
         completion_task,
     })
 }
@@ -421,19 +667,14 @@ pub async fn run(
             )
                 .await?;
 
-            // Current AMR staging terminates RunRedup at its WDL-equivalent files.
-            // These writers are installed immediately; downstream stages can later
-            // consume redup.redups_streams directly instead without changing RunRedup.
-            let mut redup_write_tasks = Vec::new();
-            for (idx, stream) in redup.redups_streams.into_iter().enumerate() {
-                redup_write_tasks.push(write_fasta_stream_to_file(
-                    stream,
-                    out_dir.join(format!("redups_{}.fa", idx + 1)),
-                    config.clone(),
-                    StreamDataType::JustBytes,
-                    &format!("AMR RunRedup part {}", idx + 1),
-                ));
-            }
+            // Raw WDL topology is RunRedupRaw -> RunSpades. Install the SPAdes
+            // adapter immediately so every bounded RunRedup output has a consumer
+            // before any host-filter completion work is awaited.
+            let spades = run_spades_amr(
+                config.clone(),
+                redup.redups_streams,
+            )
+                .await?;
             let redup_completion_task = redup.completion_task;
             // ------------------------------------------------------------
             // Drain validation / QC results.
@@ -810,11 +1051,16 @@ pub async fn run(
                 .map_err(|e| PipelineError::Other(anyhow!("RunRedup task panicked: {}", e)))?
                 .map_err(PipelineError::Other)?;
 
-            for task in redup_write_tasks {
-                task.await
-                    .map_err(|e| PipelineError::Other(anyhow!("RunRedup writer task panicked: {}", e)))?
-                    .map_err(PipelineError::Other)?;
-            }
+            spades.completion_task
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("RunSpades task panicked: {}", e)))?
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] raw contigs ready: {} (scaffolds: {})",
+                spades.contigs_path.display(),
+                spades.scaffolds_path.display()
+            );
 
             // ------------------------------------------------------------
             // Drain cleanup owned by the host-filter stage.
