@@ -228,7 +228,7 @@ pub struct Arguments {
 
     #[arg(long, default_value = "nt_info.tab")]
     pub nt_info_tab: Option<String>,
-    
+
     #[arg(long, default_value = "nt_split")]
     pub nt_split_dir: String,
 
@@ -287,5 +287,14 @@ pub struct Arguments {
     value_parser = ["raw", "filtered"]
     )]
     pub amr_input_mode: String,
+
+    #[arg(long = "amr-pre-dedup-file1", help = "Filtered AMR mode: host-filtered/pre-dedup R1 FASTQ used for duplicate re-expansion")]
+    pub amr_pre_dedup_file1: Option<String>,
+
+    #[arg(long = "amr-pre-dedup-file2", help = "Filtered AMR mode: optional host-filtered/pre-dedup R2 FASTQ used for duplicate re-expansion")]
+    pub amr_pre_dedup_file2: Option<String>,
+
+    #[arg(long = "amr-duplicate-clusters", help = "Filtered AMR mode: CZ ID clusters.csv mapping representative read id to read id")]
+    pub amr_duplicate_clusters: Option<String>,
 
 }

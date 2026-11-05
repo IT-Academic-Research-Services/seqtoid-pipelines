@@ -14,15 +14,16 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::config::defs::{ClusterInfo, PipelineError, RunConfig};
+use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
     HostFilterCompletion,
 };
-use crate::utils::fastx::SequenceRecord;
-use crate::utils::file::{validate_file_inputs, write_count_file};
+use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fastq, write_fasta_stream_to_file, SequenceRecord};
+use crate::utils::file::{resolve_existing_input_path, validate_file_inputs, write_count_file};
 use crate::utils::streams::{join_with_error_handling, ParseOutput};
+use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +238,46 @@ async fn run_redup(
 
 
 
+
+async fn fastq_file_to_record_stream(
+    path: PathBuf,
+    config: Arc<RunConfig>,
+    tag: &str,
+) -> Result<(ReceiverStream<ParseOutput>, JoinHandle<Result<(), anyhow::Error>>), PipelineError> {
+    let (byte_rx, read_task) = read_fastq(
+        path,
+        None,
+        PairingMode::Strict,
+        None,
+        u64::MAX,
+        None,
+        None,
+        tag,
+        &config,
+    )
+        .map_err(PipelineError::Other)?;
+
+    let (record_rx, parse_task) = parse_byte_stream_to_fastq(
+        byte_rx,
+        config.base_buffer_size,
+        config.args.stall_threshold,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let completion_task = tokio::spawn(async move {
+        read_task
+            .await
+            .map_err(|e| anyhow!("FASTQ file reader task panicked: {}", e))??;
+        parse_task
+            .await
+            .map_err(|e| anyhow!("FASTQ byte parser task panicked: {}", e))??;
+        Ok(())
+    });
+
+    Ok((ReceiverStream::new(record_rx), completion_task))
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -308,7 +349,7 @@ pub async fn run(
                 .await?;
 
             let HostFilterCompletion {
-                outputs,
+                mut outputs,
 
                 val_count_task,
                 qc_count_result_rx,
@@ -355,6 +396,45 @@ pub async fn run(
     outputs.pre_dedup_r2.is_some(),
     outputs.non_host_r2.is_some(),
 );
+
+            // Install RunRedup consumers immediately so every bounded host-filter
+            // output has a downstream reader before we await host-filter completion.
+            let mut pre_dedup_streams = vec![
+                outputs.pre_dedup_r1.take().ok_or_else(|| {
+                    PipelineError::Other(anyhow!("AMR raw RunRedup missing pre-dedup R1 stream"))
+                })?,
+            ];
+            if let Some(r2) = outputs.pre_dedup_r2.take() {
+                pre_dedup_streams.push(r2);
+            }
+
+            let mut subsampled_streams = vec![outputs.non_host_r1];
+            if let Some(r2) = outputs.non_host_r2 {
+                subsampled_streams.push(r2);
+            }
+
+            let redup = run_redup(
+                config.clone(),
+                pre_dedup_streams,
+                subsampled_streams,
+                outputs.duplicate_clusters,
+            )
+                .await?;
+
+            // Current AMR staging terminates RunRedup at its WDL-equivalent files.
+            // These writers are installed immediately; downstream stages can later
+            // consume redup.redups_streams directly instead without changing RunRedup.
+            let mut redup_write_tasks = Vec::new();
+            for (idx, stream) in redup.redups_streams.into_iter().enumerate() {
+                redup_write_tasks.push(write_fasta_stream_to_file(
+                    stream,
+                    out_dir.join(format!("redups_{}.fa", idx + 1)),
+                    config.clone(),
+                    StreamDataType::JustBytes,
+                    &format!("AMR RunRedup part {}", idx + 1),
+                ));
+            }
+            let redup_completion_task = redup.completion_task;
             // ------------------------------------------------------------
             // Drain validation / QC results.
             // ------------------------------------------------------------
@@ -725,6 +805,17 @@ pub async fn run(
             )
                 .await?;
 
+            redup_completion_task
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("RunRedup task panicked: {}", e)))?
+                .map_err(PipelineError::Other)?;
+
+            for task in redup_write_tasks {
+                task.await
+                    .map_err(|e| PipelineError::Other(anyhow!("RunRedup writer task panicked: {}", e)))?
+                    .map_err(PipelineError::Other)?;
+            }
+
             // ------------------------------------------------------------
             // Drain cleanup owned by the host-filter stage.
             // ------------------------------------------------------------
@@ -791,6 +882,101 @@ pub async fn run(
                 "[AMR] filtered input selected; \
                  skipping host filtering"
             );
+
+
+            let (file1_path, file2_path, _, _) =
+                validate_file_inputs(&config, &cwd, true).await?;
+
+            let pre_dedup_r1 = config
+                .args
+                .amr_pre_dedup_file1
+                .as_deref()
+                .ok_or_else(|| PipelineError::InvalidConfig(
+                    "--amr-pre-dedup-file1 is required for --amr-input-mode filtered".to_string(),
+                ))?;
+            let pre_dedup_r1 = resolve_existing_input_path(pre_dedup_r1, &cwd, true)?;
+
+            let pre_dedup_r2 = match config.args.amr_pre_dedup_file2.as_deref() {
+                Some(path) => Some(resolve_existing_input_path(path, &cwd, true)?),
+                None => None,
+            };
+
+            if file2_path.is_some() != pre_dedup_r2.is_some() {
+                return Err(PipelineError::InvalidConfig(
+                    "Filtered AMR RunRedup requires file2 and amr-pre-dedup-file2 to either both be present or both be absent".to_string(),
+                ));
+            }
+
+            let clusters_path = config
+                .args
+                .amr_duplicate_clusters
+                .as_deref()
+                .ok_or_else(|| PipelineError::InvalidConfig(
+                    "--amr-duplicate-clusters is required for --amr-input-mode filtered".to_string(),
+                ))?;
+            let clusters_path = resolve_existing_input_path(clusters_path, &cwd, true)?;
+
+            let mut input_tasks = Vec::new();
+
+            let (subsampled_r1, task) =
+                fastq_file_to_record_stream(file1_path, config.clone(), "amr_filtered_subsampled_r1").await?;
+            input_tasks.push(task);
+            let mut subsampled_streams = vec![subsampled_r1];
+
+            if let Some(path) = file2_path {
+                let (stream, task) =
+                    fastq_file_to_record_stream(path, config.clone(), "amr_filtered_subsampled_r2").await?;
+                subsampled_streams.push(stream);
+                input_tasks.push(task);
+            }
+
+            let (pre_r1, task) =
+                fastq_file_to_record_stream(pre_dedup_r1, config.clone(), "amr_filtered_pre_dedup_r1").await?;
+            input_tasks.push(task);
+            let mut pre_dedup_streams = vec![pre_r1];
+
+            if let Some(path) = pre_dedup_r2 {
+                let (stream, task) =
+                    fastq_file_to_record_stream(path, config.clone(), "amr_filtered_pre_dedup_r2").await?;
+                pre_dedup_streams.push(stream);
+                input_tasks.push(task);
+            }
+
+            let redup = run_redup(
+                config.clone(),
+                pre_dedup_streams,
+                subsampled_streams,
+                load_duplicate_clusters_csv(clusters_path),
+            )
+                .await?;
+
+            let mut redup_write_tasks = Vec::new();
+            for (idx, stream) in redup.redups_streams.into_iter().enumerate() {
+                redup_write_tasks.push(write_fasta_stream_to_file(
+                    stream,
+                    out_dir.join(format!("redups_{}.fa", idx + 1)),
+                    config.clone(),
+                    StreamDataType::JustBytes,
+                    &format!("AMR filtered RunRedup part {}", idx + 1),
+                ));
+            }
+
+            redup.completion_task
+                .await
+                .map_err(|e| PipelineError::Other(anyhow!("Filtered RunRedup task panicked: {}", e)))?
+                .map_err(PipelineError::Other)?;
+
+            for task in input_tasks {
+                task.await
+                    .map_err(|e| PipelineError::Other(anyhow!("Filtered FASTQ adapter task panicked: {}", e)))?
+                    .map_err(PipelineError::Other)?;
+            }
+
+            for task in redup_write_tasks {
+                task.await
+                    .map_err(|e| PipelineError::Other(anyhow!("Filtered RunRedup writer task panicked: {}", e)))?
+                    .map_err(PipelineError::Other)?;
+            }
         }
     }
 
