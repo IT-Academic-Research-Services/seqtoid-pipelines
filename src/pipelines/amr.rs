@@ -348,43 +348,26 @@ pub async fn run(
             // ------------------------------------------------------------
             // Acknowledge AMR preprocessing outputs.
             // ------------------------------------------------------------
-
-            let pre_dedup_r1 =
-                outputs
-                    .pre_dedup_r1
-                    .as_ref()
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                            "AMR requested pre-dedup retention \
-                             but R1 was not returned"
-                        ))
-                    })?;
+            if outputs.pre_dedup_r1.is_none() {
+                return Err(PipelineError::Other(anyhow!(
+        "AMR requested pre-dedup stream but R1 was not returned"
+    )));
+            }
 
             if paired && outputs.pre_dedup_r2.is_none() {
                 return Err(PipelineError::Other(anyhow!(
-                    "AMR paired-end run requested pre-dedup \
-                     retention but R2 was not returned"
-                )));
+        "AMR paired-end run requested pre-dedup stream but R2 was not returned"
+    )));
             }
 
             info!(
-                "[AMR] host-filter outputs ready: \
-                 pre_dedup_r1={}, pre_dedup_r2={:?}, \
-                 non_host_r1={}, non_host_r2={:?}, \
-                 duplicate_clusters={}",
-                pre_dedup_r1.display(),
-                outputs
-                    .pre_dedup_r2
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
-                outputs.non_host_r1.display(),
-                outputs
-                    .non_host_r2
-                    .as_ref()
-                    .map(|p| p.display().to_string()),
-                outputs.duplicate_clusters.len(),
-            );
-
+    "[AMR] host-filter streaming outputs ready: \
+     pre_dedup_r1=true, pre_dedup_r2={}, \
+     non_host_r1=true, non_host_r2={}, \
+     duplicate_clusters=pending",
+    outputs.pre_dedup_r2.is_some(),
+    outputs.non_host_r2.is_some(),
+);
             // ------------------------------------------------------------
             // Drain validation / QC results.
             // ------------------------------------------------------------
