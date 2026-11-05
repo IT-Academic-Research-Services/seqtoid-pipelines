@@ -9339,7 +9339,7 @@ async fn write_count_file(
 }
 
 
-async fn run_host_filter(
+pub async fn run_host_filter(
     config: Arc<RunConfig>,
     cwd: &PathBuf,
     out_dir: &PathBuf,
