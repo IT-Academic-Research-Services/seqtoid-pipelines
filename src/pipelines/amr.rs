@@ -37,6 +37,13 @@ impl AmrInputMode {
     }
 }
 
+async fn run_redup() -> Result<(), PipelineError> {
+    info!("[AMR] RunRedup placeholder reached.");
+    info!("[AMR] RunRedup implementation deferred.");
+
+    Ok(())
+}
+
 
 pub async fn run(
     config: Arc<RunConfig>,
@@ -611,6 +618,8 @@ pub async fn run(
             );
         }
     }
+
+
 
     info!(
         "Finished AMR host-filter staging."
