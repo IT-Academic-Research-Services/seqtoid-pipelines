@@ -1,21 +1,30 @@
 //! AMR Pipeline
 
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use log::{error, info, warn};
 use tempfile::TempDir;
-use tokio::sync::oneshot;
+use bytes::Bytes;
+use dashmap::DashMap;
+use tokio::fs::File as TokioFile;
+use tokio::io::BufReader;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
-use crate::config::defs::{PipelineError, RunConfig};
+use crate::config::defs::{ClusterInfo, PipelineError, RunConfig, StreamDataType};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
     HostFilterCompletion,
 };
+use crate::utils::fastx::SequenceRecord;
 use crate::utils::file::{validate_file_inputs, write_count_file};
-use crate::utils::streams::join_with_error_handling;
+use crate::utils::streams::{join_with_error_handling, parse_fastq, ParseOutput};
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +46,207 @@ impl AmrInputMode {
     }
 }
 
-async fn run_redup() -> Result<(), PipelineError> {
-    info!("[AMR] RunRedup placeholder reached.");
-    info!("[AMR] RunRedup implementation deferred.");
+struct RunRedupHandle {
+    /// One live FASTA stream per input end, in WDL `redups_1.fa`,
+    /// `redups_2.fa` order.
+    redups_streams: Vec<ReceiverStream<ParseOutput>>,
 
-    Ok(())
+    /// Completes after every per-end producer has reached EOF.
+    /// Callers must install consumers for `redups_streams` before awaiting it.
+    completion_task: JoinHandle<Result<(), anyhow::Error>>,
+}
+
+/// Native streaming equivalent of the WDL RunRedup task.
+///
+/// WDL semantics:
+///   1. `subsampled_reads` form the prefix of each `redups_N.fa`.
+///   2. Only a duplicate cluster whose representative survived subsampling is
+///      eligible for re-expansion.
+///   3. The representative itself is already present in the subsampled FASTA;
+///      append only its non-representative cluster members.
+///   4. Appended records are selected from the corresponding host-filtered,
+///      pre-dedup FASTQ and converted to FASTA.
+///
+/// Rust keeps the cluster relationship in memory, so the WDL-only
+/// `cluster_sizes` / `clusters.csv` parsing and temporary ID files are not
+/// reproduced here.
+async fn run_redup(
+    config: Arc<RunConfig>,
+    host_filtered_reads: Vec<PathBuf>,
+    subsampled_reads: Vec<PathBuf>,
+    duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
+) -> Result<RunRedupHandle, PipelineError> {
+    if host_filtered_reads.is_empty() || host_filtered_reads.len() > 2 {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRedup expected one or two host-filtered read files, got {}",
+            host_filtered_reads.len()
+        )));
+    }
+
+    if host_filtered_reads.len() != subsampled_reads.len() {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRedup input cardinality mismatch: host_filtered_reads={}, subsampled_reads={}",
+            host_filtered_reads.len(),
+            subsampled_reads.len()
+        )));
+    }
+
+    let mut output_streams = Vec::with_capacity(subsampled_reads.len());
+    let mut producer_tasks = Vec::with_capacity(subsampled_reads.len());
+
+    for (part_index, (host_filtered_path, subsampled_path)) in host_filtered_reads
+        .into_iter()
+        .zip(subsampled_reads.into_iter())
+        .enumerate()
+    {
+        let (tx, rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+        output_streams.push(ReceiverStream::new(rx));
+
+        let config_for_task = config.clone();
+        let clusters = duplicate_clusters.clone();
+        let task = tokio::spawn(async move {
+            // -------------------------------------------------------------
+            // Prefix: subsampled FASTQ -> FASTA, preserving file order.
+            // -------------------------------------------------------------
+            let subsampled_file = TokioFile::open(&subsampled_path)
+                .await
+                .map_err(|e| anyhow!(
+                    "RunRedup failed to open subsampled input {}: {}",
+                    subsampled_path.display(), e
+                ))?;
+
+            let subsampled_rx = parse_fastq(
+                BufReader::new(subsampled_file),
+                &config_for_task,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|e| anyhow!(
+                "RunRedup failed to parse subsampled input {}: {}",
+                subsampled_path.display(), e
+            ))?;
+
+            let mut subsampled_stream = ReceiverStream::new(subsampled_rx);
+            let mut passed_representatives = HashSet::<String>::new();
+
+            while let Some(item) = subsampled_stream.next().await {
+                let ParseOutput::Fastq(record) = item else {
+                    return Err(anyhow!(
+                        "RunRedup expected parsed FASTQ from {}",
+                        subsampled_path.display()
+                    ));
+                };
+
+                passed_representatives.insert(record.id().to_string());
+
+                let fasta = SequenceRecord::Fasta {
+                    id: record.id().to_string(),
+                    desc: None,
+                    seq: record.seq(),
+                };
+
+                tx.send(ParseOutput::Fasta(fasta))
+                    .await
+                    .map_err(|_| anyhow!(
+                        "RunRedup downstream receiver dropped for part {}",
+                        part_index + 1
+                    ))?;
+            }
+
+            // WDL builds one passed_filters set across all ends. For strict
+            // paired-end data both ends carry the same read IDs, so the per-end
+            // set is equivalent and avoids coupling the bounded output streams
+            // behind a cross-stream barrier.
+            let mut duplicate_member_ids = HashSet::<String>::new();
+
+            for entry in clusters.iter() {
+                let rep_id = entry.key();
+                let info = entry.value();
+
+                if info.size <= 1 || !passed_representatives.contains(rep_id.as_str()) {
+                    continue;
+                }
+
+                for member_id in &info.members {
+                    if member_id != rep_id {
+                        duplicate_member_ids.insert(member_id.clone());
+                    }
+                }
+            }
+
+            if duplicate_member_ids.is_empty() {
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            // -------------------------------------------------------------
+            // Suffix: scan this pre-dedup host-filtered end in its original
+            // order, select duplicate members, and convert them to FASTA.
+            // This matches `seqkit grep ... | seqkit fq2fa` ordering.
+            // -------------------------------------------------------------
+            let host_file = TokioFile::open(&host_filtered_path)
+                .await
+                .map_err(|e| anyhow!(
+                    "RunRedup failed to open host-filtered input {}: {}",
+                    host_filtered_path.display(), e
+                ))?;
+
+            let host_rx = parse_fastq(
+                BufReader::new(host_file),
+                &config_for_task,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|e| anyhow!(
+                "RunRedup failed to parse host-filtered input {}: {}",
+                host_filtered_path.display(), e
+            ))?;
+
+            let mut host_stream = ReceiverStream::new(host_rx);
+
+            while let Some(item) = host_stream.next().await {
+                let ParseOutput::Fastq(record) = item else {
+                    return Err(anyhow!(
+                        "RunRedup expected parsed FASTQ from {}",
+                        host_filtered_path.display()
+                    ));
+                };
+
+                if !duplicate_member_ids.contains(record.id()) {
+                    continue;
+                }
+
+                let fasta = SequenceRecord::Fasta {
+                    id: record.id().to_string(),
+                    desc: None,
+                    seq: record.seq(),
+                };
+
+                tx.send(ParseOutput::Fasta(fasta))
+                    .await
+                    .map_err(|_| anyhow!(
+                        "RunRedup downstream receiver dropped for part {}",
+                        part_index + 1
+                    ))?;
+            }
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        producer_tasks.push(task);
+    }
+
+    let completion_task = tokio::spawn(async move {
+        for task in producer_tasks {
+            task.await
+                .map_err(|e| anyhow!("RunRedup producer task panicked: {}", e))??;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok(RunRedupHandle {
+        redups_streams: output_streams,
+        completion_task,
+    })
 }
 
 
