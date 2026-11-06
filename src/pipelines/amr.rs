@@ -24,7 +24,7 @@ use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file};
-use crate::utils::streams::{join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
+use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
@@ -57,13 +57,6 @@ struct RunRedupHandle {
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
 }
 
-#[derive(Debug)]
-struct RunSpadesHandle {
-    contigs_path: PathBuf,
-    scaffolds_path: PathBuf,
-    completion_task: JoinHandle<Result<(), anyhow::Error>>,
-}
-
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -81,44 +74,32 @@ struct RunSpadesHandle {
 async fn run_redup(
     config: Arc<RunConfig>,
     host_filtered_streams: Vec<ReceiverStream<ParseOutput>>,
-    subsampled_streams: Vec<ReceiverStream<ParseOutput>>,
+    mut subsampled_stream: ReceiverStream<ParseOutput>,
+    paired: bool,
     duplicate_clusters_task: JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>>,
 ) -> Result<RunRedupHandle, PipelineError> {
-    if host_filtered_streams.is_empty() || host_filtered_streams.len() > 2 {
+    let expected_parts = if paired { 2 } else { 1 };
+    if host_filtered_streams.len() != expected_parts {
         return Err(PipelineError::InvalidConfig(format!(
-            "RunRedup expected one or two host-filtered streams, got {}",
+            "RunRedup expected {} host-filtered stream(s), got {}",
+            expected_parts,
             host_filtered_streams.len()
         )));
     }
 
-    if host_filtered_streams.len() != subsampled_streams.len() {
-        return Err(PipelineError::InvalidConfig(format!(
-            "RunRedup input cardinality mismatch: host_filtered_streams={}, subsampled_streams={}",
-            host_filtered_streams.len(),
-            subsampled_streams.len()
-        )));
-    }
+    let mut output_streams = Vec::with_capacity(expected_parts);
+    let mut output_txs = Vec::with_capacity(expected_parts);
+    let mut host_buffer_tasks = Vec::with_capacity(expected_parts);
 
-    let part_count = subsampled_streams.len();
-    let mut output_streams = Vec::with_capacity(part_count);
-    let mut prefix_tasks = Vec::with_capacity(part_count);
-    let mut host_buffer_tasks = Vec::with_capacity(part_count);
-
-    for (part_index, (mut host_stream, mut subsampled_stream)) in host_filtered_streams
-        .into_iter()
-        .zip(subsampled_streams.into_iter())
-        .enumerate()
-    {
+    for (part_index, mut host_stream) in host_filtered_streams.into_iter().enumerate() {
         let (tx, rx) = mpsc::channel::<ParseOutput>(config.base_buffer_size);
+        output_txs.push(tx);
         output_streams.push(ReceiverStream::new(rx));
 
-        // Drain the pre-dedup stream immediately. It is upstream of dedup and
-        // therefore cannot be left unread while we wait for subsampling or the
-        // final cluster map. Preserve stream order so the later duplicate suffix
-        // matches `seqkit grep ... | seqkit fq2fa`.
-        let host_buffer_task = tokio::spawn(async move {
+        // Drain the pre-dedup per-end stream immediately. It is upstream of
+        // dedup and cannot be left unread while subsampling/finalization runs.
+        host_buffer_tasks.push(tokio::spawn(async move {
             let mut records = Vec::<SequenceRecord>::new();
-
             while let Some(item) = host_stream.next().await {
                 let ParseOutput::Fastq(record) = item else {
                     return Err(anyhow!(
@@ -126,70 +107,68 @@ async fn run_redup(
                         part_index + 1
                     ));
                 };
-
                 records.push(record);
             }
-
             Ok::<Vec<SequenceRecord>, anyhow::Error>(records)
-        });
-        host_buffer_tasks.push(host_buffer_task);
-
-        // The WDL output begins with the complete subsampled input. Forward it
-        // immediately as FASTA while recording which representatives survived
-        // subsampling. The sender is returned so the coordinator can append the
-        // duplicate suffix after the cluster map becomes available.
-        let prefix_task = tokio::spawn(async move {
-            let mut passed_representatives = HashSet::<String>::new();
-
-            while let Some(item) = subsampled_stream.next().await {
-                let ParseOutput::Fastq(record) = item else {
-                    return Err(anyhow!(
-                        "RunRedup expected FASTQ on subsampled stream for part {}",
-                        part_index + 1
-                    ));
-                };
-
-                passed_representatives.insert(record.id().to_string());
-
-                let fasta = SequenceRecord::Fasta {
-                    id: record.id().to_string(),
-                    desc: None,
-                    seq: record.seq(),
-                };
-
-                tx.send(ParseOutput::Fasta(fasta))
-                    .await
-                    .map_err(|_| anyhow!(
-                        "RunRedup downstream receiver dropped for part {}",
-                        part_index + 1
-                    ))?;
-            }
-
-            Ok::<_, anyhow::Error>((passed_representatives, tx))
-        });
-        prefix_tasks.push(prefix_task);
+        }));
     }
 
+    // Consume the structured interleaved post-subsample stream directly.
+    // In paired mode dedup/subsampling guarantees R1,R2,R1,R2 ordering.
+    let prefix_task = tokio::spawn(async move {
+        let mut passed_representatives = vec![HashSet::<String>::new(); expected_parts];
+        let mut record_index = 0usize;
+
+        while let Some(item) = subsampled_stream.next().await {
+            let ParseOutput::Fastq(record) = item else {
+                return Err(anyhow!("RunRedup expected FASTQ on interleaved subsampled stream"));
+            };
+
+            let part_index = if paired { record_index % 2 } else { 0 };
+            passed_representatives[part_index].insert(record.id().to_string());
+
+            let fasta = SequenceRecord::Fasta {
+                id: record.id().to_string(),
+                desc: None,
+                seq: record.seq(),
+            };
+
+            output_txs[part_index]
+                .send(ParseOutput::Fasta(fasta))
+                .await
+                .map_err(|_| anyhow!(
+                    "RunRedup downstream receiver dropped for part {}",
+                    part_index + 1
+                ))?;
+
+            record_index += 1;
+        }
+
+        if paired && record_index % 2 != 0 {
+            return Err(anyhow!(
+                "RunRedup received incomplete paired subsampled stream: {} records",
+                record_index
+            ));
+        }
+
+        Ok::<_, anyhow::Error>((passed_representatives, output_txs))
+    });
+
     let completion_task = tokio::spawn(async move {
-        // Every live input already has a consumer installed above, so it is now
-        // safe to await dedup finalization.
+        // Every live input already has a consumer installed above.
         let duplicate_clusters = duplicate_clusters_task
             .await
             .map_err(|e| anyhow!("RunRedup duplicate-cluster task panicked: {}", e))??;
 
-        for (part_index, (prefix_task, host_buffer_task)) in prefix_tasks
+        let (passed_representatives, output_txs) = prefix_task
+            .await
+            .map_err(|e| anyhow!("RunRedup prefix task panicked: {}", e))??;
+
+        for (part_index, (host_buffer_task, tx)) in host_buffer_tasks
             .into_iter()
-            .zip(host_buffer_tasks.into_iter())
+            .zip(output_txs.into_iter())
             .enumerate()
         {
-            let (passed_representatives, tx) = prefix_task
-                .await
-                .map_err(|e| anyhow!(
-                    "RunRedup prefix task for part {} panicked: {}",
-                    part_index + 1,
-                    e
-                ))??;
-
             let host_records = host_buffer_task
                 .await
                 .map_err(|e| anyhow!(
@@ -199,12 +178,13 @@ async fn run_redup(
                 ))??;
 
             let mut duplicate_member_ids = HashSet::<String>::new();
-
             for entry in duplicate_clusters.iter() {
                 let rep_id = entry.key();
                 let info = entry.value();
 
-                if info.size <= 1 || !passed_representatives.contains(rep_id.as_str()) {
+                if info.size <= 1
+                    || !passed_representatives[part_index].contains(rep_id.as_str())
+                {
                     continue;
                 }
 
@@ -215,7 +195,7 @@ async fn run_redup(
                 }
             }
 
-            // Append selected pre-dedup records in their original stream order.
+            // Append selected pre-dedup records in original per-end order.
             for record in host_records {
                 if !duplicate_member_ids.contains(record.id()) {
                     continue;
@@ -245,8 +225,15 @@ async fn run_redup(
     })
 }
 
+#[derive(Debug)]
+struct RunSpadesHandle {
+    contigs_path: PathBuf,
+    scaffolds_path: PathBuf,
+    completion_task: JoinHandle<Result<(), anyhow::Error>>,
+}
 
-
+/// Native AMR equivalent of the WDL RunSpades task.
+///
 /// RunRedup produces live FASTA streams, but SPAdes inspects and reopens its
 /// read inputs during a run. Materializing the inputs is therefore a genuine
 /// external-tool boundary rather than a pipeline checkpoint. The per-end
@@ -588,6 +575,7 @@ pub async fn run(
                 &sample_base_buf,
                 paired,
                 true,
+                true,
                 &mut final_temp_dirs,
                 &mut cleanup_tasks,
                 &mut cleanup_receivers,
@@ -654,15 +642,36 @@ pub async fn run(
                 pre_dedup_streams.push(r2);
             }
 
-            let mut subsampled_streams = vec![outputs.non_host_r1];
-            if let Some(r2) = outputs.non_host_r2 {
-                subsampled_streams.push(r2);
+            // RunRedup consumes the structured interleaved post-subsample branch
+            // retained before the existing short-read deinterleave boundary.
+            let subsampled_stream = outputs.subsampled_interleaved.take().ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+                    "AMR raw RunRedup missing retained interleaved subsampled stream"
+                ))
+            })?;
+
+            // The existing short-read branch is still one side of the bounded
+            // fanout, so AMR must drain it even though it is not computational
+            // input. Do not drop these receivers: fanout_to_channels treats a
+            // closed branch as an error while upstream is still producing.
+            let mut unused_non_host_r1 = outputs.non_host_r1;
+            cleanup_tasks.push(tokio::spawn(async move {
+                while unused_non_host_r1.next().await.is_some() {}
+                Ok::<(), anyhow::Error>(())
+            }));
+
+            if let Some(mut unused_non_host_r2) = outputs.non_host_r2.take() {
+                cleanup_tasks.push(tokio::spawn(async move {
+                    while unused_non_host_r2.next().await.is_some() {}
+                    Ok::<(), anyhow::Error>(())
+                }));
             }
 
             let redup = run_redup(
                 config.clone(),
                 pre_dedup_streams,
-                subsampled_streams,
+                subsampled_stream,
+                paired,
                 outputs.duplicate_clusters,
             )
                 .await?;
@@ -1133,6 +1142,8 @@ pub async fn run(
             let (file1_path, file2_path, _, _) =
                 validate_file_inputs(&config, &cwd, true).await?;
 
+            let paired = file2_path.is_some();
+
             let pre_dedup_r1 = config
                 .args
                 .amr_pre_dedup_file1
@@ -1167,14 +1178,23 @@ pub async fn run(
             let (subsampled_r1, task) =
                 fastq_file_to_record_stream(file1_path, config.clone(), "amr_filtered_subsampled_r1").await?;
             input_tasks.push(task);
-            let mut subsampled_streams = vec![subsampled_r1];
 
-            if let Some(path) = file2_path {
-                let (stream, task) =
+            let subsampled_stream = if let Some(path) = file2_path {
+                let (subsampled_r2, task) =
                     fastq_file_to_record_stream(path, config.clone(), "amr_filtered_subsampled_r2").await?;
-                subsampled_streams.push(stream);
                 input_tasks.push(task);
-            }
+
+                let (interleaved_rx, interleave_task) = interleave_fastq_streams(
+                    subsampled_r1.into_inner(),
+                    subsampled_r2.into_inner(),
+                    config.base_buffer_size * 4,
+                )
+                    .await?;
+                input_tasks.push(interleave_task);
+                ReceiverStream::new(interleaved_rx)
+            } else {
+                subsampled_r1
+            };
 
             let (pre_r1, task) =
                 fastq_file_to_record_stream(pre_dedup_r1, config.clone(), "amr_filtered_pre_dedup_r1").await?;
@@ -1191,7 +1211,8 @@ pub async fn run(
             let redup = run_redup(
                 config.clone(),
                 pre_dedup_streams,
-                subsampled_streams,
+                subsampled_stream,
+                paired,
                 load_duplicate_clusters_csv(clusters_path),
             )
                 .await?;

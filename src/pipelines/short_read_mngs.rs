@@ -132,6 +132,10 @@ pub struct HostFilterOutputs {
     pub non_host_r1: ReceiverStream<ParseOutput>,
     pub non_host_r2: Option<ReceiverStream<ParseOutput>>,
 
+    /// Optional live interleaved subsampled FASTQ stream retained before the
+    /// existing short-read deinterleave/serialization boundary.
+    pub subsampled_interleaved: Option<ReceiverStream<ParseOutput>>,
+
     /// Completes after dedup reaches EOF and returns the complete cluster map.
     /// Consumers of the FASTQ streams must be installed before awaiting this.
     pub duplicate_clusters: JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>>,
@@ -9332,6 +9336,7 @@ pub(crate) async fn run_host_filter(
     sample_base_buf: &PathBuf,
     paired: bool,
     retain_pre_dedup: bool,
+    retain_subsampled_interleaved: bool,
     final_temp_dirs: &mut Vec<TempDir>,
     cleanup_tasks: &mut Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
     cleanup_receivers: &mut Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
@@ -9678,12 +9683,41 @@ pub(crate) async fn run_host_filter(
 
 
 
-    // Expose the subsampled non-host data as live deinterleaved streams.
-    // File checkpointing belongs to the caller (short-read mNGS needs it for
-    // distributed/scatter-gather execution; AMR does not necessarily need it).
+    // Optionally retain the structured interleaved post-subsample stream for
+    // AMR before the existing short-read deinterleave/serialization boundary.
+    // The normal short-read branch remains unchanged.
+    let (subsampled_for_short_read, subsampled_interleaved) =
+        if retain_subsampled_interleaved {
+            let (subsampled_streams, subsampled_router_done_rx) = fanout_to_channels(
+                subsampled_stream,
+                2,
+                "subsampled_output",
+                &config,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
+
+            cleanup_receivers.push(subsampled_router_done_rx);
+
+            let mut subsampled_streams = subsampled_streams.into_iter();
+            let short_read_stream = ReceiverStream::new(
+                subsampled_streams.next().ok_or(PipelineError::EmptyStream)?,
+            );
+            let amr_stream = ReceiverStream::new(
+                subsampled_streams.next().ok_or(PipelineError::EmptyStream)?,
+            );
+
+            (short_read_stream, Some(amr_stream))
+        } else {
+            (subsampled_stream, None)
+        };
+
+    // Existing short-read boundary: expose deinterleaved serialized FASTQ
+    // streams for checkpointing/distributed alignment. Do not change this path.
     let (non_host_r1_rx, non_host_r2_rx_opt, non_host_deinterleave_handle) =
         deinterleave_fastq_stream(
-            subsampled_stream,
+            subsampled_for_short_read,
             paired,
             config.base_buffer_size * 4,
         )
@@ -9708,6 +9742,7 @@ pub(crate) async fn run_host_filter(
     let outputs = HostFilterOutputs {
         non_host_r1,
         non_host_r2,
+        subsampled_interleaved,
         duplicate_clusters: dedup_finalize_task,
         pre_dedup_r1,
         pre_dedup_r2,
@@ -9852,6 +9887,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         &sample_base_buf,
         paired,
         true,
+        false,
         &mut final_temp_dirs,
         &mut cleanup_tasks,
         &mut cleanup_receivers,
@@ -9880,6 +9916,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
     let HostFilterOutputs {
         non_host_r1,
         non_host_r2,
+        subsampled_interleaved: _,
         duplicate_clusters: duplicate_clusters_task,
         pre_dedup_r1,
         pre_dedup_r2,
