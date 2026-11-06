@@ -372,7 +372,7 @@ async fn run_spades_amr(
         {
             Ok(stdout_rx) => Some(tokio::spawn(stream_to_file(
                 stdout_rx,
-                spades_out_dir.join("spades_stdout.log"),
+                completion_config.out_dir.join("amr_spades_stdout.log"),
             ))),
             Err(e) => {
                 warn!("[AMR] RunSpades stdout capture failed (non-fatal): {}", e);
