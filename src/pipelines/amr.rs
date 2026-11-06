@@ -24,7 +24,7 @@ use crate::pipelines::short_read_mngs::{
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
-use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file};
+use crate::utils::file::{resolve_existing_input_path, validate_file_inputs, write_count_file};
 use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
@@ -46,6 +46,14 @@ impl AmrInputMode {
             ))),
         }
     }
+}
+
+#[derive(Debug)]
+struct AmrPreparedInputs {
+    /// WDL-equivalent `non_host_reads_fa`: durable RunRedup FASTA files.
+    non_host_reads_fa: Vec<PathBuf>,
+    /// WDL-equivalent `contigs_fa`: raw SPAdes contigs or filtered-sample contigs.
+    contigs_fa: PathBuf,
 }
 
 struct RunRedupHandle {
@@ -276,70 +284,35 @@ struct RunSpadesHandle {
 
 /// Native AMR equivalent of the WDL RunSpades task.
 ///
-/// RunRedup produces live FASTA streams, but SPAdes inspects and reopens its
-/// read inputs during a run. Materializing the inputs is therefore a genuine
-/// external-tool boundary rather than a pipeline checkpoint. The per-end
-/// writers are installed before this function returns so RunRedup is never
-/// left blocked on an unconsumed bounded output.
+/// The RunRedup streams have already been materialized at the AMR external-tool
+/// boundary. SPAdes consumes those durable files, which are also retained as the
+/// downstream `non_host_reads_fa` inputs.
 async fn run_spades_amr(
     config: Arc<RunConfig>,
-    reduplicated_streams: Vec<ReceiverStream<ParseOutput>>,
+    input_paths: Vec<PathBuf>,
 ) -> Result<RunSpadesHandle, PipelineError> {
-    if reduplicated_streams.is_empty() || reduplicated_streams.len() > 2 {
+    if input_paths.is_empty() || input_paths.len() > 2 {
         return Err(PipelineError::InvalidConfig(format!(
-            "RunSpades expected one or two reduplicated FASTA streams, got {}",
-            reduplicated_streams.len()
+            "RunSpades expected one or two reduplicated FASTA files, got {}",
+            input_paths.len()
         )));
     }
 
-    let input_temp_dir = choose_temp_dir(
-        config.input_size,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        2,
-        false,
-    )
-        .await?;
+    for path in &input_paths {
+        if !path.is_file() {
+            return Err(PipelineError::FileNotFound(path.clone()));
+        }
+    }
 
     let spades_out_dir = config.out_dir.join("spades");
     let contigs_path = spades_out_dir.join("contigs.fasta");
     let scaffolds_path = spades_out_dir.join("scaffolds.fasta");
-
-    let mut input_paths = Vec::with_capacity(reduplicated_streams.len());
-    let mut input_write_tasks = Vec::with_capacity(reduplicated_streams.len());
-
-    for (idx, stream) in reduplicated_streams.into_iter().enumerate() {
-        let path = input_temp_dir
-            .path()
-            .join(format!("redups_{}.fa", idx + 1));
-
-        input_write_tasks.push(write_fasta_stream_to_file(
-            stream,
-            path.clone(),
-            config.clone(),
-            StreamDataType::JustBytes,
-            &format!("AMR RunSpades input part {}", idx + 1),
-        ));
-        input_paths.push(path);
-    }
 
     let completion_config = config.clone();
     let completion_contigs = contigs_path.clone();
     let completion_scaffolds = scaffolds_path.clone();
 
     let completion_task = tokio::spawn(async move {
-        // Keep the scratch directory alive for the entire SPAdes invocation.
-        let _input_temp_dir = input_temp_dir;
-
-        for (idx, task) in input_write_tasks.into_iter().enumerate() {
-            task.await
-                .map_err(|e| anyhow!(
-                    "RunSpades input writer {} panicked: {}",
-                    idx + 1,
-                    e
-                ))??;
-        }
-
         // A RunRedup/input-adapter failure is an upstream pipeline failure.
         // From this point onward, match WDL RunSpades: assembly failures are
         // non-fatal and produce compatibility marker files.
@@ -366,7 +339,7 @@ async fn run_spades_amr(
             r1_path: input_paths[0].clone(),
             r2_path_opt: input_paths.get(1).cloned(),
             outdir_path: spades_out_dir.clone(),
-            tempdir_path: Some(_input_temp_dir.path().to_path_buf()),
+            tempdir_path: None,
             option_fields: options,
         };
 
@@ -514,6 +487,37 @@ async fn run_spades_amr(
 
 
 
+async fn materialize_redups(
+    config: Arc<RunConfig>,
+    reduplicated_streams: Vec<ReceiverStream<ParseOutput>>,
+    out_dir: &PathBuf,
+    tag: &str,
+) -> Result<(Vec<PathBuf>, Vec<JoinHandle<Result<(), anyhow::Error>>>), PipelineError> {
+    if reduplicated_streams.is_empty() || reduplicated_streams.len() > 2 {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRedup expected one or two output streams, got {}",
+            reduplicated_streams.len()
+        )));
+    }
+
+    let mut paths = Vec::with_capacity(reduplicated_streams.len());
+    let mut tasks = Vec::with_capacity(reduplicated_streams.len());
+
+    for (idx, stream) in reduplicated_streams.into_iter().enumerate() {
+        let path = out_dir.join(format!("redups_{}.fa", idx + 1));
+        tasks.push(write_fasta_stream_to_file(
+            stream,
+            path.clone(),
+            config.clone(),
+            StreamDataType::JustBytes,
+            &format!("{} part {}", tag, idx + 1),
+        ));
+        paths.push(path);
+    }
+
+    Ok((paths, tasks))
+}
+
 async fn fastq_file_to_record_stream(
     path: PathBuf,
     config: Arc<RunConfig>,
@@ -563,7 +567,7 @@ pub async fn run(
 
     info!("Starting AMR pipeline.");
 
-    match AmrInputMode::from_config(&config)? {
+    let prepared = match AmrInputMode::from_config(&config)? {
         AmrInputMode::Raw => {
             info!(
                 "[AMR] raw input selected; running shared host filtering"
@@ -763,9 +767,11 @@ pub async fn run(
             // host-filter completion work is awaited.
             // ------------------------------------------------------------
 
-            let spades = run_spades_amr(
+            let (redup_paths, redup_write_tasks) = materialize_redups(
                 config.clone(),
                 redup.redups_streams,
+                &out_dir,
+                "AMR raw RunRedup",
             )
                 .await?;
 
@@ -1154,6 +1160,13 @@ pub async fn run(
                 .map_err(|e| PipelineError::Other(anyhow!("RunRedup task panicked: {}", e)))?
                 .map_err(PipelineError::Other)?;
 
+            for task in redup_write_tasks {
+                task.await
+                    .map_err(|e| PipelineError::Other(anyhow!("Raw RunRedup writer task panicked: {}", e)))?
+                    .map_err(PipelineError::Other)?;
+            }
+
+            let spades = run_spades_amr(config.clone(), redup_paths.clone()).await?;
             spades.completion_task
                 .await
                 .map_err(|e| PipelineError::Other(anyhow!("RunSpades task panicked: {}", e)))?
@@ -1208,6 +1221,11 @@ pub async fn run(
                  {} retained temp directories can now be released",
                 final_temp_dirs.len()
             );
+
+            AmrPreparedInputs {
+                non_host_reads_fa: redup_paths,
+                contigs_fa: spades.contigs_path,
+            }
         }
 
         AmrInputMode::Filtered => {
@@ -1266,6 +1284,15 @@ pub async fn run(
                     "--amr-duplicate-clusters is required for --amr-input-mode filtered".to_string(),
                 ))?;
             let clusters_path = resolve_existing_input_path(clusters_path, &cwd, true)?;
+
+            let filtered_contigs = config
+                .args
+                .amr_filtered_contigs
+                .as_deref()
+                .ok_or_else(|| PipelineError::InvalidConfig(
+                    "--amr-filtered-contigs is required for --amr-input-mode filtered".to_string(),
+                ))?;
+            let filtered_contigs = resolve_existing_input_path(filtered_contigs, &cwd, true)?;
 
             let mut input_tasks = Vec::new();
 
@@ -1337,16 +1364,13 @@ pub async fn run(
 
 
 
-            let mut redup_write_tasks = Vec::new();
-            for (idx, stream) in redup.redups_streams.into_iter().enumerate() {
-                redup_write_tasks.push(write_fasta_stream_to_file(
-                    stream,
-                    out_dir.join(format!("redups_{}.fa", idx + 1)),
-                    config.clone(),
-                    StreamDataType::JustBytes,
-                    &format!("AMR filtered RunRedup part {}", idx + 1),
-                ));
-            }
+            let (redup_paths, redup_write_tasks) = materialize_redups(
+                config.clone(),
+                redup.redups_streams,
+                &out_dir,
+                "AMR filtered RunRedup",
+            )
+                .await?;
 
             redup.completion_task
                 .await
@@ -1364,13 +1388,18 @@ pub async fn run(
                     .map_err(|e| PipelineError::Other(anyhow!("Filtered RunRedup writer task panicked: {}", e)))?
                     .map_err(PipelineError::Other)?;
             }
+
+            AmrPreparedInputs {
+                non_host_reads_fa: redup_paths,
+                contigs_fa: filtered_contigs,
+            }
         }
-    }
-
-
+    };
 
     info!(
-        "Finished AMR host-filter staging."
+        "[AMR] prepared common inputs: reads={:?}, contigs={}",
+        prepared.non_host_reads_fa,
+        prepared.contigs_fa.display(),
     );
 
     Ok(())

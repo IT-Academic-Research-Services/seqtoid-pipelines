@@ -297,4 +297,10 @@ pub struct Arguments {
     #[arg(long = "amr-duplicate-clusters", help = "Filtered AMR mode: CZ ID clusters.csv mapping representative read id to read id")]
     pub amr_duplicate_clusters: Option<String>,
 
+    #[arg(
+        long = "amr-filtered-contigs",
+        help = "Filtered AMR mode: contigs FASTA corresponding to the supplied filtered sample"
+    )]
+    pub amr_filtered_contigs: Option<String>,
+
 }
