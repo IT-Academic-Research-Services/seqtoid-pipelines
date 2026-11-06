@@ -1,5 +1,6 @@
 //! AMR Pipeline
 
+use crate::pipelines::short_read_mngs::HostFilterOutputs;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -623,8 +624,11 @@ pub async fn run(
             )
                 .await?;
 
+
+
+
             let HostFilterCompletion {
-                mut outputs,
+                outputs,
 
                 val_count_task,
                 qc_count_result_rx,
@@ -648,68 +652,133 @@ pub async fn run(
                 subsample_count_rx,
             } = host_filter;
 
+            // ------------------------------------------------------------
+            // Split host-filter outputs by ownership.
+            //
+            // Raw AMR consumes:
+            //
+            //   * pre_dedup_interleaved
+            //   * subsampled_interleaved
+            //   * duplicate_clusters
+            //
+            // run_host_filter() also creates the normal short-read
+            // deinterleaved non_host_r1/non_host_r2 outputs. AMR does not
+            // use those outputs, but they MUST still be drained. Otherwise
+            // their bounded channels can fill and backpressure the shared
+            // subsampled fanout.
+            // ------------------------------------------------------------
+
+            let HostFilterOutputs {
+                non_host_r1,
+                non_host_r2,
+                subsampled_interleaved,
+                duplicate_clusters,
+                pre_dedup_interleaved,
+            } = outputs;
 
             // ------------------------------------------------------------
-            // Acknowledge AMR preprocessing outputs.
+            // Drain the unused normal short-read non-host outputs.
+            //
+            // Install these consumers immediately, before awaiting any
+            // host-filter completion work.
             // ------------------------------------------------------------
-            if outputs.pre_dedup_interleaved.is_none() {
-                return Err(PipelineError::Other(anyhow!(
-        "AMR requested retained interleaved pre-dedup stream but it was not returned"
-    )));
+
+            let mut unused_non_host_r1 = non_host_r1;
+
+            cleanup_tasks.push(tokio::spawn(async move {
+                while unused_non_host_r1.next().await.is_some() {}
+
+                Ok::<(), anyhow::Error>(())
+            }));
+
+            let has_non_host_r2 = non_host_r2.is_some();
+
+            if let Some(mut unused_non_host_r2) = non_host_r2 {
+                cleanup_tasks.push(tokio::spawn(async move {
+                    while unused_non_host_r2.next().await.is_some() {}
+
+                    Ok::<(), anyhow::Error>(())
+                }));
             }
 
-            if outputs.subsampled_interleaved.is_none() {
-                return Err(PipelineError::Other(anyhow!(
-        "AMR requested retained interleaved subsampled stream but it was not returned"
-    )));
-            }
+            // ------------------------------------------------------------
+            // Validate and take the AMR-specific retained streams.
+            // ------------------------------------------------------------
+
+            let pre_dedup_stream =
+                pre_dedup_interleaved.ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "AMR raw RunRedup missing retained interleaved pre-dedup stream"
+                    ))
+                })?;
+
+            let subsampled_stream =
+                subsampled_interleaved.ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "AMR raw RunRedup missing retained interleaved subsampled stream"
+                    ))
+                })?;
 
             info!(
-    "[AMR] host-filter streaming outputs ready: \
-     pre_dedup_interleaved=true, \
-     subsampled_interleaved=true, \
-     non_host_r1=true, non_host_r2={}, \
-     duplicate_clusters=pending",
-    outputs.non_host_r2.is_some(),
-);
+                "[AMR] host-filter streaming outputs ready: \
+                 pre_dedup_interleaved=true, \
+                 subsampled_interleaved=true, \
+                 non_host_r1=draining, non_host_r2={}, \
+                 duplicate_clusters=pending",
+                has_non_host_r2,
+            );
 
-
-
-            // Install RunRedup consumers immediately so every bounded host-filter
-            // output has a downstream reader before we await host-filter completion.
-            let pre_dedup_stream = outputs.pre_dedup_interleaved.take().ok_or_else(|| {
-                PipelineError::Other(anyhow!(
-        "AMR raw RunRedup missing retained interleaved pre-dedup stream"
-    ))
-            })?;
-
-            let subsampled_stream = outputs.subsampled_interleaved.take().ok_or_else(|| {
-                PipelineError::Other(anyhow!(
-        "AMR raw RunRedup missing retained interleaved subsampled stream"
-    ))
-            })?;
+            // ------------------------------------------------------------
+            // Install RunRedup consumers immediately.
+            //
+            // Both retained streams are structured interleaved FASTQ:
+            //
+            //   pre_dedup_stream
+            //       exact host-filtered records immediately before dedup
+            //
+            //   subsampled_stream
+            //       deduplicated + subsampled representatives
+            //
+            // duplicate_clusters completes only after dedup reaches EOF.
+            // run_redup() installs consumers for both live streams before
+            // awaiting that task.
+            // ------------------------------------------------------------
 
             let redup = run_redup(
                 config.clone(),
                 pre_dedup_stream,
                 subsampled_stream,
                 paired,
-                outputs.duplicate_clusters,
+                duplicate_clusters,
             )
                 .await?;
 
+            // ------------------------------------------------------------
+            // Raw WDL topology:
+            //
+            //     RunRedupRaw -> RunSpades
+            //
+            // Install the SPAdes consumer immediately so every bounded
+            // RunRedup output has a downstream reader before any
+            // host-filter completion work is awaited.
+            // ------------------------------------------------------------
 
-
-
-            // Raw WDL topology is RunRedupRaw -> RunSpades. Install the SPAdes
-            // adapter immediately so every bounded RunRedup output has a consumer
-            // before any host-filter completion work is awaited.
             let spades = run_spades_amr(
                 config.clone(),
                 redup.redups_streams,
             )
                 .await?;
+
             let redup_completion_task = redup.completion_task;
+
+            // ------------------------------------------------------------
+            // Drain validation / QC results.
+            // ------------------------------------------------------------
+
+
+
+
+
             // ------------------------------------------------------------
             // Drain validation / QC results.
             // ------------------------------------------------------------
