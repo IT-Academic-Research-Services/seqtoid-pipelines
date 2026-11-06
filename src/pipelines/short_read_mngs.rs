@@ -128,7 +128,8 @@ const DISTRIBUTED_WORKER_STALE_SECS: u64 = 30;
 
 
 pub struct HostFilterOutputs {
-    /// Live, deinterleaved subsampled non-host FASTQ streams.
+    /// Live, deinterleaved subsampled non-host FASTQ streams used by the
+    /// existing short-read checkpoint/alignment path.
     pub non_host_r1: ReceiverStream<ParseOutput>,
     pub non_host_r2: Option<ReceiverStream<ParseOutput>>,
 
@@ -140,10 +141,9 @@ pub struct HostFilterOutputs {
     /// Consumers of the FASTQ streams must be installed before awaiting this.
     pub duplicate_clusters: JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>>,
 
-    /// Live, deinterleaved host-filtered FASTQ streams immediately before dedup.
-    /// Present only when `retain_pre_dedup` is requested.
-    pub pre_dedup_r1: Option<ReceiverStream<ParseOutput>>,
-    pub pre_dedup_r2: Option<ReceiverStream<ParseOutput>>,
+    /// Optional live structured interleaved FASTQ stream containing the exact
+    /// host-filtered records entering dedup.
+    pub pre_dedup_interleaved: Option<ReceiverStream<ParseOutput>>,
 }
 
 pub(crate) struct HostFilterCompletion {
@@ -9599,7 +9599,7 @@ pub(crate) async fn run_host_filter(
     // Optionally expose the exact host-filtered records entering dedup as
     // live, deinterleaved streams. The dedup branch and the retained branch
     // are installed concurrently; no FASTQ checkpoint is created here.
-    let (pre_dedup_for_dedup, pre_dedup_r1, pre_dedup_r2) = if retain_pre_dedup {
+    let (pre_dedup_for_dedup, pre_dedup_interleaved) = if retain_pre_dedup {
         let (pre_dedup_streams, pre_dedup_router_done_rx) = fanout_to_channels(
             ReceiverStream::new(pre_dedup_parsed_stream),
             2,
@@ -9613,32 +9613,26 @@ pub(crate) async fn run_host_filter(
         cleanup_receivers.push(pre_dedup_router_done_rx);
 
         let mut pre_dedup_streams = pre_dedup_streams.into_iter();
+
         let dedup_input = pre_dedup_streams
             .next()
             .ok_or(PipelineError::EmptyStream)?;
-        let output_input = ReceiverStream::new(
+
+        let retained_input = ReceiverStream::new(
             pre_dedup_streams
                 .next()
                 .ok_or(PipelineError::EmptyStream)?,
         );
 
-        let (r1_rx, r2_rx_opt, deinterleave_handle) = deinterleave_fastq_stream(
-            output_input,
-            paired,
-            config.base_buffer_size * 4,
-        )
-            .await
-            .map_err(PipelineError::Other)?;
-
-        cleanup_tasks.push(deinterleave_handle);
-
         (
             dedup_input,
-            Some(ReceiverStream::new(r1_rx)),
-            r2_rx_opt.map(ReceiverStream::new),
+            Some(retained_input),
         )
     } else {
-        (pre_dedup_parsed_stream, None, None)
+        (
+            pre_dedup_parsed_stream,
+            None,
+        )
     };
 
     let (
@@ -9744,8 +9738,7 @@ pub(crate) async fn run_host_filter(
         non_host_r2,
         subsampled_interleaved,
         duplicate_clusters: dedup_finalize_task,
-        pre_dedup_r1,
-        pre_dedup_r2,
+        pre_dedup_interleaved,
     };
 
     Ok(HostFilterCompletion {
@@ -9918,9 +9911,35 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         non_host_r2,
         subsampled_interleaved: _,
         duplicate_clusters: duplicate_clusters_task,
-        pre_dedup_r1,
-        pre_dedup_r2,
+        pre_dedup_interleaved,
     } = outputs;
+
+    // The normal short-read pipeline requires separate R1/R2 pre-dedup
+    // checkpoint files. Keep that representation change here, at the
+    // short-read caller boundary, rather than inside run_host_filter().
+    let pre_dedup_interleaved = pre_dedup_interleaved.ok_or_else(|| {
+        PipelineError::InvalidConfig(
+            "short-read host filter requested pre-dedup stream but it was absent"
+                .to_string(),
+        )
+    })?;
+
+    let (
+        pre_dedup_r1_rx,
+        pre_dedup_r2_rx_opt,
+        pre_dedup_deinterleave_handle,
+    ) = deinterleave_fastq_stream(
+        pre_dedup_interleaved,
+        paired,
+        config.base_buffer_size * 4,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    cleanup_tasks.push(pre_dedup_deinterleave_handle);
+
+    let pre_dedup_r1 = ReceiverStream::new(pre_dedup_r1_rx);
+    let pre_dedup_r2 = pre_dedup_r2_rx_opt.map(ReceiverStream::new);
 
     // ---------------------------------------------------------------------
     // Short-read hard checkpoint.
@@ -9973,21 +9992,11 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     };
 
-    let pre_dedup_r1_write_task_fut = async {
-        let stream = pre_dedup_r1.ok_or_else(|| {
-            PipelineError::InvalidConfig(
-                "short-read host filter requested pre-dedup sidecar but R1 stream was absent"
-                    .to_string(),
-            )
-        })?;
-
-        write_parse_output_to_file(
-            &pre_dedup_r1_path,
-            stream,
-            Some(config.base_buffer_size * 4),
-        )
-            .await
-    };
+    let pre_dedup_r1_write_task_fut = write_parse_output_to_file(
+        &pre_dedup_r1_path,
+        pre_dedup_r1,
+        Some(config.base_buffer_size * 4),
+    );
 
     let pre_dedup_r2_write_task_fut = async {
         match (pre_dedup_r2, pre_dedup_r2_path_opt.as_ref()) {
