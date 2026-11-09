@@ -872,6 +872,281 @@ pub async fn generate_assembly_coverage(
 }
 
 
+/// Borrowed view of the 11 mandatory fields in one SAM alignment record.
+///
+/// Optional SAM tags are deliberately left in `optional_fields`; callers can
+/// parse only the tags they actually need. Header lines are not SAM records and
+/// must be handled by the caller before invoking `parse_sam_record`.
+#[derive(Debug, Clone, Copy)]
+pub struct SamRecordRef<'a> {
+    pub qname: &'a str,
+    pub flag: u16,
+    pub rname: &'a str,
+    pub pos: u64,
+    pub mapq: u8,
+    pub cigar: &'a str,
+    pub rnext: &'a str,
+    pub pnext: i64,
+    pub tlen: i64,
+    pub seq: &'a str,
+    pub qual: &'a str,
+
+    /// Raw tab-delimited SAM optional fields, without a leading tab.
+    ///
+    /// Empty when the record contains only the 11 mandatory fields.
+    pub optional_fields: &'a str,
+}
+
+impl SamRecordRef<'_> {
+    /// SAM-level unmapped state. Some producers can emit internally
+    /// inconsistent records, so consumers with stricter requirements should
+    /// additionally validate RNAME/POS/CIGAR for their own use case.
+    pub fn flag_is_unmapped(&self) -> bool {
+        self.flag & 0x4 != 0
+    }
+
+    pub fn is_secondary(&self) -> bool {
+        self.flag & 0x100 != 0
+    }
+
+    pub fn is_supplementary(&self) -> bool {
+        self.flag & 0x800 != 0
+    }
+}
+
+/// Parse one complete, non-header SAM alignment line.
+///
+/// This parser intentionally validates only the mandatory SAM columns. It does
+/// not impose pipeline-specific mapped/unmapped semantics.
+pub fn parse_sam_record<'a>(line: &'a str) -> Result<SamRecordRef<'a>> {
+    if line.starts_with('@') {
+        return Err(anyhow!(
+            "SAM header line is not an alignment record: {}",
+            line
+        ));
+    }
+
+    let mut fields = line.splitn(12, '\t');
+
+    let qname = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing QNAME: {}", line))?;
+
+    let flag_str = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing FLAG: {}", line))?;
+
+    let rname = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing RNAME: {}", line))?;
+
+    let pos_str = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing POS: {}", line))?;
+
+    let mapq_str = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing MAPQ: {}", line))?;
+
+    let cigar = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing CIGAR: {}", line))?;
+
+    let rnext = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing RNEXT: {}", line))?;
+
+    let pnext_str = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing PNEXT: {}", line))?;
+
+    let tlen_str = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing TLEN: {}", line))?;
+
+    let seq = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing SEQ: {}", line))?;
+
+    let qual = fields
+        .next()
+        .ok_or_else(|| anyhow!("Malformed SAM record: missing QUAL: {}", line))?;
+
+    // splitn(12) leaves everything after QUAL intact. This means the
+    // optional SAM fields remain borrowed directly from `line`.
+    let optional_fields = fields.next().unwrap_or("");
+
+    let flag = flag_str.parse::<u16>().map_err(|e| {
+        anyhow!(
+            "Invalid SAM FLAG '{}' in record '{}': {}",
+            flag_str,
+            line,
+            e
+        )
+    })?;
+
+    let pos = pos_str.parse::<u64>().map_err(|e| {
+        anyhow!(
+            "Invalid SAM POS '{}' in record '{}': {}",
+            pos_str,
+            line,
+            e
+        )
+    })?;
+
+    let mapq = mapq_str.parse::<u8>().map_err(|e| {
+        anyhow!(
+            "Invalid SAM MAPQ '{}' in record '{}': {}",
+            mapq_str,
+            line,
+            e
+        )
+    })?;
+
+    let pnext = pnext_str.parse::<i64>().map_err(|e| {
+        anyhow!(
+            "Invalid SAM PNEXT '{}' in record '{}': {}",
+            pnext_str,
+            line,
+            e
+        )
+    })?;
+
+    let tlen = tlen_str.parse::<i64>().map_err(|e| {
+        anyhow!(
+            "Invalid SAM TLEN '{}' in record '{}': {}",
+            tlen_str,
+            line,
+            e
+        )
+    })?;
+
+    Ok(SamRecordRef {
+        qname,
+        flag,
+        rname,
+        pos,
+        mapq,
+        cigar,
+        rnext,
+        pnext,
+        tlen,
+        seq,
+        qual,
+        optional_fields,
+    })
+}
+
+/// One operation in a SAM CIGAR string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CigarOp {
+    Match(u32),
+    Insertion(u32),
+    Deletion(u32),
+    ReferenceSkip(u32),
+    SoftClip(u32),
+    HardClip(u32),
+    Padding(u32),
+    SequenceMatch(u32),
+    SequenceMismatch(u32),
+}
+
+impl CigarOp {
+    pub fn len(self) -> u32 {
+        match self {
+            Self::Match(n)
+            | Self::Insertion(n)
+            | Self::Deletion(n)
+            | Self::ReferenceSkip(n)
+            | Self::SoftClip(n)
+            | Self::HardClip(n)
+            | Self::Padding(n)
+            | Self::SequenceMatch(n)
+            | Self::SequenceMismatch(n) => n,
+        }
+    }
+
+    pub fn consumes_reference(self) -> bool {
+        matches!(
+            self,
+            Self::Match(_)
+                | Self::Deletion(_)
+                | Self::ReferenceSkip(_)
+                | Self::SequenceMatch(_)
+                | Self::SequenceMismatch(_)
+        )
+    }
+
+    pub fn consumes_query(self) -> bool {
+        matches!(
+            self,
+            Self::Match(_)
+                | Self::Insertion(_)
+                | Self::SoftClip(_)
+                | Self::SequenceMatch(_)
+                | Self::SequenceMismatch(_)
+        )
+    }
+}
+
+/// Parse a complete SAM CIGAR into typed operations.
+///
+/// `*` means that no CIGAR is available and therefore returns an empty vector.
+/// Unlike `terminal_cigar_clipping`, this is a strict parser for the full CIGAR
+/// grammar and is intended for new generic consumers such as AMR aggregation.
+pub fn parse_cigar(cigar: &str) -> Result<Vec<CigarOp>> {
+    if cigar == "*" {
+        return Ok(Vec::new());
+    }
+    if cigar.is_empty() {
+        return Err(anyhow!("Empty CIGAR string"));
+    }
+
+    let bytes = cigar.as_bytes();
+    let mut ops = Vec::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if start == i || i >= bytes.len() {
+            return Err(anyhow!("Malformed CIGAR '{}': expected length+operation", cigar));
+        }
+
+        let len: u32 = cigar[start..i].parse().map_err(|e| {
+            anyhow!("Invalid operation length in CIGAR '{}': {}", cigar, e)
+        })?;
+        if len == 0 {
+            return Err(anyhow!("Zero-length operation in CIGAR '{}'", cigar));
+        }
+
+        let op = match bytes[i] {
+            b'M' => CigarOp::Match(len),
+            b'I' => CigarOp::Insertion(len),
+            b'D' => CigarOp::Deletion(len),
+            b'N' => CigarOp::ReferenceSkip(len),
+            b'S' => CigarOp::SoftClip(len),
+            b'H' => CigarOp::HardClip(len),
+            b'P' => CigarOp::Padding(len),
+            b'=' => CigarOp::SequenceMatch(len),
+            b'X' => CigarOp::SequenceMismatch(len),
+            other => {
+                return Err(anyhow!(
+                    "Unsupported CIGAR operation '{}' in '{}'",
+                    other as char,
+                    cigar,
+                ))
+            }
+        };
+        ops.push(op);
+        i += 1;
+    }
+
+    Ok(ops)
+}
+
 /// Filter minimap2 SAM alignments with excessive terminal clipping.
 ///
 /// This is the streaming Rust equivalent of filter_clipped_alignments.py.
@@ -1008,23 +1283,18 @@ pub async fn filter_clipped_alignments(
                         )
                     })?;
 
-            let fields: Vec<&str> =
-                line_str.split('\t').collect();
-
-            if fields.len() < 11 {
-                return Err(anyhow!(
-                    "Malformed SAM record {} in filter_clipped_alignments: \
-                     expected at least 11 fields, found {}: {}",
+            let record = parse_sam_record(line_str).map_err(|e| {
+                anyhow!(
+                    "Malformed SAM record {} in filter_clipped_alignments: {}",
                     sam_record_count,
-                    fields.len(),
-                    line_str,
-                ));
-            }
+                    e,
+                )
+            })?;
 
-            let qname = fields[0];
-            let cigar = fields[5];
-            let seq = fields[9];
-            let qual = fields[10];
+            let qname = record.qname;
+            let cigar = record.cigar;
+            let seq = record.seq;
+            let qual = record.qual;
 
             // ----------------------------------------------------------
             // Legacy Python:
@@ -1327,6 +1597,79 @@ fn terminal_cigar_clipping(
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn test_parse_sam_record_kma_alignment() -> Result<()> {
+        let line = "SRR23038836.140681895\t65\tARO:3002644|ID:2114|Name:APH(3')-IIa|NCBI:V00618.1\t734\t165\t62=89S\t*\t0\t0\tACGT\t*\tET:i:1\tAS:i:68";
+        let record = parse_sam_record(line)?;
+
+        assert_eq!(record.qname, "SRR23038836.140681895");
+        assert_eq!(record.flag, 65);
+        assert_eq!(record.pos, 734);
+        assert_eq!(record.mapq, 165);
+        assert_eq!(record.cigar, "62=89S");
+        assert_eq!(record.seq, "ACGT");
+        assert_eq!(record.optional_fields, "ET:i:1\tAS:i:68");
+
+        assert!(!record.flag_is_unmapped());
+        assert!(!record.is_secondary());
+        assert!(!record.is_supplementary());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_sam_record_without_optional_fields() -> Result<()> {
+        let line = "read1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII";
+        let record = parse_sam_record(line)?;
+
+        assert_eq!(record.optional_fields, "");
+        assert!(record.flag_is_unmapped());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_cigar_full_sam_alphabet() -> Result<()> {
+        let ops = parse_cigar("5S10M2I3=4X2D7N1P6H")?;
+        assert_eq!(
+            ops,
+            vec![
+                CigarOp::SoftClip(5),
+                CigarOp::Match(10),
+                CigarOp::Insertion(2),
+                CigarOp::SequenceMatch(3),
+                CigarOp::SequenceMismatch(4),
+                CigarOp::Deletion(2),
+                CigarOp::ReferenceSkip(7),
+                CigarOp::Padding(1),
+                CigarOp::HardClip(6),
+            ]
+        );
+        assert_eq!(ops.iter().copied().filter(|op| op.consumes_reference()).map(CigarOp::len).sum::<u32>(), 26);
+        assert_eq!(ops.iter().copied().filter(|op| op.consumes_query()).map(CigarOp::len).sum::<u32>(), 24);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_cigar_kma_examples() -> Result<()> {
+        assert_eq!(parse_cigar("151=")?, vec![CigarOp::SequenceMatch(151)]);
+        assert_eq!(
+            parse_cigar("62=89S")?,
+            vec![CigarOp::SequenceMatch(62), CigarOp::SoftClip(89)]
+        );
+        assert_eq!(parse_cigar("*")?, Vec::<CigarOp>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_clipping_legacy_semantics_unchanged() -> Result<()> {
+        assert_eq!(terminal_cigar_clipping("10H20S100M", true)?, (10, 10));
+        assert_eq!(terminal_cigar_clipping("100M20S10H", false)?, (10, 10));
+        assert_eq!(terminal_cigar_clipping("20S100M30S", true)?, (20, 0));
+        assert_eq!(terminal_cigar_clipping("20S100M30S", false)?, (30, 0));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_stream_sam_alignment_counter() -> Result<()> {
