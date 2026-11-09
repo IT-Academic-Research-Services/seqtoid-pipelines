@@ -15,17 +15,20 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType, SPADES_TAG};
+use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
+                          SPADES_TAG, KMA_TAG};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
     HostFilterCompletion,
 };
+use crate::utils::command::kma::KmaConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file};
-use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
+use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output,
+                            spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput, stream_to_cmd, fanout_to_channels};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
@@ -55,6 +58,12 @@ struct RunRedupHandle {
 
     /// Completes after every per-end producer has reached EOF.
     /// Callers must install consumers for `redups_streams` before awaiting it.
+    completion_task: JoinHandle<Result<(), anyhow::Error>>,
+}
+
+#[derive(Debug)]
+struct RunKmaHandle {
+    sam_stream: ReceiverStream<ParseOutput>,
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
 }
 
@@ -553,6 +562,307 @@ async fn fastq_file_to_record_stream(
     Ok((ReceiverStream::new(record_rx), completion_task))
 }
 
+async fn run_kma_amr(
+    config: Arc<RunConfig>,
+    reduplicated_streams: Vec<ReceiverStream<ParseOutput>>,
+    kma_db: PathBuf,
+) -> Result<RunKmaHandle, PipelineError> {
+    let stream_count = reduplicated_streams.len();
+
+    if stream_count == 0 || stream_count > 2 {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunKMA expected one or two reduplicated FASTA streams, got {}",
+            stream_count
+        )));
+    }
+
+    let paired = stream_count == 2;
+
+    // ------------------------------------------------------------
+    // Adapt RunRedup output to KMA stdin.
+    //
+    // Single-end:
+    //
+    //     R1 -> KMA -i --
+    //
+    // Paired-end:
+    //
+    //     R1 --\
+    //            -> R1,R2,R1,R2,... -> KMA -int --
+    //     R2 --/
+    //
+    // RunRedup emits ParseOutput::Fasta records. Keep them structured
+    // until stream_to_cmd serializes them to KMA stdin.
+    // ------------------------------------------------------------
+
+    let (kma_input_rx, input_adapter_task) = if paired {
+        let mut streams = reduplicated_streams.into_iter();
+
+        let mut r1 = streams
+            .next()
+            .expect("paired RunKMA input missing R1 stream");
+
+        let mut r2 = streams
+            .next()
+            .expect("paired RunKMA input missing R2 stream");
+
+        let (tx, rx) =
+            mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+        let task = tokio::spawn(async move {
+            let mut pairs = 0u64;
+
+            loop {
+                let left = r1.next().await;
+                let right = r2.next().await;
+
+                match (left, right) {
+                    (
+                        Some(ParseOutput::Fasta(r1_record)),
+                        Some(ParseOutput::Fasta(r2_record)),
+                    ) => {
+                        tx.send(ParseOutput::Fasta(r1_record))
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "RunKMA paired input receiver dropped on R1"
+                                )
+                            })?;
+
+                        tx.send(ParseOutput::Fasta(r2_record))
+                            .await
+                            .map_err(|_| {
+                                anyhow!(
+                                    "RunKMA paired input receiver dropped on R2"
+                                )
+                            })?;
+
+                        pairs += 1;
+                    }
+
+                    (None, None) => {
+                        break;
+                    }
+
+                    (None, Some(_)) | (Some(_), None) => {
+                        return Err(anyhow!(
+                            "RunKMA R1/R2 streams have unequal record counts \
+                             after {} complete pairs",
+                            pairs
+                        ));
+                    }
+
+                    (Some(left), Some(right)) => {
+                        return Err(anyhow!(
+                            "RunKMA expected paired FASTA records, got {:?} and {:?}",
+                            left,
+                            right
+                        ));
+                    }
+                }
+            }
+
+            info!(
+                "[AMR] RunKMA prepared {} interleaved read pairs",
+                pairs
+            );
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        (rx, task)
+    } else {
+        let mut streams = reduplicated_streams.into_iter();
+
+        let mut r1 = streams
+            .next()
+            .expect("single-end RunKMA input missing R1 stream");
+
+        let (tx, rx) =
+            mpsc::channel::<ParseOutput>(config.base_buffer_size);
+
+        let task = tokio::spawn(async move {
+            let mut reads = 0u64;
+
+            while let Some(item) = r1.next().await {
+                let ParseOutput::Fasta(record) = item else {
+                    return Err(anyhow!(
+                        "RunKMA expected single-end FASTA record, got {:?}",
+                        item
+                    ));
+                };
+
+                tx.send(ParseOutput::Fasta(record))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "RunKMA single-end input receiver dropped"
+                        )
+                    })?;
+
+                reads += 1;
+            }
+
+            info!(
+                "[AMR] RunKMA prepared {} single-end reads",
+                reads
+            );
+
+            Ok::<(), anyhow::Error>(())
+        });
+
+        (rx, task)
+    };
+
+    // ------------------------------------------------------------
+    // KMA requires an output prefix even though the SAM stream is
+    // emitted on stdout. Keep KMA's sidecars in temporary storage.
+    // ------------------------------------------------------------
+
+    let kma_temp_dir =
+        tempfile::TempDir::new_in(&config.ram_temp_dir)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "Failed to create RunKMA temp directory: {}",
+                    e
+                ))
+            })?;
+
+    let kma_output_prefix =
+        kma_temp_dir.path().join("read_amr");
+
+    let kma_config = KmaConfig::amr_stdin(
+        kma_db,
+        kma_output_prefix,
+        paired,
+    );
+
+    let kma_args = generate_cli(
+        KMA_TAG,
+        &config,
+        Some(&kma_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunKMA mode={}, args={:?}",
+        if paired {
+            "paired-interleaved-stdin"
+        } else {
+            "single-end-stdin"
+        },
+        kma_args
+    );
+
+    let stderr_path =
+        config.out_dir.join("amr_kma_stderr.log");
+
+    // ------------------------------------------------------------
+    // Feed the structured FASTA stream directly to KMA.
+    // ------------------------------------------------------------
+
+    let (child, stdin_task, stderr_task) =
+        stream_to_cmd(
+            config.clone(),
+            kma_input_rx,
+            KMA_TAG,
+            kma_args,
+            StreamDataType::IlluminaFastq,
+            config.args.verbose,
+            Some(stderr_path),
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    // ------------------------------------------------------------
+    // Take KMA stdout without retaining the child mutex.
+    //
+    // stream_to_cmd's stdin task ultimately needs the child lock in
+    // order to wait for process completion. Holding that lock while
+    // draining SAM stdout would deadlock the process lifecycle.
+    // ------------------------------------------------------------
+
+    let stdout = {
+        let mut child_guard = child.lock().await;
+
+        child_guard
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+                    "RunKMA child stdout not available"
+                ))
+            })?
+    };
+
+    // KMA `-sam` emits SAM text to stdout. ParseMode::Lines semantics
+    // are represented here by parse_lines(): each channel item is one
+    // SAM line with its newline removed.
+    let sam_rx = crate::utils::streams::parse_lines(
+        stdout,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    // ------------------------------------------------------------
+    // Own all KMA-side producer/process completion in one task.
+    //
+    // The SAM receiver is deliberately NOT consumed here. Its caller
+    // must install a consumer immediately so KMA stdout cannot
+    // backpressure.
+    // ------------------------------------------------------------
+
+    let completion_task = tokio::spawn(async move {
+        // KMA may access/write its sidecars until process exit.
+        let _kma_temp_dir = kma_temp_dir;
+
+        input_adapter_task
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "RunKMA input adapter task panicked: {}",
+                    e
+                )
+            })??;
+
+        stdin_task
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "RunKMA stdin task panicked: {}",
+                    e
+                )
+            })??;
+
+        stderr_task
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "RunKMA stderr task panicked: {}",
+                    e
+                )
+            })??;
+
+        info!(
+            "[AMR] RunKMA process completed ({})",
+            if paired {
+                "paired-end"
+            } else {
+                "single-end"
+            }
+        );
+
+        Ok::<(), anyhow::Error>(())
+    });
+
+    Ok(RunKmaHandle {
+        sam_stream: ReceiverStream::new(sam_rx),
+        completion_task,
+    })
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -763,18 +1073,104 @@ pub async fn run(
             // host-filter completion work is awaited.
             // ------------------------------------------------------------
 
+
+            let mut spades_streams = Vec::new();
+            let mut kma_streams = Vec::new();
+            let mut redup_fanout_tasks = Vec::new();
+
+            for (idx, redup_stream) in
+                redup.redups_streams.into_iter().enumerate()
+            {
+                let (mut branches, done_rx) = fanout_to_channels(
+                    redup_stream,
+                    2,
+                    &format!("AMR redups part {}", idx + 1),
+                    &config,
+                    StreamDataType::IlluminaFastq,
+                )
+                    .await?;
+
+                spades_streams.push(
+                    ReceiverStream::new(branches.remove(0))
+                );
+
+                kma_streams.push(
+                    ReceiverStream::new(branches.remove(0))
+                );
+
+                redup_fanout_tasks.push(done_rx);
+            }
+
+
+
             let spades = run_spades_amr(
                 config.clone(),
-                redup.redups_streams,
+                spades_streams,
             )
                 .await?;
+
+            let kma = run_kma_amr(
+                config.clone(),
+                kma_streams,
+                PathBuf::from(
+                    "/data/refs/card/rgi_db/localDB/bwt/card_reference/kma"
+                ),
+            )
+                .await?;
+            let RunKmaHandle {
+                sam_stream: mut kma_sam_stream,
+                completion_task: kma_completion_task,
+            } = kma;
 
             let redup_completion_task = redup.completion_task;
 
             // ------------------------------------------------------------
-            // Drain validation / QC results.
+            // TEST: drain KMA SAM stdout to a file.
+            //
+            // KMA stdout has already been split with ParseMode::Lines,
+            // which strips line endings. Restore '\n' here so the debug
+            // artifact is a valid SAM file.
             // ------------------------------------------------------------
 
+            let kma_sam_path = out_dir.join("amr_kma_raw.sam");
+
+            let kma_sam_task = tokio::spawn(async move {
+                use tokio::io::{AsyncWriteExt, BufWriter};
+
+                let file = tokio::fs::File::create(&kma_sam_path)
+                    .await
+                    .map_err(|e| {
+                        anyhow!(
+                "Failed to create KMA SAM debug output {}: {}",
+                kma_sam_path.display(),
+                e
+            )
+                    })?;
+
+                let mut writer = BufWriter::new(file);
+                let mut line_count = 0u64;
+
+                while let Some(item) = kma_sam_stream.next().await {
+                    let ParseOutput::Bytes(line) = item else {
+                        return Err(anyhow!(
+                "RunKMA expected line-oriented Bytes output"
+            ));
+                    };
+
+                    writer.write_all(&line).await?;
+                    writer.write_all(b"\n").await?;
+                    line_count += 1;
+                }
+
+                writer.flush().await?;
+
+                info!(
+        "[AMR] RunKMA debug SAM capture complete: {} lines",
+        line_count
+    );
+
+                Ok::<(), anyhow::Error>(())
+            });
 
 
 
@@ -1149,14 +1545,64 @@ pub async fn run(
             )
                 .await?;
 
+            // ------------------------------------------------------------
+            // Complete RunRedup and both downstream consumers.
+            // ------------------------------------------------------------
+
             redup_completion_task
                 .await
-                .map_err(|e| PipelineError::Other(anyhow!("RunRedup task panicked: {}", e)))?
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunRedup task panicked: {}",
+            e
+        ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            // Every RunRedup item must have reached both SPAdes and KMA.
+            for (idx, done_rx) in redup_fanout_tasks.into_iter().enumerate() {
+                done_rx
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRedup fanout {} completion receiver dropped: {}",
+                idx + 1,
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+            }
+
+            // KMA stdout must be drained concurrently with KMA execution.
+            // At this point wait for both sides to finish.
+            kma_sam_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunKMA SAM capture task panicked: {}",
+            e
+        ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            kma_completion_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunKMA completion task panicked: {}",
+            e
+        ))
+                })?
                 .map_err(PipelineError::Other)?;
 
             spades.completion_task
                 .await
-                .map_err(|e| PipelineError::Other(anyhow!("RunSpades task panicked: {}", e)))?
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunSpades task panicked: {}",
+            e
+        ))
+                })?
                 .map_err(PipelineError::Other)?;
 
             info!(
