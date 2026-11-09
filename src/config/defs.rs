@@ -47,6 +47,7 @@ pub const MAKEBLASTDB_TAG: &str = "makeblastdb";
 pub const SORT_TAG: &str = "sort";
 pub const MMSEQS_TAG: &str = "mmseqs";
 pub const FLYE_TAG: &str = "flye";
+pub const KMA_TAG: &str = "kma";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";
@@ -92,6 +93,7 @@ lazy_static! {
         m.insert(MAKEBLASTDB_TAG, 2.12);
         m.insert(MMSEQS_TAG, 0.0);
         m.insert(FLYE_TAG, 2.9);
+        m.insert(KMA_TAG, 1.7);
         m
     };
 }
@@ -446,7 +448,7 @@ impl RunConfig {
             (MINIMAP2_TAG, _) | (KRAKEN2_TAG, _) | (MAFFT_TAG, _) | (NUCMER_TAG, _) | (FASTP_TAG, _)
             | (PIGZ_TAG, _) | (BOWTIE2_TAG, _) | (KALLISTO_TAG, _) | (DIAMOND_TAG, _) |
             (SPADES_TAG, _) | (BLASTN_TAG, _) | (BLASTX_TAG, _) | (HISAT2_TAG, _)
-            | (MAKEBLASTDB_TAG, _) | (MMSEQS_TAG, _) | (FLYE_TAG, _) => CoreAllocation::Maximal,
+            | (MAKEBLASTDB_TAG, _) | (MMSEQS_TAG, _) | (FLYE_TAG, _) | (KMA_TAG, _) => CoreAllocation::Maximal,
             (SAMTOOLS_TAG, Some("sort")) | (BCFTOOLS_TAG, Some("mpileup")) |
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |

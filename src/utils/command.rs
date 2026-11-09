@@ -4827,6 +4827,379 @@ pub mod flye {
     }
 }
 
+pub mod kma {
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{anyhow, Result};
+
+    use crate::config::defs::{RunConfig, KMA_TAG};
+    use crate::utils::command::{version_check, ArgGenerator};
+    use crate::utils::streams::ChildStream;
+
+    /// Input topology for one KMA invocation.
+    ///
+    /// KMA 1.7.x uses `--` to represent stdin. For the AMR pipeline:
+    ///
+    /// Single-end stdin:
+    ///
+    ///     -i --
+    ///
+    /// Paired-end interleaved stdin:
+    ///
+    ///     -int --
+    ///
+    /// KMA does not accept the conventional `-` token for the interleaved
+    /// stdin mode; `-int --` has been parity-tested against `-ipe`.
+    #[derive(Debug, Clone)]
+    pub enum KmaInput {
+        /// Single-end input file(s):
+        ///
+        ///     -i reads.fa
+        SingleEnd(Vec<PathBuf>),
+
+        /// Single-end reads supplied on stdin:
+        ///
+        ///     -i --
+        SingleEndStdin,
+
+        /// Paired-end input files:
+        ///
+        ///     -ipe r1.fa r2.fa
+        PairedEnd {
+            r1: PathBuf,
+            r2: PathBuf,
+        },
+
+        /// One or more files containing interleaved paired reads:
+        ///
+        ///     -int interleaved.fa
+        InterleavedFiles(Vec<PathBuf>),
+
+        /// Interleaved paired reads supplied on stdin:
+        ///
+        ///     -int --
+        InterleavedStdin,
+    }
+
+    /// Configuration for one KMA mapping invocation.
+    ///
+    /// This struct describes KMA itself, not the AMR interpretation of its
+    /// output. CARD/RGI-specific filtering, SAM parsing, and evidence
+    /// aggregation belong in the AMR pipeline.
+    #[derive(Debug, Clone)]
+    pub struct KmaConfig {
+        /// KMA database prefix supplied to `-t_db`.
+        ///
+        /// For example, if the database contains:
+        ///
+        ///     card_reference/kma.comp.b
+        ///     card_reference/kma.length.b
+        ///     card_reference/kma.name
+        ///     card_reference/kma.seq.b
+        ///
+        /// this value is:
+        ///
+        ///     card_reference/kma
+        pub db_prefix: PathBuf,
+
+        /// KMA input topology.
+        pub input: KmaInput,
+
+        /// Prefix supplied to `-o`.
+        ///
+        /// KMA requires an output prefix even when SAM is consumed directly
+        /// from stdout. KMA may create sidecar files using this prefix.
+        pub output_prefix: PathBuf,
+
+        /// Explicit thread override.
+        ///
+        /// None uses RunConfig::thread_allocation(KMA_TAG, None).
+        pub threads: Option<usize>,
+
+        /// Ordered additional KMA options.
+        ///
+        /// These are appended after the standard arguments so future KMA
+        /// workflows can reuse this command module without putting their
+        /// policy here.
+        pub option_fields: Vec<(String, Option<String>)>,
+
+        /// Emit SAM to stdout (`-sam`).
+        pub sam: bool,
+
+        /// Emit VCF (`-vcf`).
+        pub vcf: bool,
+
+        /// Use KMA memory-mode template mapping (`-mem_mode`).
+        pub mem_mode: bool,
+
+        /// Search k-mers exhaustively (`-ex_mode`).
+        pub exhaustive: bool,
+
+        /// Assign one query to one template (`-1t1`).
+        pub one_query_one_template: bool,
+    }
+
+    impl KmaConfig {
+        /// Construct the KMA configuration used by the short-read AMR path.
+        ///
+        /// The common RGI/KMA mapping options are:
+        ///
+        ///     -mem_mode
+        ///     -ex_mode
+        ///     -1t1
+        ///     -vcf
+        ///     -sam
+        ///     -t <threads>
+        ///     -t_db <db>
+        ///     -o <prefix>
+        ///
+        /// Input mode depends on the sample:
+        ///
+        /// Single-end:
+        ///
+        ///     -i --
+        ///
+        /// Paired-end:
+        ///
+        ///     -int --
+        pub fn amr_stdin(
+            db_prefix: impl Into<PathBuf>,
+            output_prefix: impl Into<PathBuf>,
+            paired: bool,
+        ) -> Self {
+            Self {
+                db_prefix: db_prefix.into(),
+                input: if paired {
+                    KmaInput::InterleavedStdin
+                } else {
+                    KmaInput::SingleEndStdin
+                },
+                output_prefix: output_prefix.into(),
+                threads: None,
+                option_fields: Vec::new(),
+                sam: true,
+                vcf: true,
+                mem_mode: true,
+                exhaustive: true,
+                one_query_one_template: true,
+            }
+        }
+
+        pub fn threads(mut self, threads: usize) -> Self {
+            self.threads = Some(threads.max(1));
+            self
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+    }
+
+    pub struct KmaArgGenerator;
+
+    /// Checks whether KMA is installed and returns its major/minor version.
+    ///
+    /// KMA 1.7.1:
+    ///
+    ///     $ kma -v
+    ///     KMA-1.7.1
+    ///
+    /// The shared version parser strips the `KMA-` prefix and records 1.7.
+    pub async fn kma_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
+        version_check(
+            KMA_TAG,
+            vec!["-v"],
+            0,
+            0,
+            ChildStream::Stdout,
+            None,
+            config,
+        )
+            .await
+    }
+
+    /// Validate the files required by an existing KMA database prefix.
+    ///
+    /// KMA receives the prefix itself through `-t_db`, not any individual
+    /// sidecar path.
+    pub fn validate_kma_db(db_prefix: &Path) -> Result<()> {
+        let prefix = db_prefix
+            .to_str()
+            .ok_or_else(|| {
+                anyhow!(
+                    "KMA database prefix is not valid UTF-8: {}",
+                    db_prefix.display()
+                )
+            })?;
+
+        let required = [
+            format!("{}.comp.b", prefix),
+            format!("{}.length.b", prefix),
+            format!("{}.name", prefix),
+            format!("{}.seq.b", prefix),
+        ];
+
+        for file in required {
+            let path = PathBuf::from(&file);
+
+            if !path.is_file() {
+                return Err(anyhow!(
+                    "Missing KMA database file: {}",
+                    path.display()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn push_input_args(
+        args: &mut Vec<String>,
+        input: &KmaInput,
+    ) -> Result<()> {
+        match input {
+            KmaInput::SingleEnd(paths) => {
+                if paths.is_empty() {
+                    return Err(anyhow!(
+                        "KMA single-end input requires at least one file"
+                    ));
+                }
+
+                args.push("-i".to_string());
+
+                for path in paths {
+                    args.push(path.to_string_lossy().to_string());
+                }
+            }
+
+            KmaInput::SingleEndStdin => {
+                args.push("-i".to_string());
+                args.push("--".to_string());
+            }
+
+            KmaInput::PairedEnd { r1, r2 } => {
+                args.push("-ipe".to_string());
+                args.push(r1.to_string_lossy().to_string());
+                args.push(r2.to_string_lossy().to_string());
+            }
+
+            KmaInput::InterleavedFiles(paths) => {
+                if paths.is_empty() {
+                    return Err(anyhow!(
+                        "KMA interleaved input requires at least one file"
+                    ));
+                }
+
+                args.push("-int".to_string());
+
+                for path in paths {
+                    args.push(path.to_string_lossy().to_string());
+                }
+            }
+
+            KmaInput::InterleavedStdin => {
+                args.push("-int".to_string());
+                args.push("--".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    impl ArgGenerator for KmaArgGenerator {
+        fn generate_args(
+            &self,
+            run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<KmaConfig>())
+                .ok_or_else(|| {
+                    anyhow!("KMA requires a KmaConfig as extra argument")
+                })?;
+
+            validate_kma_db(&config.db_prefix)?;
+
+            let mut args = Vec::new();
+
+            // Preserve the established RGI/KMA option ordering where
+            // practical.
+            if config.mem_mode {
+                args.push("-mem_mode".to_string());
+            }
+
+            if config.exhaustive {
+                args.push("-ex_mode".to_string());
+            }
+
+            if config.one_query_one_template {
+                args.push("-1t1".to_string());
+            }
+
+            if config.vcf {
+                args.push("-vcf".to_string());
+            }
+
+            if config.sam {
+                args.push("-sam".to_string());
+            }
+
+            push_input_args(&mut args, &config.input)?;
+
+            let threads = config
+                .threads
+                .unwrap_or_else(|| {
+                    run_config.thread_allocation(KMA_TAG, None)
+                });
+
+            args.push("-t".to_string());
+            args.push(threads.max(1).to_string());
+
+            args.push("-t_db".to_string());
+            args.push(
+                config
+                    .db_prefix
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+            args.push("-o".to_string());
+            args.push(
+                config
+                    .output_prefix
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+            for (key, value) in &config.option_fields {
+                args.push(key.clone());
+
+                if let Some(value) = value {
+                    args.push(value.clone());
+                }
+            }
+
+            Ok(args)
+        }
+    }
+}
+
 /// Generates the command-line arguments for a given tool.
 ///
 /// # Arguments
@@ -4869,6 +5242,7 @@ pub fn generate_cli(
         SORT_TAG => Box::new(sort::SortArgGenerator),
         MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
         FLYE_TAG => Box::new(flye::FlyeArgGenerator),
+        KMA_TAG => Box::new(kma::KmaArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -4935,6 +5309,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
                 FLYE_TAG => flye::flye_presence_check(&config, version_file).await,
                 PIGZ_TAG => pigz::pigz_presence_check(&config).await,
+                KMA_TAG => kma::kma_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))
