@@ -47,6 +47,7 @@ pub const MAKEBLASTDB_TAG: &str = "makeblastdb";
 pub const SORT_TAG: &str = "sort";
 pub const MMSEQS_TAG: &str = "mmseqs";
 pub const FLYE_TAG: &str = "flye";
+pub const RGI_TAG: &str = "rgi";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";
@@ -92,6 +93,7 @@ lazy_static! {
         m.insert(MAKEBLASTDB_TAG, 2.12);
         m.insert(MMSEQS_TAG, 0.0);
         m.insert(FLYE_TAG, 2.9);
+        m.insert(RGI_TAG, 6.0);
         m
     };
 }
@@ -154,6 +156,14 @@ pub enum KallistoSubcommand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DiamondSubcommand {
     Blastx
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RgiSubcommand {
+    Load,
+    Bwt,
+    Main,
+    KmerQuery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

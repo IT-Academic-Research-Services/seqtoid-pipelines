@@ -4827,6 +4827,137 @@ pub mod flye {
     }
 }
 
+pub mod rgi {
+    use crate::config::defs::{
+        RgiSubcommand,
+        RunConfig,
+        RGI_TAG,
+    };
+    use crate::utils::command::{
+        version_check,
+        ArgGenerator,
+    };
+    use crate::utils::streams::ChildStream;
+    use anyhow::anyhow;
+
+    #[derive(Debug)]
+    pub struct RgiConfig {
+        pub subcommand: RgiSubcommand,
+
+        /// Ordered command-line options and flags.
+        ///
+        /// Examples:
+        ///
+        ///     ("-i", Some("card.json"))
+        ///     ("--clean", None)
+        ///     ("--include_nudge", None)
+        ///
+        /// Vec is intentional:
+        /// - preserves command-line order;
+        /// - permits repeated options;
+        /// - keeps options separate from positional operands.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands, if a future RGI command needs them.
+        pub positional_args: Vec<String>,
+    }
+
+    impl RgiConfig {
+        pub fn new(subcommand: RgiSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+            self
+        }
+    }
+
+    pub struct RgiArgGenerator;
+
+    impl ArgGenerator for RgiArgGenerator {
+        fn generate_args(
+            &self,
+            _run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<RgiConfig>())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "RGI requires an RgiConfig as extra argument"
+                    )
+                })?;
+
+            let mut args_vec = Vec::new();
+
+            args_vec.push(
+                match config.subcommand {
+                    RgiSubcommand::Load => "load",
+                    RgiSubcommand::Bwt => "bwt",
+                    RgiSubcommand::Main => "main",
+                    RgiSubcommand::KmerQuery => "kmer_query",
+                }
+                    .to_string(),
+            );
+
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
+                }
+            }
+
+            args_vec.extend(
+                config.positional_args.iter().cloned()
+            );
+
+            Ok(args_vec)
+        }
+    }
+
+    pub async fn rgi_presence_check(
+        config: &RunConfig,
+    ) -> anyhow::Result<f32> {
+        version_check(
+            RGI_TAG,
+            vec!["main", "--version"],
+            0,
+            0,
+            ChildStream::Stdout,
+            None,
+            config,
+        )
+            .await
+    }
+}
+
 /// Generates the command-line arguments for a given tool.
 ///
 /// # Arguments
@@ -4869,6 +5000,7 @@ pub fn generate_cli(
         SORT_TAG => Box::new(sort::SortArgGenerator),
         MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
         FLYE_TAG => Box::new(flye::FlyeArgGenerator),
+        RGI_TAG => Box::new(rgi::RgiArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -4935,6 +5067,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 MMSEQS_TAG => mmseqs::mmseqs_presence_check(&config).await,
                 FLYE_TAG => flye::flye_presence_check(&config, version_file).await,
                 PIGZ_TAG => pigz::pigz_presence_check(&config).await,
+                RGI_TAG => rgi::rgi_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))
