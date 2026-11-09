@@ -15,13 +15,15 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType, SPADES_TAG};
+use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
+                          SPADES_TAG, RgiSubcommand, RGI_TAG};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
     HostFilterCompletion,
 };
 use crate::utils::command::spades::SpadesConfig;
+use crate::utils::command::rgi::RgiConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{resolve_existing_input_path, validate_file_inputs, write_count_file};
@@ -64,6 +66,20 @@ struct RunRedupHandle {
     /// Completes after every per-end producer has reached EOF.
     /// Callers must install consumers for `redups_streams` before awaiting it.
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
+}
+
+#[derive(Debug)]
+struct RgiBwtKmaOutputs {
+    output_kma: Vec<PathBuf>,
+
+    kma_amr_results: PathBuf,
+    artifacts_mapping_stats: PathBuf,
+    gene_mapping_data: PathBuf,
+    overall_mapping_stats: PathBuf,
+    reference_mapping_stats: PathBuf,
+    output_sorted_length_100: PathBuf,
+    output_sorted_length_100_bai: PathBuf,
+    kma_amr_results_json: PathBuf,
 }
 
 /// Native streaming equivalent of the WDL RunRedup task.
@@ -1395,12 +1411,11 @@ pub async fn run(
             }
         }
     };
-
     info!(
-        "[AMR] prepared common inputs: reads={:?}, contigs={}",
-        prepared.non_host_reads_fa,
-        prepared.contigs_fa.display(),
-    );
+    "[AMR] prepared common inputs: reads={:?}, contigs={}",
+    prepared.non_host_reads_fa,
+    prepared.contigs_fa.display(),
+);
 
     Ok(())
 }
