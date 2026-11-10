@@ -1418,14 +1418,14 @@ pub async fn run(
             //   KMA stdout -> samtools fixmate stdin -> BAM stdout
             // ------------------------------------------------------------
 
-            let samtools_threads =
-                config.thread_allocation(SAMTOOLS_TAG, None);
+            let fixmate_threads =
+                config.thread_allocation(SAMTOOLS_TAG, Some("fixmate"));
 
             let fixmate_config =
                 SamtoolsConfig::new(SamtoolsSubcommand::Fixmate)
                     .option("--verbosity", "0")
                     .option("-z", "all")
-                    .option("--threads", samtools_threads.to_string())
+                    .option("--threads", fixmate_threads.to_string())
                     .flag("-m")
                     .option("-O", "bam")
                     .positional("-")
@@ -1510,9 +1510,12 @@ pub async fn run(
             let sort_temp_prefix =
                 sort_temp_dir.path().join("sr_amr_report.sorted");
 
+            let sort_threads =
+                config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
+
             let sort_config =
                 SamtoolsConfig::new(SamtoolsSubcommand::Sort)
-                    .option("--threads", samtools_threads.to_string())
+                    .option("--threads", sort_threads.to_string())
                     .option(
                         "-T",
                         sort_temp_prefix.to_string_lossy().to_string(),
