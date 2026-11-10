@@ -16,20 +16,33 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
-                          SPADES_TAG, KMA_TAG};
+                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
     HostFilterCompletion,
 };
 use crate::utils::command::kma::KmaConfig;
+use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file, write_byte_stream_to_file};
 use crate::utils::sambam::parse_sam_record;
-use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output,
-                            spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput, stream_to_cmd, fanout_to_channels};
+use crate::utils::streams::{
+    bytes_to_lines,
+    fanout_to_channels,
+    interleave_fastq_streams,
+    join_with_error_handling,
+    parse_bytes,
+    parse_child_output,
+    spawn_cmd,
+    stream_to_file,
+    stream_to_cmd,
+    ChildStream,
+    ParseMode,
+    ParseOutput,
+};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
@@ -64,9 +77,18 @@ struct RunRedupHandle {
 
 #[derive(Debug)]
 struct RunKmaHandle {
+    /// Complete line-oriented KMA SAM for the native AMR parser.
     sam_stream: ReceiverStream<ParseOutput>,
-    sam_write_task: JoinHandle<Result<(), anyhow::Error>>,
+
+    /// Raw KMA SAM bytes, unchanged, for direct streaming into samtools fixmate.
+    samtools_stream: mpsc::Receiver<ParseOutput>,
+
+    /// Completes when every raw KMA stdout byte has reached both branches.
     sam_fanout_done: oneshot::Receiver<Result<(), anyhow::Error>>,
+
+    /// Completes when the parser branch has converted raw byte chunks to lines.
+    sam_lines_task: JoinHandle<Result<(), anyhow::Error>>,
+
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
 
     // Keep KMA sidecars alive for downstream AMR post-processing.
@@ -753,12 +775,11 @@ async fn run_kma_amr(
     };
 
     // ------------------------------------------------------------
-    // KMA requires an output prefix even though the SAM stream is
-    // emitted on stdout.
+    // KMA requires an output prefix even though SAM is emitted on
+    // stdout.
     //
-    // The TempDir is returned in RunKmaHandle rather than owned by the
-    // process-completion task. This keeps KMA sidecars (.res/.fsa/
-    // .vcf.gz/etc.) alive for subsequent AMR post-processing.
+    // Keep the TempDir in RunKmaHandle so KMA sidecars remain alive
+    // for downstream RunRgiBwtKma processing.
     // ------------------------------------------------------------
 
     let kma_temp_dir =
@@ -800,7 +821,7 @@ async fn run_kma_amr(
         config.out_dir.join("amr_kma_stderr.log");
 
     // ------------------------------------------------------------
-    // Feed the structured FASTA stream directly to KMA.
+    // Feed structured FASTA directly to KMA.
     // ------------------------------------------------------------
 
     let (child, stdin_task, stderr_task) =
@@ -819,9 +840,8 @@ async fn run_kma_amr(
     // ------------------------------------------------------------
     // Take KMA stdout without retaining the child mutex.
     //
-    // stream_to_cmd's stdin task ultimately needs the child lock in
-    // order to wait for process completion. Holding that lock while
-    // draining SAM stdout would deadlock the process lifecycle.
+    // stream_to_cmd's stdin task ultimately waits on the child.
+    // Holding the child lock while consuming stdout would deadlock.
     // ------------------------------------------------------------
 
     let stdout = {
@@ -838,19 +858,23 @@ async fn run_kma_amr(
     };
 
     // ------------------------------------------------------------
-    // KMA `-sam` emits SAM text to stdout.
+    // KMA `-sam` emits serialized SAM on stdout.
     //
-    // parse_lines() removes line endings. Fan the resulting line stream
-    // into:
+    // IMPORTANT:
     //
-    //   1. the native SAM consumer
-    //   2. a diagnostic raw-KMA SAM file
+    // Keep this as RAW BYTES before fanout. This preserves the exact
+    // SAM byte stream, including line endings, for samtools.
     //
-    // write_byte_stream_to_file(..., append_newline=true) restores the
-    // line endings when materializing the diagnostic SAM.
+    //                         ┌-> bytes_to_lines()
+    //                         │      -> native SAM parser
+    // KMA -> parse_bytes() -> fanout
+    //                         │
+    //                         └-> samtools fixmate stdin
+    //
+    // There is deliberately no raw-SAM file boundary here.
     // ------------------------------------------------------------
 
-    let sam_rx = crate::utils::streams::parse_lines(
+    let sam_bytes_rx = parse_bytes(
         stdout,
         &config,
         StreamDataType::JustBytes,
@@ -860,47 +884,64 @@ async fn run_kma_amr(
 
     let (mut sam_branches, sam_fanout_done) =
         fanout_to_channels(
-            ReceiverStream::new(sam_rx),
+            ReceiverStream::new(sam_bytes_rx),
             2,
-            "AMR KMA SAM",
+            "AMR KMA SAM bytes",
             &config,
             StreamDataType::JustBytes,
         )
             .await?;
 
-    let sam_stream =
-        ReceiverStream::new(sam_branches.remove(0));
+    // ------------------------------------------------------------
+    // Branch 1: native AMR parser.
+    //
+    // KMA stdout was chunked arbitrarily by parse_bytes(), so convert
+    // the byte stream back into complete SAM lines before handing it
+    // to consume_kma_sam().
+    //
+    // bytes_to_lines() preserves the newline in each emitted line.
+    // consume_kma_sam() therefore needs to trim the line ending before
+    // parsing (see small change below).
+    // ------------------------------------------------------------
 
-    let sam_file_stream =
-        ReceiverStream::new(sam_branches.remove(0));
+    let native_sam_bytes_rx = sam_branches.remove(0);
 
-    let raw_sam_path =
-        config.out_dir.join("amr_kma_raw.sam");
-
-    let sam_write_task =
-        write_byte_stream_to_file(
-            &raw_sam_path,
-            sam_file_stream,
-            config.clone(),
-            StreamDataType::JustBytes,
-            "AMR raw KMA SAM",
-            true,
+    let (sam_lines_rx, sam_lines_task) =
+        bytes_to_lines(
+            native_sam_bytes_rx,
+            config.base_buffer_size,
         )
             .await
             .map_err(PipelineError::Other)?;
 
+    let sam_stream =
+        ReceiverStream::new(sam_lines_rx);
+
     // ------------------------------------------------------------
-    // Own KMA process completion in one task.
+    // Branch 2: exact raw SAM bytes for samtools fixmate.
     //
-    // IMPORTANT:
+    // Do NOT parse, rewrite, materialize, or otherwise modify this
+    // branch. stream_to_cmd() can feed these ParseOutput::Bytes
+    // directly into samtools stdin.
+    // ------------------------------------------------------------
+
+    let samtools_stream =
+        sam_branches.remove(0);
+
+    // ------------------------------------------------------------
+    // Own KMA-side producer/process completion in one task.
     //
-    // kma_temp_dir is deliberately NOT moved into this task. It is
-    // returned in RunKmaHandle so KMA sidecars remain available after
-    // process completion.
+    // kma_temp_dir is deliberately NOT moved into this task. The
+    // returned RunKmaHandle owns it so KMA sidecars survive process
+    // completion.
     //
-    // The SAM receivers are also deliberately not consumed here. The
-    // caller installs their consumers immediately so stdout cannot
-    // backpressure KMA.
+    // Neither SAM branch is consumed here. The caller must install
+    // both downstream consumers immediately:
+    //
+    //   sam_stream      -> consume_kma_sam()
+    //   samtools_stream -> samtools fixmate
+    //
+    // This ensures KMA stdout cannot backpressure indefinitely.
     // ------------------------------------------------------------
 
     let completion_task = tokio::spawn(async move {
@@ -945,8 +986,9 @@ async fn run_kma_amr(
 
     Ok(RunKmaHandle {
         sam_stream,
-        sam_write_task,
+        samtools_stream,
         sam_fanout_done,
+        sam_lines_task,
         completion_task,
         output_temp_dir: kma_temp_dir,
         output_prefix: kma_output_prefix,
@@ -1020,10 +1062,11 @@ async fn consume_kma_sam(
         let line = std::str::from_utf8(&line_bytes)
             .map_err(|e| {
                 anyhow!(
-                    "RunKMA emitted non-UTF8 SAM line: {}",
-                    e
-                )
-            })?;
+            "RunKMA emitted non-UTF8 SAM line: {}",
+            e
+        )
+            })?
+            .trim_end_matches(['\r', '\n']);
 
         if line.starts_with('@') {
             if let Some(reference) = parse_kma_sq_header(line)? {
@@ -1330,11 +1373,12 @@ pub async fn run(
                 .await?;
             let RunKmaHandle {
                 sam_stream: kma_sam_stream,
-                sam_write_task,
+                samtools_stream: kma_samtools_stream,
                 sam_fanout_done,
+                sam_lines_task,
                 completion_task: kma_completion_task,
                 output_temp_dir: kma_output_temp_dir,
-                output_prefix: _kma_output_prefix,
+                output_prefix: kma_output_prefix,
             } = kma;
             // Keep KMA sidecars alive through downstream AMR post-processing.
             final_temp_dirs.push(kma_output_temp_dir);
@@ -1353,7 +1397,204 @@ pub async fn run(
                 consume_kma_sam(kma_sam_stream)
             );
 
+            // ------------------------------------------------------------
+            // Stream raw KMA SAM directly through the same samtools fixmate
+            // transformation used by RGI.
+            //
+            // RGI:
+            //
+            //   samtools fixmate
+            //       --verbosity 0
+            //       -z all
+            //       --threads N
+            //       -m
+            //       input.sam
+            //       -O bam
+            //       output.bam
+            //
+            // Here both file operands are "-" so the transformation remains
+            // fully streaming:
+            //
+            //   KMA stdout -> samtools fixmate stdin -> BAM stdout
+            // ------------------------------------------------------------
 
+            let samtools_threads =
+                config.thread_allocation(SAMTOOLS_TAG, None);
+
+            let fixmate_config =
+                SamtoolsConfig::new(SamtoolsSubcommand::Fixmate)
+                    .option("--verbosity", "0")
+                    .option("-z", "all")
+                    .option("--threads", samtools_threads.to_string())
+                    .flag("-m")
+                    .option("-O", "bam")
+                    .positional("-")
+                    .positional("-");
+
+            let fixmate_args = generate_cli(
+                SAMTOOLS_TAG,
+                &config,
+                Some(&fixmate_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+    "[AMR] RunRgiBwtKma samtools fixmate args: {:?}",
+    fixmate_args
+);
+
+            let (
+                fixmate_child,
+                fixmate_stdin_task,
+                fixmate_stderr_task,
+            ) = stream_to_cmd(
+                config.clone(),
+                kma_samtools_stream,
+                SAMTOOLS_TAG,
+                fixmate_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+                None,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            // ------------------------------------------------------------
+            // Stream fixmate BAM stdout directly into samtools sort.
+            //
+            // RGI:
+            //
+            //   samtools sort
+            //       --threads N
+            //       -T <prefix>.sorted
+            //       -o <sorted.bam>
+            //       <unsorted.bam>
+            //
+            // We preserve the sort operation but keep the pipeline streaming:
+            //
+            //   fixmate stdout -> samtools sort stdin -> sorted BAM stdout
+            //
+            // No intermediate unsorted BAM is materialized.
+            // ------------------------------------------------------------
+
+            let fixmate_stdout = {
+                let mut child_guard = fixmate_child.lock().await;
+
+                child_guard
+                    .stdout
+                    .take()
+                    .ok_or_else(|| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools fixmate stdout not available"
+            ))
+                    })?
+            };
+
+            let fixmate_bam_rx = parse_bytes(
+                fixmate_stdout,
+                &config,
+                StreamDataType::JustBytes,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let sort_temp_dir = choose_temp_dir(
+                config.input_size,
+                &config.ram_temp_dir,
+                &config.args.nvme_scratch,
+                4,
+                false,
+            )
+                .await?;
+
+            let sort_temp_prefix =
+                sort_temp_dir.path().join("sr_amr_report.sorted");
+
+            let sort_config =
+                SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+                    .option("--threads", samtools_threads.to_string())
+                    .option(
+                        "-T",
+                        sort_temp_prefix.to_string_lossy().to_string(),
+                    )
+                    .option("-O", "bam")
+                    .positional("-");
+
+            let sort_args = generate_cli(
+                SAMTOOLS_TAG,
+                &config,
+                Some(&sort_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+    "[AMR] RunRgiBwtKma samtools sort args: {:?}",
+    sort_args
+);
+
+            let (
+                sort_child,
+                sort_stdin_task,
+                sort_stderr_task,
+            ) = stream_to_cmd(
+                config.clone(),
+                fixmate_bam_rx,
+                SAMTOOLS_TAG,
+                sort_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+                None,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+
+
+            // ------------------------------------------------------------
+            // Consume samtools sort stdout into the sorted BAM.
+            //
+            // This is the first intentional BAM file boundary in the RGI
+            // workflow. RGI indexes this sorted BAM before the subsequent
+            // bamtools filter step.
+            // ------------------------------------------------------------
+
+            let sort_stdout = {
+                let mut child_guard = sort_child.lock().await;
+
+                child_guard
+                    .stdout
+                    .take()
+                    .ok_or_else(|| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools sort stdout not available"
+            ))
+                    })?
+            };
+
+            let sorted_bam_rx = parse_bytes(
+                sort_stdout,
+                &config,
+                StreamDataType::JustBytes,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let sorted_bam_path =
+                sort_temp_dir.path().join("sr_amr_report.sorted.temp.bam");
+
+            let sorted_bam_write_task = write_byte_stream_to_file(
+                &sorted_bam_path,
+                ReceiverStream::new(sorted_bam_rx),
+                config.clone(),
+                StreamDataType::JustBytes,
+                "RunRgiBwtKma sorted BAM",
+                false,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            // Keep samtools sort scratch alive until sort has completed.
+            final_temp_dirs.push(sort_temp_dir);
 
 
             // ------------------------------------------------------------
@@ -1607,17 +1848,105 @@ pub async fn run(
             // Complete all host-filter result branches.
             // ------------------------------------------------------------
 
+            // ------------------------------------------------------------
+            // Complete the streaming KMA -> fixmate -> sort -> BAM chain.
+            //
+            // All stdout consumers have already been installed above, so it
+            // is now safe to await producer/process completion.
+            //
+            // The sorted BAM is not considered ready until:
+            //   * fixmate has consumed all KMA SAM and exited successfully
+            //   * sort has consumed all fixmate BAM and exited successfully
+            //   * sort stdout has been completely written to disk
+            // ------------------------------------------------------------
+
+            let rgi_bwt_bam_fut = async move {
+                let (
+                    fixmate_stdin_result,
+                    sort_stdin_result,
+                    sorted_bam_write_result,
+                ) = tokio::join!(
+        fixmate_stdin_task,
+        sort_stdin_task,
+        sorted_bam_write_task,
+    );
+
+                fixmate_stdin_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools fixmate stdin task panicked: {}",
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                sort_stdin_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools sort stdin task panicked: {}",
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                sorted_bam_write_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma sorted BAM writer task panicked: {}",
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                let (
+                    fixmate_stderr_result,
+                    sort_stderr_result,
+                ) = tokio::join!(
+        fixmate_stderr_task,
+        sort_stderr_task,
+    );
+
+                fixmate_stderr_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools fixmate stderr task panicked: {}",
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                sort_stderr_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools sort stderr task panicked: {}",
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                info!(
+        "[AMR] RunRgiBwtKma sorted BAM ready: {}",
+        sorted_bam_path.display()
+    );
+
+                Ok::<PathBuf, PipelineError>(sorted_bam_path)
+            };
+
             let (
                 validation_and_qc,
                 host_counts,
                 (),
                 dedup_and_subsample,
-            ) = tokio::try_join!(
-                validation_and_qc_fut,
-                host_counts_fut,
-                kallisto_fut,
-                dedup_and_subsample_fut,
-            )?;
+                sorted_bam_path,
+                ) = tokio::try_join!(
+        validation_and_qc_fut,
+        host_counts_fut,
+        kallisto_fut,
+        dedup_and_subsample_fut,
+        rgi_bwt_bam_fut,
+    )?;
+
+
 
             let (
                 validation_stats,
@@ -1766,11 +2095,11 @@ pub async fn run(
                 })?
                 .map_err(PipelineError::Other)?;
 
-            sam_write_task
+            sam_lines_task
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-            "RunKMA raw SAM writer task panicked: {}",
+            "RunKMA SAM line adapter task panicked: {}",
             e
         ))
                 })?
