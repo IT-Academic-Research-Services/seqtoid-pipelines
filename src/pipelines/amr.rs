@@ -26,7 +26,7 @@ use crate::utils::command::kma::KmaConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
-use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file};
+use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file, write_byte_stream_to_file};
 use crate::utils::sambam::parse_sam_record;
 use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output,
                             spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput, stream_to_cmd, fanout_to_channels};
@@ -65,7 +65,13 @@ struct RunRedupHandle {
 #[derive(Debug)]
 struct RunKmaHandle {
     sam_stream: ReceiverStream<ParseOutput>,
+    sam_write_task: JoinHandle<Result<(), anyhow::Error>>,
+    sam_fanout_done: oneshot::Receiver<Result<(), anyhow::Error>>,
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
+
+    // Keep KMA sidecars alive for downstream AMR post-processing.
+    output_temp_dir: TempDir,
+    output_prefix: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -748,7 +754,11 @@ async fn run_kma_amr(
 
     // ------------------------------------------------------------
     // KMA requires an output prefix even though the SAM stream is
-    // emitted on stdout. Keep KMA's sidecars in temporary storage.
+    // emitted on stdout.
+    //
+    // The TempDir is returned in RunKmaHandle rather than owned by the
+    // process-completion task. This keeps KMA sidecars (.res/.fsa/
+    // .vcf.gz/etc.) alive for subsequent AMR post-processing.
     // ------------------------------------------------------------
 
     let kma_temp_dir =
@@ -765,7 +775,7 @@ async fn run_kma_amr(
 
     let kma_config = KmaConfig::amr_stdin(
         kma_db,
-        kma_output_prefix,
+        kma_output_prefix.clone(),
         paired,
     );
 
@@ -827,9 +837,19 @@ async fn run_kma_amr(
             })?
     };
 
-    // KMA `-sam` emits SAM text to stdout. ParseMode::Lines semantics
-    // are represented here by parse_lines(): each channel item is one
-    // SAM line with its newline removed.
+    // ------------------------------------------------------------
+    // KMA `-sam` emits SAM text to stdout.
+    //
+    // parse_lines() removes line endings. Fan the resulting line stream
+    // into:
+    //
+    //   1. the native SAM consumer
+    //   2. a diagnostic raw-KMA SAM file
+    //
+    // write_byte_stream_to_file(..., append_newline=true) restores the
+    // line endings when materializing the diagnostic SAM.
+    // ------------------------------------------------------------
+
     let sam_rx = crate::utils::streams::parse_lines(
         stdout,
         &config,
@@ -838,18 +858,52 @@ async fn run_kma_amr(
         .await
         .map_err(PipelineError::Other)?;
 
+    let (mut sam_branches, sam_fanout_done) =
+        fanout_to_channels(
+            ReceiverStream::new(sam_rx),
+            2,
+            "AMR KMA SAM",
+            &config,
+            StreamDataType::JustBytes,
+        )
+            .await?;
+
+    let sam_stream =
+        ReceiverStream::new(sam_branches.remove(0));
+
+    let sam_file_stream =
+        ReceiverStream::new(sam_branches.remove(0));
+
+    let raw_sam_path =
+        config.out_dir.join("amr_kma_raw.sam");
+
+    let sam_write_task =
+        write_byte_stream_to_file(
+            &raw_sam_path,
+            sam_file_stream,
+            config.clone(),
+            StreamDataType::JustBytes,
+            "AMR raw KMA SAM",
+            true,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
     // ------------------------------------------------------------
-    // Own all KMA-side producer/process completion in one task.
+    // Own KMA process completion in one task.
     //
-    // The SAM receiver is deliberately NOT consumed here. Its caller
-    // must install a consumer immediately so KMA stdout cannot
-    // backpressure.
+    // IMPORTANT:
+    //
+    // kma_temp_dir is deliberately NOT moved into this task. It is
+    // returned in RunKmaHandle so KMA sidecars remain available after
+    // process completion.
+    //
+    // The SAM receivers are also deliberately not consumed here. The
+    // caller installs their consumers immediately so stdout cannot
+    // backpressure KMA.
     // ------------------------------------------------------------
 
     let completion_task = tokio::spawn(async move {
-        // KMA may access/write its sidecars until process exit.
-        let _kma_temp_dir = kma_temp_dir;
-
         input_adapter_task
             .await
             .map_err(|e| {
@@ -890,8 +944,12 @@ async fn run_kma_amr(
     });
 
     Ok(RunKmaHandle {
-        sam_stream: ReceiverStream::new(sam_rx),
+        sam_stream,
+        sam_write_task,
+        sam_fanout_done,
         completion_task,
+        output_temp_dir: kma_temp_dir,
+        output_prefix: kma_output_prefix,
     })
 }
 
@@ -1271,9 +1329,15 @@ pub async fn run(
             )
                 .await?;
             let RunKmaHandle {
-                sam_stream: mut kma_sam_stream,
+                sam_stream: kma_sam_stream,
+                sam_write_task,
+                sam_fanout_done,
                 completion_task: kma_completion_task,
+                output_temp_dir: kma_output_temp_dir,
+                output_prefix: _kma_output_prefix,
             } = kma;
+            // Keep KMA sidecars alive through downstream AMR post-processing.
+            final_temp_dirs.push(kma_output_temp_dir);
 
             let redup_completion_task = redup.completion_task;
 
@@ -1701,6 +1765,27 @@ pub async fn run(
         ))
                 })?
                 .map_err(PipelineError::Other)?;
+
+            sam_write_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunKMA raw SAM writer task panicked: {}",
+            e
+        ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            sam_fanout_done
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunKMA SAM fanout completion receiver dropped: {}",
+            e
+        ))
+                })?
+                .map_err(PipelineError::Other)?;
+
 
 
                 info!(
