@@ -27,6 +27,7 @@ use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file};
+use crate::utils::sambam::parse_sam_record;
 use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output,
                             spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput, stream_to_cmd, fanout_to_channels};
 use crate::utils::subsample::load_duplicate_clusters_csv;
@@ -65,6 +66,36 @@ struct RunRedupHandle {
 struct RunKmaHandle {
     sam_stream: ReceiverStream<ParseOutput>,
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
+}
+
+#[derive(Debug, Clone)]
+struct KmaReference {
+    name: String,
+    length: u64,
+}
+
+#[derive(Debug, Clone)]
+struct KmaAlignment {
+    qname: String,
+    flag: u16,
+    rname: String,
+    pos: u64,
+    mapq: u8,
+    cigar: String,
+    seq: String,
+}
+
+#[derive(Debug)]
+struct KmaSamResults {
+    references: HashMap<String, KmaReference>,
+    alignments: Vec<KmaAlignment>,
+
+    /// Number of non-header SAM records emitted by KMA.
+    total_records: u64,
+
+    /// KMA records that are not usable alignments despite potentially
+    /// misleading FLAG values, e.g. RNAME="*", POS=0, CIGAR="*".
+    invalid_alignment_records: u64,
 }
 
 /// Native streaming equivalent of the WDL RunRedup task.
@@ -863,6 +894,126 @@ async fn run_kma_amr(
     })
 }
 
+fn parse_kma_sq_header(line: &str) -> anyhow::Result<Option<KmaReference>> {
+    if !line.starts_with("@SQ\t") {
+        return Ok(None);
+    }
+
+    let mut name: Option<&str> = None;
+    let mut length: Option<u64> = None;
+
+    for field in line.split('\t').skip(1) {
+        if let Some(value) = field.strip_prefix("SN:") {
+            name = Some(value);
+        } else if let Some(value) = field.strip_prefix("LN:") {
+            length = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|e| {
+                        anyhow!(
+                            "Invalid @SQ LN value '{}' in KMA SAM header '{}': {}",
+                            value,
+                            line,
+                            e
+                        )
+                    })?,
+            );
+        }
+    }
+
+    let name = name.ok_or_else(|| {
+        anyhow!("KMA @SQ header missing SN field: {}", line)
+    })?;
+
+    let length = length.ok_or_else(|| {
+        anyhow!("KMA @SQ header missing LN field: {}", line)
+    })?;
+
+    Ok(Some(KmaReference {
+        name: name.to_string(),
+        length,
+    }))
+}
+
+fn is_valid_kma_alignment(record: &crate::utils::sambam::SamRecordRef<'_>) -> bool {
+    !record.flag_is_unmapped()
+        && record.rname != "*"
+        && record.pos != 0
+        && record.cigar != "*"
+}
+
+async fn consume_kma_sam(
+    mut sam_stream: ReceiverStream<ParseOutput>,
+) -> anyhow::Result<KmaSamResults> {
+    let mut references = HashMap::<String, KmaReference>::new();
+    let mut alignments = Vec::<KmaAlignment>::new();
+
+    let mut total_records = 0u64;
+    let mut invalid_alignment_records = 0u64;
+
+    while let Some(item) = sam_stream.next().await {
+        let ParseOutput::Bytes(line_bytes) = item else {
+            return Err(anyhow!(
+                "RunKMA expected line-oriented Bytes output"
+            ));
+        };
+
+        let line = std::str::from_utf8(&line_bytes)
+            .map_err(|e| {
+                anyhow!(
+                    "RunKMA emitted non-UTF8 SAM line: {}",
+                    e
+                )
+            })?;
+
+        if line.starts_with('@') {
+            if let Some(reference) = parse_kma_sq_header(line)? {
+                references.insert(
+                    reference.name.clone(),
+                    reference,
+                );
+            }
+
+            continue;
+        }
+
+        total_records += 1;
+
+        let record = parse_sam_record(line)?;
+
+        if !is_valid_kma_alignment(&record) {
+            invalid_alignment_records += 1;
+            continue;
+        }
+
+        alignments.push(KmaAlignment {
+            qname: record.qname.to_string(),
+            flag: record.flag,
+            rname: record.rname.to_string(),
+            pos: record.pos,
+            mapq: record.mapq,
+            cigar: record.cigar.to_string(),
+            seq: record.seq.to_string(),
+        });
+    }
+
+    info!(
+        "[AMR] RunKMA SAM parsed: {} records, {} valid mapped alignments, \
+         {} non-alignment records, {} reference sequences",
+        total_records,
+        alignments.len(),
+        invalid_alignment_records,
+        references.len(),
+    );
+
+    Ok(KmaSamResults {
+        references,
+        alignments,
+        total_records,
+        invalid_alignment_records,
+    })
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -1125,52 +1276,16 @@ pub async fn run(
             let redup_completion_task = redup.completion_task;
 
             // ------------------------------------------------------------
-            // TEST: drain KMA SAM stdout to a file.
+            // Parse KMA SAM stdout directly into the native AMR
+            // representation.
             //
-            // KMA stdout has already been split with ParseMode::Lines,
-            // which strips line endings. Restore '\n' here so the debug
-            // artifact is a valid SAM file.
+            // This consumer is installed immediately after RunKMA returns so
+            // KMA stdout can never block on the bounded line channel.
             // ------------------------------------------------------------
 
-            let kma_sam_path = out_dir.join("amr_kma_raw.sam");
-
-            let kma_sam_task = tokio::spawn(async move {
-                use tokio::io::{AsyncWriteExt, BufWriter};
-
-                let file = tokio::fs::File::create(&kma_sam_path)
-                    .await
-                    .map_err(|e| {
-                        anyhow!(
-                "Failed to create KMA SAM debug output {}: {}",
-                kma_sam_path.display(),
-                e
-            )
-                    })?;
-
-                let mut writer = BufWriter::new(file);
-                let mut line_count = 0u64;
-
-                while let Some(item) = kma_sam_stream.next().await {
-                    let ParseOutput::Bytes(line) = item else {
-                        return Err(anyhow!(
-                "RunKMA expected line-oriented Bytes output"
-            ));
-                    };
-
-                    writer.write_all(&line).await?;
-                    writer.write_all(b"\n").await?;
-                    line_count += 1;
-                }
-
-                writer.flush().await?;
-
-                info!(
-        "[AMR] RunKMA debug SAM capture complete: {} lines",
-        line_count
-    );
-
-                Ok::<(), anyhow::Error>(())
-            });
+            let kma_sam_task = tokio::spawn(
+                consume_kma_sam(kma_sam_stream)
+            );
 
 
 
@@ -1575,15 +1690,37 @@ pub async fn run(
 
             // KMA stdout must be drained concurrently with KMA execution.
             // At this point wait for both sides to finish.
-            kma_sam_task
+            let kma_sam_results = kma_sam_task
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-            "RunKMA SAM capture task panicked: {}",
+            "RunKMA SAM parser task panicked: {}",
             e
         ))
                 })?
                 .map_err(PipelineError::Other)?;
+
+
+                info!(
+        "[AMR] RunKMA native results: records={}, mapped={}, references={}",
+        kma_sam_results.total_records,
+        kma_sam_results.alignments.len(),
+        kma_sam_results.references.len(),
+    );
+
+            for alignment in &kma_sam_results.alignments {
+                info!(
+        "[AMR] KMA mapped: qname={} flag={} rname={} pos={} mapq={} cigar={}",
+        alignment.qname,
+        alignment.flag,
+        alignment.rname,
+        alignment.pos,
+        alignment.mapq,
+        alignment.cigar,
+    );
+            }
+
+
 
             kma_completion_task
                 .await
