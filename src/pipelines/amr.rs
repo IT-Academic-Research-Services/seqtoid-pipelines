@@ -82,6 +82,7 @@ struct KmaAlignment {
     pos: u64,
     mapq: u8,
     cigar: String,
+    rnext: String,
     seq: String,
 }
 
@@ -993,6 +994,7 @@ async fn consume_kma_sam(
             pos: record.pos,
             mapq: record.mapq,
             cigar: record.cigar.to_string(),
+            rnext: record.rnext.to_string(),
             seq: record.seq.to_string(),
         });
     }
