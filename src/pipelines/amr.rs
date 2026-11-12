@@ -16,7 +16,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
-                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, SamtoolsSubcommand, BamtoolsSubcommand};
+                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG,
+                          BedtoolsSubcommand, SamtoolsSubcommand, BamtoolsSubcommand};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
@@ -25,6 +26,7 @@ use crate::pipelines::short_read_mngs::{
 use crate::utils::command::kma::KmaConfig;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::bamtools::BamtoolsConfig;
+use crate::utils::command::bedtools::BedtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
@@ -2621,6 +2623,84 @@ pub async fn run(
                     alignments.len()
                 );
             }
+
+            // ------------------------------------------------------------
+            // Compute the coverage histogram used by RGI reporting.
+            //
+            // IMPORTANT FILE BOUNDARY:
+            //
+            // sr_amr_report.sorted.length_100.bam is fully materialized
+            // before execution can reach this point. rgi_bwt_bam_fut awaited
+            // sorted_bam_write_task to EOF and returned sorted_bam_path only
+            // after that writer completed successfully.
+            //
+            // The BAM has also already been successfully indexed and consumed
+            // by samtools idxstats and samtools view above.
+            //
+            // RGI:
+            //
+            //   bedtools genomecov
+            //       -ibam sr_amr_report.sorted.length_100.bam
+            //
+            // RGI writes genomecov stdout to
+            // sr_amr_report.coverage_all_positions.temp.txt. We do not need
+            // that temporary file boundary, so keep stdout as a line stream.
+            // Parsing/aggregation of the histogram is the following stage.
+            // ------------------------------------------------------------
+
+            if !sorted_bam_path.is_file() {
+                return Err(PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma BEDTools genomecov input BAM is missing: {}",
+                    sorted_bam_path.display()
+                )));
+            }
+
+            let genomecov_config =
+                BedtoolsConfig::new(BedtoolsSubcommand::Genomecov)
+                    .option(
+                        "-ibam",
+                        sorted_bam_path
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+
+            let genomecov_args = generate_cli(
+                BEDTOOLS_TAG,
+                &config,
+                Some(&genomecov_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma bedtools genomecov args: {:?}",
+                genomecov_args
+            );
+
+            let (mut genomecov_child, genomecov_stderr_task) =
+                spawn_cmd(
+                    config.clone(),
+                    BEDTOOLS_TAG,
+                    genomecov_args,
+                    config.args.verbose,
+                    None,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+            // genomecov emits a tab-delimited coverage histogram on stdout.
+            // Keep it line-oriented so the next stage can parse each histogram
+            // record directly without materializing RGI's temporary text file.
+            let mut genomecov_rx =
+                parse_child_output(
+                    &mut genomecov_child,
+                    ChildStream::Stdout,
+                    ParseMode::Lines,
+                    &config,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+
 
 
 
