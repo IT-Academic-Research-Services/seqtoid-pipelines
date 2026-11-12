@@ -123,6 +123,7 @@ pub enum SamtoolsSubcommand {
     Stats,
     Sort,
     Index,
+    Idxstats,
     Mpileup,
     Consensus,
     Depth,
@@ -460,7 +461,7 @@ impl RunConfig {
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
-            (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
+            (SAMTOOLS_TAG, Some("idxstats")) | (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
             _ => CoreAllocation::Minimal,
         }
     }

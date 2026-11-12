@@ -1021,6 +1021,7 @@ pub mod samtools {
                     SamtoolsSubcommand::Stats => "stats",
                     SamtoolsSubcommand::Sort => "sort",
                     SamtoolsSubcommand::Index => "index",
+                    SamtoolsSubcommand::Idxstats => "idxstats",
                     SamtoolsSubcommand::Mpileup => "mpileup",
                     SamtoolsSubcommand::Consensus => "consensus",
                     SamtoolsSubcommand::Depth => "depth",
