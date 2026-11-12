@@ -13,7 +13,7 @@ use crate::config::defs::{
     FASTP_TAG, H5DUMP_TAG, HISAT2_TAG, IVAR_TAG, KALLISTO_TAG, KRAKEN2_TAG, MAFFT_TAG,
     MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, MUSCLE_TAG, NUCMER_TAG, PIGZ_TAG, QUAST_TAG,
     SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, FLYE_TAG,
-    KMA_TAG, BAMTOOLS_TAG, TOOL_VERSIONS,
+    KMA_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG, TOOL_VERSIONS,
 };
 use crate::utils::streams::spawn_cmd;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
@@ -5202,6 +5202,149 @@ pub mod kma {
     }
 }
 
+pub mod bedtools {
+    use crate::config::defs::{
+        BedtoolsSubcommand,
+        RunConfig,
+        BEDTOOLS_TAG,
+    };
+    use crate::utils::command::{
+        version_check,
+        ArgGenerator,
+    };
+    use crate::utils::streams::ChildStream;
+    use anyhow::{anyhow, Result};
+
+    #[derive(Debug)]
+    pub struct BedtoolsConfig {
+        pub subcommand: BedtoolsSubcommand,
+
+        /// Ordered command-line options and flags.
+        ///
+        /// Examples:
+        ///
+        ///     ("-ibam", Some("input.bam"))
+        ///     ("-split", None)
+        ///
+        /// Vec is intentional so command-line ordering is preserved and
+        /// repeated options remain possible.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+
+        /// Ordered positional operands, if required by a future BedTools
+        /// subcommand.
+        pub positional_args: Vec<String>,
+    }
+
+    impl BedtoolsConfig {
+        pub fn new(subcommand: BedtoolsSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+                positional_args: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((flag.into(), None));
+
+            self
+        }
+
+        pub fn positional(
+            mut self,
+            value: impl Into<String>,
+        ) -> Self {
+            self.positional_args.push(value.into());
+
+            self
+        }
+    }
+
+    pub struct BedtoolsArgGenerator;
+
+    /// Checks whether BedTools is installed and returns its major/minor
+    /// version.
+    ///
+    /// BedTools 2.31.1:
+    ///
+    ///     $ bedtools --version
+    ///     bedtools v2.31.1
+    ///
+    /// The shared version parser strips the leading `v` and records 2.31.
+    pub async fn bedtools_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
+        version_check(
+            BEDTOOLS_TAG,
+            vec!["--version"],
+            0,
+            1,
+            ChildStream::Stdout,
+            None,
+            config,
+        )
+            .await
+    }
+
+    impl ArgGenerator for BedtoolsArgGenerator {
+        fn generate_args(
+            &self,
+            _run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| {
+                    e.downcast_ref::<BedtoolsConfig>()
+                })
+                .ok_or_else(|| {
+                    anyhow!(
+                        "BedTools requires a BedtoolsConfig as extra argument"
+                    )
+                })?;
+
+            let mut args = Vec::new();
+
+            args.push(
+                match config.subcommand {
+                    BedtoolsSubcommand::Genomecov => "genomecov",
+                }
+                    .to_string(),
+            );
+
+            // Serialize caller-specified options exactly and in order.
+            for (key, value) in &config.subcommand_fields {
+                args.push(key.clone());
+
+                if let Some(value) = value {
+                    args.push(value.clone());
+                }
+            }
+
+            // Preserve positional operands for future BedTools commands.
+            args.extend(
+                config.positional_args.iter().cloned()
+            );
+
+            Ok(args)
+        }
+    }
+}
+
 pub mod bamtools {
     use crate::config::defs::{
         BamtoolsSubcommand,
@@ -5350,6 +5493,7 @@ pub fn generate_cli(
         FLYE_TAG => Box::new(flye::FlyeArgGenerator),
         KMA_TAG => Box::new(kma::KmaArgGenerator),
         BAMTOOLS_TAG => Box::new(bamtools::BamtoolsArgGenerator),
+        BEDTOOLS_TAG => Box::new(bedtools::BedtoolsArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -5418,6 +5562,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 PIGZ_TAG => pigz::pigz_presence_check(&config).await,
                 KMA_TAG => kma::kma_presence_check(&config).await,
                 BAMTOOLS_TAG => bamtools::bamtools_presence_check(&config).await,
+                BEDTOOLS_TAG => {bedtools::bedtools_presence_check(&config).await}
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

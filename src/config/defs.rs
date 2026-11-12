@@ -49,6 +49,7 @@ pub const MMSEQS_TAG: &str = "mmseqs";
 pub const FLYE_TAG: &str = "flye";
 pub const KMA_TAG: &str = "kma";
 pub const BAMTOOLS_TAG: &str = "bamtools";
+pub const BEDTOOLS_TAG: &str = "bedtools";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";
@@ -96,6 +97,7 @@ lazy_static! {
         m.insert(FLYE_TAG, 2.9);
         m.insert(KMA_TAG, 1.7);
         m.insert(BAMTOOLS_TAG, 2.5);
+        m.insert(BEDTOOLS_TAG, 2.31);
         m
     };
 }
@@ -164,6 +166,11 @@ pub enum DiamondSubcommand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BamtoolsSubcommand {
     Filter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BedtoolsSubcommand {
+    Genomecov,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -461,7 +468,7 @@ impl RunConfig {
             (BCFTOOLS_TAG, Some("call")) | (QUAST_TAG, _) | (MUSCLE_TAG, _) => CoreAllocation::High,
             (SAMTOOLS_TAG, Some("view")) | (SAMTOOLS_TAG, Some("stats")) |
             (SAMTOOLS_TAG, Some("depth")) | (BCFTOOLS_TAG, Some("view")) | (SEQKIT_TAG, _) => CoreAllocation::Low,
-            (SAMTOOLS_TAG, Some("idxstats")) | (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
+            (BEDTOOLS_TAG, _)| (SAMTOOLS_TAG, Some("idxstats")) | (IVAR_TAG, _) | (SHOW_COORDS_TAG, _) | (H5DUMP_TAG, _) => CoreAllocation::Minimal,
             _ => CoreAllocation::Minimal,
         }
     }
