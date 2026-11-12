@@ -2106,12 +2106,106 @@ pub async fn run(
                 dedup_and_subsample,
                 sorted_bam_path,
             ) = tokio::try_join!(
-        validation_and_qc_fut,
-        host_counts_fut,
-        kallisto_fut,
-        dedup_and_subsample_fut,
-        rgi_bwt_bam_fut,
-    )?;
+                validation_and_qc_fut,
+                host_counts_fut,
+                kallisto_fut,
+                dedup_and_subsample_fut,
+                rgi_bwt_bam_fut,
+            )?;
+
+            // ------------------------------------------------------------
+            // Index the completed coordinate-sorted AMR BAM.
+            //
+            // rgi_bwt_bam_fut does not return until the final
+            // sr_amr_report.sorted.length_100.bam writer has reached EOF.
+            // samtools index therefore starts only after the durable BAM
+            // file boundary is complete.
+            // ------------------------------------------------------------
+
+            let sorted_bai_path =
+                PathBuf::from(format!("{}.bai", sorted_bam_path.display()));
+
+            let index_threads =
+                config.thread_allocation(SAMTOOLS_TAG, Some("index"));
+
+            let index_config =
+                SamtoolsConfig::new(SamtoolsSubcommand::Index)
+                    .option("-@", index_threads.to_string())
+                    .flag("-b")
+                    .positional(
+                        sorted_bam_path
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                    .positional(
+                        sorted_bai_path
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+
+            let index_args = generate_cli(
+                SAMTOOLS_TAG,
+                &config,
+                Some(&index_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+    "[AMR] RunRgiBwtKma samtools index args: {:?}",
+    index_args
+);
+
+            let (mut index_child, index_stderr_task) =
+                spawn_cmd(
+                    config.clone(),
+                    SAMTOOLS_TAG,
+                    index_args,
+                    config.args.verbose,
+                    None,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+            let index_status =
+                index_child
+                    .wait()
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools index wait failed: {}",
+                e
+            ))
+                    })?;
+
+            index_stderr_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunRgiBwtKma samtools index stderr task panicked: {}",
+            e
+        ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            if !index_status.success() {
+                return Err(PipelineError::Other(anyhow!(
+        "RunRgiBwtKma samtools index failed with exit status {}",
+        index_status
+    )));
+            }
+
+            if !sorted_bai_path.is_file() {
+                return Err(PipelineError::Other(anyhow!(
+        "RunRgiBwtKma samtools index completed but BAI was not created: {}",
+        sorted_bai_path.display()
+    )));
+            }
+
+            info!(
+    "[AMR] RunRgiBwtKma BAM index ready: {}",
+    sorted_bai_path.display()
+);
+
 
 
 
