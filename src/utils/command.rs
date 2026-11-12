@@ -12,7 +12,8 @@ use crate::config::defs::{
     RunConfig, BCFTOOLS_TAG, BLASTN_TAG, BLASTX_TAG, BOWTIE2_TAG, CZID_DEDUP_TAG, DIAMOND_TAG,
     FASTP_TAG, H5DUMP_TAG, HISAT2_TAG, IVAR_TAG, KALLISTO_TAG, KRAKEN2_TAG, MAFFT_TAG,
     MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, MUSCLE_TAG, NUCMER_TAG, PIGZ_TAG, QUAST_TAG,
-    SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, FLYE_TAG, TOOL_VERSIONS,
+    SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, FLYE_TAG,
+    BAMTOOLS_TAG, TOOL_VERSIONS,
 };
 use crate::utils::streams::spawn_cmd;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
@@ -5200,6 +5201,110 @@ pub mod kma {
     }
 }
 
+pub mod bamtools {
+    use crate::config::defs::{
+        BamtoolsSubcommand,
+        RunConfig,
+        BAMTOOLS_TAG,
+    };
+    use crate::utils::command::{
+        version_check,
+        ArgGenerator,
+    };
+    use crate::utils::streams::ChildStream;
+    use anyhow::{anyhow, Result};
+
+    #[derive(Debug)]
+    pub struct BamtoolsConfig {
+        pub subcommand: BamtoolsSubcommand,
+
+        /// Ordered command-line options and flags.
+        pub subcommand_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl BamtoolsConfig {
+        pub fn new(subcommand: BamtoolsSubcommand) -> Self {
+            Self {
+                subcommand,
+                subcommand_fields: Vec::new(),
+            }
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.subcommand_fields.push((flag.into(), None));
+            self
+        }
+    }
+
+    pub struct BamtoolsArgGenerator;
+
+    /// Checks if `bamtools` is present and returns its version.
+    pub async fn bamtools_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
+        let version = version_check(
+            BAMTOOLS_TAG,
+            vec!["--version"],
+            0,
+            1,
+            ChildStream::Stdout,
+            None,
+            config,
+        )
+            .await?;
+
+        Ok(version)
+    }
+
+    impl ArgGenerator for BamtoolsArgGenerator {
+        fn generate_args(
+            &self,
+            _run_config: &RunConfig,
+            extra: Option<&dyn std::any::Any>,
+        ) -> anyhow::Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<BamtoolsConfig>())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "BamTools requires a BamtoolsConfig as extra argument"
+                    )
+                })?;
+
+            let mut args_vec = Vec::new();
+
+            args_vec.push(
+                match config.subcommand {
+                    BamtoolsSubcommand::Filter => "filter",
+                }
+                    .to_string(),
+            );
+
+            for (key, value) in &config.subcommand_fields {
+                args_vec.push(key.clone());
+
+                if let Some(value) = value {
+                    args_vec.push(value.clone());
+                }
+            }
+
+            Ok(args_vec)
+        }
+    }
+}
+
 /// Generates the command-line arguments for a given tool.
 ///
 /// # Arguments
@@ -5243,6 +5348,7 @@ pub fn generate_cli(
         MMSEQS_TAG => Box::new(mmseqs::MmseqsArgGenerator),
         FLYE_TAG => Box::new(flye::FlyeArgGenerator),
         KMA_TAG => Box::new(kma::KmaArgGenerator),
+        BAMTOOLS_TAG => Box::new(bamtools::BamtoolsArgGenerator),
         _ => return Err(anyhow!("Unknown tool: {}", tool)),
     };
 
@@ -5310,6 +5416,7 @@ pub async fn check_versions(tools: Vec<&str>, out_dir: &PathBuf, config: &RunCon
                 FLYE_TAG => flye::flye_presence_check(&config, version_file).await,
                 PIGZ_TAG => pigz::pigz_presence_check(&config).await,
                 KMA_TAG => kma::kma_presence_check(&config).await,
+                BAMTOOLS_TAG => bamtools::bamtools_presence_check(&config).await,
                 _ => return Err(anyhow!("Unknown tool: {}", tool)),
             }?;
             Ok((tool.to_string(), version))

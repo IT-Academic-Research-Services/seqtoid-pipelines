@@ -48,6 +48,7 @@ pub const SORT_TAG: &str = "sort";
 pub const MMSEQS_TAG: &str = "mmseqs";
 pub const FLYE_TAG: &str = "flye";
 pub const KMA_TAG: &str = "kma";
+pub const BAMTOOLS_TAG: &str = "bamtools";
 
 pub const NT_TAG: &str = "nt";
 pub const NR_TAG: &str = "nr";
@@ -94,6 +95,7 @@ lazy_static! {
         m.insert(MMSEQS_TAG, 0.0);
         m.insert(FLYE_TAG, 2.9);
         m.insert(KMA_TAG, 1.7);
+        m.insert(BAMTOOLS_TAG, 2.5);
         m
     };
 }
@@ -156,6 +158,11 @@ pub enum KallistoSubcommand {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DiamondSubcommand {
     Blastx
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BamtoolsSubcommand {
+    Filter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
