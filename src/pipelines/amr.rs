@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
-                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, SamtoolsSubcommand};
+                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, SamtoolsSubcommand, BamtoolsSubcommand};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
     run_host_filter,
@@ -24,6 +24,7 @@ use crate::pipelines::short_read_mngs::{
 };
 use crate::utils::command::kma::KmaConfig;
 use crate::utils::command::samtools::SamtoolsConfig;
+use crate::utils::command::bamtools::BamtoolsConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
@@ -1554,11 +1555,25 @@ pub async fn run(
 
 
             // ------------------------------------------------------------
-            // Consume samtools sort stdout into the sorted BAM.
+            // Stream the coordinate-sorted BAM through the same predicate-free
+            // bamtools filter transformation used by RGI, then re-emit it with
+            // samtools before materializing the final length_100 BAM:
             //
-            // This is the first intentional BAM file boundary in the RGI
-            // workflow. RGI indexes this sorted BAM before the subsequent
-            // bamtools filter step.
+            //   sort_stdout
+            //       -> parse_bytes
+            //       -> stream_to_cmd(BAMTOOLS_TAG, ["filter"])
+            //       -> parse_bytes
+            //       -> stream_to_cmd(SAMTOOLS_TAG, ["view", "-b", "-"])
+            //       -> parse_bytes
+            //       -> write_byte_stream_to_file(length_100.bam)
+            //
+            // BamTools 2.5.2 accepts BAM on stdin and emits the same decoded
+            // alignments as its file-based filter invocation, but its stdout BAM
+            // omits the BGZF EOF marker. `samtools view -b -` re-emits a properly
+            // finalized BAM while preserving the alignment stream. This lets us
+            // avoid both RGI's sorted.temp.bam materialization and its unused
+            // intermediate BAI; the only BAM file boundary is the durable
+            // sr_amr_report.sorted.length_100.bam required downstream.
             // ------------------------------------------------------------
 
             let sort_stdout = {
@@ -1569,8 +1584,8 @@ pub async fn run(
                     .take()
                     .ok_or_else(|| {
                         PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools sort stdout not available"
-            ))
+                            "RunRgiBwtKma samtools sort stdout not available"
+                        ))
                     })?
             };
 
@@ -1582,15 +1597,121 @@ pub async fn run(
                 .await
                 .map_err(PipelineError::Other)?;
 
+            let bamtools_config =
+                BamtoolsConfig::new(BamtoolsSubcommand::Filter);
+
+            let bamtools_args = generate_cli(
+                BAMTOOLS_TAG,
+                &config,
+                Some(&bamtools_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma bamtools filter args: {:?}",
+                bamtools_args
+            );
+
+            let (
+                bamtools_child,
+                bamtools_stdin_task,
+                bamtools_stderr_task,
+            ) = stream_to_cmd(
+                config.clone(),
+                sorted_bam_rx,
+                BAMTOOLS_TAG,
+                bamtools_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+                None,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let bamtools_stdout = {
+                let mut child_guard = bamtools_child.lock().await;
+
+                child_guard
+                    .stdout
+                    .take()
+                    .ok_or_else(|| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma bamtools filter stdout not available"
+                        ))
+                    })?
+            };
+
+            let bamtools_bam_rx = parse_bytes(
+                bamtools_stdout,
+                &config,
+                StreamDataType::JustBytes,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let finalize_config =
+                SamtoolsConfig::new(SamtoolsSubcommand::View)
+                    .flag("-b")
+                    .positional("-");
+
+            let finalize_args = generate_cli(
+                SAMTOOLS_TAG,
+                &config,
+                Some(&finalize_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma samtools BAM finalizer args: {:?}",
+                finalize_args
+            );
+
+            let (
+                finalize_child,
+                finalize_stdin_task,
+                finalize_stderr_task,
+            ) = stream_to_cmd(
+                config.clone(),
+                bamtools_bam_rx,
+                SAMTOOLS_TAG,
+                finalize_args,
+                StreamDataType::JustBytes,
+                config.args.verbose,
+                None,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let finalize_stdout = {
+                let mut child_guard = finalize_child.lock().await;
+
+                child_guard
+                    .stdout
+                    .take()
+                    .ok_or_else(|| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma samtools BAM finalizer stdout not available"
+                        ))
+                    })?
+            };
+
+            let final_bam_rx = parse_bytes(
+                finalize_stdout,
+                &config,
+                StreamDataType::JustBytes,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
             let sorted_bam_path =
-                sort_temp_dir.path().join("sr_amr_report.sorted.temp.bam");
+                out_dir.join("sr_amr_report.sorted.length_100.bam");
 
             let sorted_bam_write_task = write_byte_stream_to_file(
                 &sorted_bam_path,
-                ReceiverStream::new(sorted_bam_rx),
+                ReceiverStream::new(final_bam_rx),
                 config.clone(),
                 StreamDataType::JustBytes,
-                "RunRgiBwtKma sorted BAM",
+                "RunRgiBwtKma length_100 BAM",
                 false,
             )
                 .await
@@ -1852,85 +1973,128 @@ pub async fn run(
             // ------------------------------------------------------------
 
             // ------------------------------------------------------------
-            // Complete the streaming KMA -> fixmate -> sort -> BAM chain.
+            // Complete the streaming
+            // KMA -> fixmate -> sort -> bamtools -> samtools view -> BAM chain.
             //
             // All stdout consumers have already been installed above, so it
-            // is now safe to await producer/process completion.
-            //
-            // The sorted BAM is not considered ready until:
-            //   * fixmate has consumed all KMA SAM and exited successfully
-            //   * sort has consumed all fixmate BAM and exited successfully
-            //   * sort stdout has been completely written to disk
+            // is now safe to await producer/process completion. The final BAM
+            // is not considered ready until every stdin/process task has
+            // completed successfully and samtools view stdout has been fully
+            // materialized.
             // ------------------------------------------------------------
 
             let rgi_bwt_bam_fut = async move {
                 let (
                     fixmate_stdin_result,
                     sort_stdin_result,
+                    bamtools_stdin_result,
+                    finalize_stdin_result,
                     sorted_bam_write_result,
                 ) = tokio::join!(
-        fixmate_stdin_task,
-        sort_stdin_task,
-        sorted_bam_write_task,
-    );
+                    fixmate_stdin_task,
+                    sort_stdin_task,
+                    bamtools_stdin_task,
+                    finalize_stdin_task,
+                    sorted_bam_write_task,
+                );
 
                 fixmate_stdin_result
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools fixmate stdin task panicked: {}",
-                e
-            ))
+                            "RunRgiBwtKma samtools fixmate stdin task panicked: {}",
+                            e
+                        ))
                     })?
                     .map_err(PipelineError::Other)?;
 
                 sort_stdin_result
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools sort stdin task panicked: {}",
-                e
-            ))
+                            "RunRgiBwtKma samtools sort stdin task panicked: {}",
+                            e
+                        ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                bamtools_stdin_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma bamtools filter stdin task panicked: {}",
+                            e
+                        ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                finalize_stdin_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma samtools BAM finalizer stdin task panicked: {}",
+                            e
+                        ))
                     })?
                     .map_err(PipelineError::Other)?;
 
                 sorted_bam_write_result
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                "RunRgiBwtKma sorted BAM writer task panicked: {}",
-                e
-            ))
+                            "RunRgiBwtKma length_100 BAM writer task panicked: {}",
+                            e
+                        ))
                     })?
                     .map_err(PipelineError::Other)?;
 
                 let (
                     fixmate_stderr_result,
                     sort_stderr_result,
+                    bamtools_stderr_result,
+                    finalize_stderr_result,
                 ) = tokio::join!(
-        fixmate_stderr_task,
-        sort_stderr_task,
-    );
+                    fixmate_stderr_task,
+                    sort_stderr_task,
+                    bamtools_stderr_task,
+                    finalize_stderr_task,
+                );
 
                 fixmate_stderr_result
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools fixmate stderr task panicked: {}",
-                e
-            ))
+                            "RunRgiBwtKma samtools fixmate stderr task panicked: {}",
+                            e
+                        ))
                     })?
                     .map_err(PipelineError::Other)?;
 
                 sort_stderr_result
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools sort stderr task panicked: {}",
-                e
-            ))
+                            "RunRgiBwtKma samtools sort stderr task panicked: {}",
+                            e
+                        ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                bamtools_stderr_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma bamtools filter stderr task panicked: {}",
+                            e
+                        ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                finalize_stderr_result
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma samtools BAM finalizer stderr task panicked: {}",
+                            e
+                        ))
                     })?
                     .map_err(PipelineError::Other)?;
 
                 info!(
-        "[AMR] RunRgiBwtKma sorted BAM ready: {}",
-        sorted_bam_path.display()
-    );
+                    "[AMR] RunRgiBwtKma length_100 BAM ready: {}",
+                    sorted_bam_path.display()
+                );
 
                 Ok::<PathBuf, PipelineError>(sorted_bam_path)
             };
@@ -1941,7 +2105,7 @@ pub async fn run(
                 (),
                 dedup_and_subsample,
                 sorted_bam_path,
-                ) = tokio::try_join!(
+            ) = tokio::try_join!(
         validation_and_qc_fut,
         host_counts_fut,
         kallisto_fut,
@@ -2120,7 +2284,7 @@ pub async fn run(
 
 
 
-                info!(
+            info!(
         "[AMR] RunKMA native results: records={}, mapped={}, references={}",
         kma_sam_results.total_records,
         kma_sam_results.alignments.len(),
