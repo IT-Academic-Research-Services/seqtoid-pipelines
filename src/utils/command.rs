@@ -13,7 +13,7 @@ use crate::config::defs::{
     FASTP_TAG, H5DUMP_TAG, HISAT2_TAG, IVAR_TAG, KALLISTO_TAG, KRAKEN2_TAG, MAFFT_TAG,
     MAKEBLASTDB_TAG, MINIMAP2_TAG, MMSEQS_TAG, MUSCLE_TAG, NUCMER_TAG, PIGZ_TAG, QUAST_TAG,
     SAMTOOLS_TAG, SEQKIT_TAG, SHOW_COORDS_TAG, SORT_TAG, SPADES_TAG, STAR_TAG, FLYE_TAG,
-    BAMTOOLS_TAG, TOOL_VERSIONS,
+    KMA_TAG, BAMTOOLS_TAG, TOOL_VERSIONS,
 };
 use crate::utils::streams::spawn_cmd;
 use crate::utils::streams::{read_child_output_to_vec, ChildStream};
