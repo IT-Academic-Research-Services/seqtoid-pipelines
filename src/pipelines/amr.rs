@@ -136,6 +136,16 @@ struct RgiReadCounts {
     all: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RgiAlignment {
+    qname: String,
+    flag: u16,
+    rname: String,
+    pos: u64,
+    mapq: u8,
+    mrnm: String,
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -1123,6 +1133,76 @@ async fn consume_kma_sam(
         alignments,
         total_records,
         invalid_alignment_records,
+    })
+}
+
+
+/// Parse one `samtools view` SAM alignment record into the fields retained
+/// by RGI's `get_qname_rname_sequence()` / `preload_alignments()`.
+///
+/// RGI retains SAM fields:
+///
+///   1  QNAME
+///   2  FLAG
+///   3  RNAME
+///   4  POS
+///   5  MAPQ
+///   7  RNEXT / MRNM
+///
+/// `samtools view` emits the complete SAM alignment record, so this parser
+/// selects those fields directly instead of reproducing RGI's:
+///
+///   cut -f 1,2,3,4,5,7 | sort -s -n -k 1,1
+///
+/// The sort is unnecessary for the Rust representation because alignments
+/// will be grouped directly by RNAME.
+fn parse_rgi_alignment(line: &str) -> anyhow::Result<RgiAlignment> {
+    let fields: Vec<&str> = line.split('\t').collect();
+
+    // We need through SAM field 7 (RNEXT), i.e. zero-based index 6.
+    if fields.len() < 7 {
+        return Err(anyhow!(
+            "RunRgiBwtKma samtools view emitted malformed SAM record: \
+             expected at least 7 tab-delimited fields, found {}: {:?}",
+            fields.len(),
+            line
+        ));
+    }
+
+    let flag = fields[1].parse::<u16>().map_err(|e| {
+        anyhow!(
+            "RunRgiBwtKma invalid SAM FLAG {:?} for QNAME {:?}: {}",
+            fields[1],
+            fields[0],
+            e
+        )
+    })?;
+
+    let pos = fields[3].parse::<u64>().map_err(|e| {
+        anyhow!(
+            "RunRgiBwtKma invalid SAM POS {:?} for QNAME {:?}: {}",
+            fields[3],
+            fields[0],
+            e
+        )
+    })?;
+
+    let mapq = fields[4].parse::<u8>().map_err(|e| {
+        anyhow!(
+            "RunRgiBwtKma invalid SAM MAPQ {:?} for QNAME {:?}: {}",
+            fields[4],
+            fields[0],
+            e
+        )
+    })?;
+
+    Ok(RgiAlignment {
+        qname: fields[0].to_string(),
+        flag,
+        rname: fields[2].to_string(),
+        pos,
+        mapq,
+        mrnm: fields[6].to_string(),
     })
 }
 
@@ -2384,6 +2464,164 @@ pub async fn run(
                     counts.all,
                 );
             }
+
+
+
+            // ------------------------------------------------------------
+            // Pull alignment records from the completed AMR BAM and build
+            // the in-memory alignment representation used by RGI reporting.
+            //
+            // RGI:
+            //
+            //   samtools view --threads <threads> <bam>
+            //       | cut -f 1,2,3,4,5,7
+            //       | sort -s -n -k 1,1
+            //
+            // followed by preload_alignments(), which groups the selected
+            // SAM fields by RNAME.
+            //
+            // We eliminate both cut and sort. samtools view stdout is parsed
+            // one SAM line at a time and the six fields retained by RGI are
+            // extracted directly:
+            //
+            //   QNAME, FLAG, RNAME, POS, MAPQ, RNEXT
+            //
+            // Alignments are grouped directly by RNAME, so no temporary
+            // sr_amr_report.seqs.temp.txt file is required.
+            // ------------------------------------------------------------
+
+            let view_threads =
+                config.thread_allocation(SAMTOOLS_TAG, Some("view"));
+
+            let view_config =
+                SamtoolsConfig::new(SamtoolsSubcommand::View)
+                    .option("-@", view_threads.to_string())
+                    .positional(
+                        sorted_bam_path
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+
+            let view_args = generate_cli(
+                SAMTOOLS_TAG,
+                &config,
+                Some(&view_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma samtools view args: {:?}",
+                view_args
+            );
+
+            let (mut view_child, view_stderr_task) =
+                spawn_cmd(
+                    config.clone(),
+                    SAMTOOLS_TAG,
+                    view_args,
+                    config.args.verbose,
+                    None,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+            // ParseMode::Lines emits one complete SAM line per
+            // ParseOutput::Bytes, with trailing CR/LF removed.
+            let mut view_rx =
+                parse_child_output(
+                    &mut view_child,
+                    ChildStream::Stdout,
+                    ParseMode::Lines,
+                    &config,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+            let mut rgi_alignments:
+                HashMap<String, Vec<RgiAlignment>> = HashMap::new();
+
+            let mut alignment_count: u64 = 0;
+
+            while let Some(item) = view_rx.recv().await {
+                let bytes = match item {
+                    ParseOutput::Bytes(bytes) => bytes,
+
+                    other => {
+                        return Err(PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma samtools view produced unexpected \
+                             parse output: {:?}",
+                            other
+                        )));
+                    }
+                };
+
+                let line =
+                    std::str::from_utf8(&bytes)
+                        .map_err(|e| {
+                            PipelineError::Other(anyhow!(
+                                "RunRgiBwtKma samtools view emitted \
+                                 non-UTF8 SAM line: {}",
+                                e
+                            ))
+                        })?;
+
+                let alignment =
+                    parse_rgi_alignment(line)
+                        .map_err(PipelineError::Other)?;
+
+                alignment_count += 1;
+
+                rgi_alignments
+                    .entry(alignment.rname.clone())
+                    .or_default()
+                    .push(alignment);
+            }
+
+            // stdout is completely drained at this point, so samtools can
+            // safely be awaited without risking a blocked stdout pipe.
+            let view_status =
+                view_child
+                    .wait()
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma samtools view wait failed: {}",
+                            e
+                        ))
+                    })?;
+
+            view_stderr_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma samtools view stderr task panicked: {}",
+                        e
+                    ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            if !view_status.success() {
+                return Err(PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools view failed with exit status {}",
+                    view_status
+                )));
+            }
+
+            info!(
+                "[AMR] RunRgiBwtKma samtools view parsed: \
+                 {} alignment records across {} reference names",
+                alignment_count,
+                rgi_alignments.len()
+            );
+
+            for (rname, alignments) in &rgi_alignments {
+                info!(
+                    "[AMR] RGI alignments: reference={} records={}",
+                    rname,
+                    alignments.len()
+                );
+            }
+
 
 
             let (
