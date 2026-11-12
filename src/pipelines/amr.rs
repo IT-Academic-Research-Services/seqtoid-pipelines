@@ -128,6 +128,14 @@ struct KmaSamResults {
     invalid_alignment_records: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RgiReadCounts {
+    reference_length: u64,
+    mapped: u64,
+    unmapped: u64,
+    all: u64,
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -2206,7 +2214,176 @@ pub async fn run(
     sorted_bai_path.display()
 );
 
+            // ------------------------------------------------------------
+            // Pull per-reference alignment counts with samtools idxstats.
+            //
+            // RGI materializes this stdout as sr_amr_report.temp.txt and
+            // get_reads_count() later keeps only rows with mapped > 0.
+            // There is no external-tool requirement for that text-file
+            // boundary, so consume idxstats stdout directly and preserve the
+            // same mapped-reference semantics in memory.
+            // ------------------------------------------------------------
 
+            let idxstats_config =
+                SamtoolsConfig::new(SamtoolsSubcommand::Idxstats)
+                    .positional(
+                        sorted_bam_path
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+
+            let idxstats_args = generate_cli(
+                SAMTOOLS_TAG,
+                &config,
+                Some(&idxstats_config),
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma samtools idxstats args: {:?}",
+                idxstats_args
+            );
+
+            let (mut idxstats_child, idxstats_stderr_task) =
+                spawn_cmd(
+                    config.clone(),
+                    SAMTOOLS_TAG,
+                    idxstats_args,
+                    config.args.verbose,
+                    None,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+            let mut idxstats_stdout = parse_child_output(
+                &mut idxstats_child,
+                ChildStream::Stdout,
+                ParseMode::Lines,
+                &config,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let mut rgi_read_counts = HashMap::<String, RgiReadCounts>::new();
+
+            while let Some(item) = idxstats_stdout.recv().await {
+                let ParseOutput::Bytes(line_bytes) = item else {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma samtools idxstats expected line-oriented Bytes output"
+                    )));
+                };
+
+                let line = std::str::from_utf8(&line_bytes)
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma samtools idxstats emitted non-UTF8 output: {}",
+                            e
+                        ))
+                    })?
+                    .trim_end_matches(['\r', '\n']);
+
+                if line.is_empty() {
+                    continue;
+                }
+
+                let fields: Vec<&str> = line.split('\t').collect();
+
+                if fields.len() != 4 {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma samtools idxstats expected 4 tab-separated fields, got {}: {}",
+                        fields.len(),
+                        line
+                    )));
+                }
+
+                let reference_length = fields[1]
+                    .parse::<u64>()
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma invalid idxstats reference length '{}': {}",
+                            fields[1],
+                            e
+                        ))
+                    })?;
+
+                let mapped = fields[2]
+                    .parse::<u64>()
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma invalid idxstats mapped count '{}': {}",
+                            fields[2],
+                            e
+                        ))
+                    })?;
+
+                let unmapped = fields[3]
+                    .parse::<u64>()
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma invalid idxstats unmapped count '{}': {}",
+                            fields[3],
+                            e
+                        ))
+                    })?;
+
+                // Match RGI get_reads_count(): retain only references with at
+                // least one mapped read. The '*' idxstats row therefore drops
+                // out naturally because its mapped count is zero.
+                if mapped > 0 {
+                    rgi_read_counts.insert(
+                        fields[0].to_string(),
+                        RgiReadCounts {
+                            reference_length,
+                            mapped,
+                            unmapped,
+                            all: mapped + unmapped,
+                        },
+                    );
+                }
+            }
+
+            let idxstats_status = idxstats_child
+                .wait()
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma samtools idxstats wait failed: {}",
+                        e
+                    ))
+                })?;
+
+            idxstats_stderr_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma samtools idxstats stderr task panicked: {}",
+                        e
+                    ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            if !idxstats_status.success() {
+                return Err(PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools idxstats failed with exit status {}",
+                    idxstats_status
+                )));
+            }
+
+            info!(
+                "[AMR] RunRgiBwtKma idxstats parsed: {} references with mapped reads",
+                rgi_read_counts.len()
+            );
+
+            for (reference, counts) in &rgi_read_counts {
+                info!(
+                    "[AMR] RGI idxstats: reference={} length={} mapped={} unmapped={} all={}",
+                    reference,
+                    counts.reference_length,
+                    counts.mapped,
+                    counts.unmapped,
+                    counts.all,
+                );
+            }
 
 
             let (
