@@ -803,14 +803,14 @@ async fn run_kma_amr(
     // for downstream RunRgiBwtKma processing.
     // ------------------------------------------------------------
 
-    let kma_temp_dir =
-        tempfile::TempDir::new_in(&config.ram_temp_dir)
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "Failed to create RunKMA temp directory: {}",
-                    e
-                ))
-            })?;
+    let kma_temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        2,
+        false,
+    )
+        .await?;
 
     let kma_output_prefix =
         kma_temp_dir.path().join("read_amr");
