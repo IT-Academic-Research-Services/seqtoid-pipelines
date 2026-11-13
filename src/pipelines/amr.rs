@@ -2082,6 +2082,97 @@ fn build_rgi_allele_summaries(
     Ok(summaries)
 }
 
+/// Serialize the native allele summaries in the exact object shape emitted by
+/// RGI BWT.py `summary()`, then write the same top-level JSON array produced by
+/// `json.dumps(summary, sort_keys=True)`.
+///
+/// serde_json::Map is a BTreeMap unless the `preserve_order` feature is enabled,
+/// so object keys serialize lexicographically, matching Python `sort_keys=True`.
+async fn write_rgi_allele_mapping_json(
+    out_dir: &std::path::Path,
+    summaries: &[RgiAlleleSummary],
+) -> anyhow::Result<PathBuf> {
+    let mut output = Vec::<serde_json::Value>::with_capacity(summaries.len());
+
+    for summary in summaries {
+        let alignments = summary
+            .alignments
+            .iter()
+            .map(|alignment| {
+                serde_json::json!({
+                    "qname": alignment.qname,
+                    "flag": alignment.flag.to_string(),
+                    "rname": alignment.rname,
+                    "pos": alignment.pos.to_string(),
+                    "mapq": alignment.mapq.to_string(),
+                    "mrnm": alignment.mrnm,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // Match BWT.py summary() exactly. Values originating from idxstats and
+        // samtools-view preload files remain strings in RGI's JSON, while the
+        // CARD identity value remains numeric.
+        output.push(serde_json::json!({
+            "id": summary.id,
+            "cvterm_name": summary.cvterm_name,
+            "aro_accession": summary.aro_accession,
+            "model_type": summary.model_type,
+            "database": summary.database,
+            "reference_allele_source": summary.reference_allele_source,
+            "observed_in_genomes": summary.observed_in_genomes,
+            "observed_in_plasmids": summary.observed_in_plasmids,
+            "observed_in_pathogens": summary.observed_in_pathogens,
+            "range_of_reference_allele_source": summary.range_of_reference_allele_source,
+            "reads": {
+                "mapped": summary.reads.mapped.to_string(),
+                "unmapped": summary.reads.unmapped.to_string(),
+                "all": summary.reads.all.to_string(),
+            },
+            "alignments": alignments,
+            "mapq_average": summary.mapq_average,
+            "number_of_mapped_baits": 0,
+            "number_of_mapped_baits_with_reads": 0,
+            "average_bait_coverage": 0,
+            "bait_coverage_coefficient_of_variation": 0,
+            "mate_pair": summary.mate_pair,
+            "percent_coverage": {
+                "covered": summary.percent_coverage_covered,
+                "uncovered": summary.percent_coverage_uncovered,
+            },
+            "length_coverage": {
+                "covered": summary.length_coverage_covered,
+                "uncovered": summary.length_coverage_uncovered,
+            },
+            "reference": {
+                "sequence_length": summary.reference_sequence_length,
+            },
+            "mutation": "N/A",
+            "resistomes": summary.resistomes,
+            "predicted_pathogen": "N/A",
+            "depth": summary.depth,
+            "snps": summary.snps,
+            "consensus_sequence_dna": summary.consensus_sequence_dna,
+            "consensus_sequence_protein": summary.consensus_sequence_protein,
+        }));
+    }
+
+    let path = out_dir.join("sr_amr_report.allele_mapping_data.json");
+    let bytes = serde_json::to_vec(&output)?;
+
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| anyhow!("Failed to write RGI allele mapping JSON {}: {}", path.display(), e))?;
+
+    info!(
+        "[AMR] RunRgiBwtKma allele mapping JSON written: {} ({} summaries)",
+        path.display(),
+        summaries.len()
+    );
+
+    Ok(path)
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -3801,6 +3892,18 @@ pub async fn run(
             info!(
                 "[AMR] RunRgiBwtKma allele summaries constructed: {}",
                 rgi_allele_summaries.len()
+            );
+
+            let allele_mapping_json_path = write_rgi_allele_mapping_json(
+                &out_dir,
+                &rgi_allele_summaries,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma allele mapping report ready: {}",
+                allele_mapping_json_path.display()
             );
 
             for summary in &rgi_allele_summaries {
