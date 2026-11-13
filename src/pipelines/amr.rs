@@ -2173,6 +2173,130 @@ async fn write_rgi_allele_mapping_json(
     Ok(path)
 }
 
+/// Write the tab-delimited allele report emitted by RGI BWT.py `get_summary()`.
+///
+/// Python uses csv.writer(delimiter='\\t', dialect='excel'), which produces
+/// CRLF record terminators and quotes fields only when required. The values
+/// below mirror the exact column order and joining/sorting rules in BWT.py.
+async fn write_rgi_allele_mapping_tab(
+    out_dir: &std::path::Path,
+    summaries: &[RgiAlleleSummary],
+) -> anyhow::Result<PathBuf> {
+    fn csv_field(value: &str) -> String {
+        if value.contains(['\t', '\r', '\n', '"']) {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value.to_string()
+        }
+    }
+
+    fn sorted_join(values: &[String]) -> String {
+        let mut values = values.to_vec();
+        values.sort_by(|a, b| {
+            a.to_lowercase()
+                .cmp(&b.to_lowercase())
+                .then_with(|| a.cmp(b))
+        });
+        values.join("; ")
+    }
+
+    fn resistome_values<'a>(
+        summary: &'a RgiAlleleSummary,
+        key: &str,
+    ) -> &'a [String] {
+        summary
+            .resistomes
+            .get(key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    const HEADER: [&str; 24] = [
+        "Reference Sequence",
+        "ARO Term",
+        "ARO Accession",
+        "Reference Model Type",
+        "Reference DB",
+        "Reference Allele Source",
+        "Resistomes & Variants: Observed in Genome(s)",
+        "Resistomes & Variants: Observed in Plasmid(s)",
+        "Resistomes & Variants: Observed Pathogen(s)",
+        "Completely Mapped Reads",
+        "Mapped Reads with Flanking Sequence",
+        "All Mapped Reads",
+        "Percent Coverage",
+        "Length Coverage (bp)",
+        "Average MAPQ (Completely Mapped Reads)",
+        "Mate Pair Linkage",
+        "Reference Length",
+        "AMR Gene Family",
+        "Drug Class",
+        "Resistance Mechanism",
+        "Depth",
+        "SNPs",
+        "Consensus Sequence DNA",
+        "Consensus Sequence Protein",
+    ];
+
+    let mut output = String::new();
+    output.push_str(&HEADER.join("\t"));
+    output.push_str("\r\n");
+
+    for summary in summaries {
+        let row = [
+            summary.id.clone(),
+            summary.cvterm_name.clone(),
+            summary.aro_accession.clone(),
+            summary.model_type.clone(),
+            summary.database.clone(),
+            summary.reference_allele_source.clone(),
+            summary.observed_in_genomes.clone(),
+            summary.observed_in_plasmids.clone(),
+            summary.observed_in_pathogens.join("; "),
+            summary.reads.mapped.to_string(),
+            summary.reads.unmapped.to_string(),
+            summary.reads.all.to_string(),
+            summary.percent_coverage_covered.clone(),
+            summary.length_coverage_covered.clone(),
+            summary.mapq_average.clone(),
+            summary.mate_pair.join("; "),
+            summary.reference_sequence_length.clone(),
+            sorted_join(resistome_values(summary, "AMR Gene Family")),
+            sorted_join(resistome_values(summary, "Drug Class")),
+            sorted_join(resistome_values(summary, "Resistance Mechanism")),
+            summary.depth.clone(),
+            summary.snps.clone(),
+            summary.consensus_sequence_dna.clone(),
+            summary.consensus_sequence_protein.clone(),
+        ];
+
+        output.push_str(
+            &row.iter()
+                .map(|value| csv_field(value))
+                .collect::<Vec<_>>()
+                .join("\t"),
+        );
+        output.push_str("\r\n");
+    }
+
+    let path = out_dir.join("sr_amr_report.allele_mapping_data.txt");
+    tokio::fs::write(&path, output.as_bytes())
+        .await
+        .map_err(|e| anyhow!(
+            "Failed to write RGI allele mapping tab report {}: {}",
+            path.display(),
+            e
+        ))?;
+
+    info!(
+        "[AMR] RunRgiBwtKma allele mapping tab report written: {} ({} summaries)",
+        path.display(),
+        summaries.len()
+    );
+
+    Ok(path)
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -3904,6 +4028,18 @@ pub async fn run(
             info!(
                 "[AMR] RunRgiBwtKma allele mapping report ready: {}",
                 allele_mapping_json_path.display()
+            );
+
+            let allele_mapping_tab_path = write_rgi_allele_mapping_tab(
+                &out_dir,
+                &rgi_allele_summaries,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma allele mapping tab report ready: {}",
+                allele_mapping_tab_path.display()
             );
 
             for summary in &rgi_allele_summaries {
