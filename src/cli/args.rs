@@ -297,4 +297,10 @@ pub struct Arguments {
     #[arg(long = "amr-duplicate-clusters", help = "Filtered AMR mode: CZ ID clusters.csv mapping representative read id to read id")]
     pub amr_duplicate_clusters: Option<String>,
 
+    #[arg(
+        long = "amr-card-json",
+        help = "AMR: path to the CARD card.json model metadata database"
+    )]
+    pub amr_card_json: Option<String>,
+
 }
