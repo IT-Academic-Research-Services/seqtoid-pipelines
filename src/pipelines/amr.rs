@@ -165,6 +165,294 @@ struct RgiCoverage {
     uncovered_bases: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CardModel {
+    model_id: String,
+    aro_accession: String,
+    model_name: String,
+    model_type: String,
+
+    /// RGI:
+    ///
+    ///     category_aro_class_name -> [category_aro_name, ...]
+    ///
+    /// Examples of class names used downstream include:
+    ///
+    ///     AMR Gene Family
+    ///     Drug Class
+    ///     Resistance Mechanism
+    categories: HashMap<String, Vec<String>>,
+
+    /// Unique genus/species-level taxonomy labels.
+    ///
+    /// RGI reduces every NCBI_taxonomy_name to its first two
+    /// whitespace-separated components.
+    taxon: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CardModels {
+    /// Equivalent to BWT.py `models`.
+    by_model_id: HashMap<String, CardModel>,
+
+    /// Equivalent to BWT.py `models_by_accession`.
+    by_aro_accession: HashMap<String, CardModel>,
+}
+
+/// Load the subset of CARD `card.json` required by RunRgiBwtKma.
+///
+/// This is the native equivalent of BWT.py `get_model_details()`.
+///
+/// RGI loads the complete JSON document, iterates only numeric top-level
+/// entries, and retains:
+///
+///     model_id
+///     ARO_accession
+///     model_name
+///     model_type
+///     ARO_category
+///     model_sequences.sequence[*].NCBI_taxonomy.NCBI_taxonomy_name
+///
+/// Taxonomy names are reduced to their first two whitespace-separated
+/// components and deduplicated.
+///
+/// `card.json` is small enough relative to the AMR pipeline workload that
+/// parsing the complete document with serde_json is preferable to adding
+/// another streaming JSON dependency.
+async fn load_card_models(
+    card_json_path: PathBuf,
+) -> anyhow::Result<CardModels> {
+    // File I/O is asynchronous. serde_json parsing itself is synchronous,
+    // but the CARD JSON is modest (~tens of MiB) and is loaded only once
+    // per AMR run.
+    let json_bytes = tokio::fs::read(&card_json_path)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to read CARD model database {}: {}",
+                card_json_path.display(),
+                e
+            )
+        })?;
+
+    let root: serde_json::Value =
+        serde_json::from_slice(&json_bytes)
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to parse CARD model database {}: {}",
+                    card_json_path.display(),
+                    e
+                )
+            })?;
+
+    let root_object = root
+        .as_object()
+        .ok_or_else(|| {
+            anyhow!(
+                "CARD model database {} has a non-object JSON root",
+                card_json_path.display()
+            )
+        })?;
+
+    let mut by_model_id =
+        HashMap::<String, CardModel>::new();
+
+    let mut by_aro_accession =
+        HashMap::<String, CardModel>::new();
+
+    for (top_level_key, model_value) in root_object {
+        // Match Python:
+        //
+        //     for i in data:
+        //         if i.isdigit():
+        //
+        // CARD also contains non-model top-level metadata, which RGI
+        // deliberately ignores.
+        if top_level_key.is_empty()
+            || !top_level_key.bytes().all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+
+        let model = model_value
+            .as_object()
+            .ok_or_else(|| {
+                anyhow!(
+                    "CARD model entry '{}' in {} is not a JSON object",
+                    top_level_key,
+                    card_json_path.display()
+                )
+            })?;
+
+        let required_string =
+            |field: &str| -> anyhow::Result<String> {
+                model
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "CARD model entry '{}' in {} is missing \
+                             string field '{}'",
+                            top_level_key,
+                            card_json_path.display(),
+                            field
+                        )
+                    })
+            };
+
+        let model_id =
+            required_string("model_id")?;
+
+        let aro_accession =
+            required_string("ARO_accession")?;
+
+        let model_name =
+            required_string("model_name")?;
+
+        let model_type =
+            required_string("model_type")?;
+
+        // ------------------------------------------------------------
+        // ARO categories
+        //
+        // Python:
+        //
+        //   categories[class_name] = [category_name, ...]
+        //
+        // with duplicate category names suppressed within each class.
+        // ------------------------------------------------------------
+
+        let mut categories =
+            HashMap::<String, Vec<String>>::new();
+
+        if let Some(category_object) =
+            model
+                .get("ARO_category")
+                .and_then(serde_json::Value::as_object)
+        {
+            for category_value in category_object.values() {
+                let Some(category) =
+                    category_value.as_object()
+                else {
+                    continue;
+                };
+
+                let Some(class_name) = category
+                    .get("category_aro_class_name")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+
+                let Some(category_name) = category
+                    .get("category_aro_name")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+
+                let names =
+                    categories
+                        .entry(class_name.to_string())
+                        .or_default();
+
+                if !names.iter().any(|name| name == category_name) {
+                    names.push(category_name.to_string());
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Model taxonomy
+        //
+        // Python:
+        //
+        //   for item in
+        //       data[i]["model_sequences"]["sequence"]:
+        //
+        //       taxonomy_name =
+        //           ...["NCBI_taxonomy"]["NCBI_taxonomy_name"]
+        //
+        //       taxa = " ".join(taxonomy_name.split()[:2])
+        //
+        // Preserve first-seen order while suppressing duplicates, just
+        // as the Python list implementation does.
+        // ------------------------------------------------------------
+
+        let mut taxon =
+            Vec::<String>::new();
+
+        if let Some(sequence_object) = model
+            .get("model_sequences")
+            .and_then(|value| value.get("sequence"))
+            .and_then(serde_json::Value::as_object)
+        {
+            for sequence_value in sequence_object.values() {
+                let Some(taxonomy_name) = sequence_value
+                    .get("NCBI_taxonomy")
+                    .and_then(|value| {
+                        value.get("NCBI_taxonomy_name")
+                    })
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+
+                let taxa = taxonomy_name
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                if !taxa.is_empty()
+                    && !taxon.iter().any(|existing| existing == &taxa)
+                {
+                    taxon.push(taxa);
+                }
+            }
+        }
+
+        let card_model = CardModel {
+            model_id: model_id.clone(),
+            aro_accession: aro_accession.clone(),
+            model_name,
+            model_type,
+            categories,
+            taxon,
+        };
+
+        // Match the two dictionaries produced by get_model_details().
+        //
+        // Clone here is intentional. CARD contains only a few thousand
+        // models and this keeps downstream lookups simple. If desired,
+        // these can later become Arc<CardModel> without changing parsing
+        // semantics.
+        by_model_id.insert(
+            model_id,
+            card_model.clone(),
+        );
+
+        by_aro_accession.insert(
+            aro_accession,
+            card_model,
+        );
+    }
+
+    info!(
+        "[AMR] CARD models loaded from {}: \
+         models={}, accessions={}",
+        card_json_path.display(),
+        by_model_id.len(),
+        by_aro_accession.len(),
+    );
+
+    Ok(CardModels {
+        by_model_id,
+        by_aro_accession,
+    })
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -1539,6 +1827,30 @@ pub async fn run(
                 .await?;
 
             let paired = file2_path.is_some();
+
+            // Resolve and load CARD model metadata for native RunRgiBwtKma reporting.
+            let card_json_arg = config
+                .args
+                .amr_card_json
+                .as_deref()
+                .ok_or_else(|| {
+                    PipelineError::InvalidConfig(
+                        "--amr-card-json is required for the AMR pipeline".to_string(),
+                    )
+                })?;
+
+            let card_json_path =
+                resolve_existing_input_path(card_json_arg, &cwd, true)?;
+
+            let card_models = load_card_models(card_json_path)
+                .await
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] CARD metadata ready: models={}, accessions={}",
+                card_models.by_model_id.len(),
+                card_models.by_aro_accession.len(),
+            );
 
             let mut final_temp_dirs: Vec<TempDir> = Vec::new();
 
