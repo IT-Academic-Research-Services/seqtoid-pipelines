@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio::fs::File as TokioFile;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
                           SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG, PIGZ_TAG,
@@ -40,6 +41,7 @@ use crate::utils::streams::{
     join_with_error_handling,
     parse_bytes,
     parse_child_output,
+    parse_fasta,
     spawn_cmd,
     stream_to_file,
     stream_to_cmd,
@@ -1090,21 +1092,17 @@ async fn consume_kma_sidecars(
     // ================================================================
     // KMA .fsa
     //
-    // Use the pipeline FASTA reader rather than introducing a second
+    // KMA writes its consensus sequences as FASTA. Open the completed
+    // sidecar asynchronously and feed it through the pipeline's structured
     // FASTA parser.
     //
     // Retain:
     //
-    //   reference -> consensus sequence
+    //     reference -> consensus sequence
     // ================================================================
 
-    let fsa_rx = read_fasta(
-        fsa_path.clone(),
-        u64::MAX,
-        None,
-        None,
-        &config,
-    )
+    let fsa_file = TokioFile::open(&fsa_path)
+        .await
         .map_err(|e| {
             anyhow!(
             "Failed to open KMA .fsa {}: {}",
@@ -1113,8 +1111,21 @@ async fn consume_kma_sidecars(
         )
         })?;
 
-    let mut fsa_stream =
-        ReceiverStream::new(fsa_rx);
+    let fsa_rx = parse_fasta(
+        fsa_file,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(|e| {
+            anyhow!(
+        "Failed to parse KMA .fsa {}: {}",
+        fsa_path.display(),
+        e
+    )
+        })?;
+
+    let mut fsa_stream = ReceiverStream::new(fsa_rx);
 
     let mut consensus_sequences =
         HashMap::<String, String>::new();
@@ -1122,22 +1133,22 @@ async fn consume_kma_sidecars(
     while let Some(item) = fsa_stream.next().await {
         let ParseOutput::Fasta(record) = item else {
             return Err(anyhow!(
-                "KMA .fsa parser produced non-FASTA output for {}",
-                fsa_path.display()
-            ));
+            "KMA .fsa parser produced unexpected output for {}: {:?}",
+            fsa_path.display(),
+            item
+        ));
         };
 
-        let reference =
-            record.id().to_string();
+        let reference = record.id().to_string();
 
         let sequence =
             String::from_utf8(record.seq().to_vec())
                 .map_err(|e| {
                     anyhow!(
-                        "KMA .fsa sequence for {} is not UTF-8: {}",
-                        reference,
-                        e
-                    )
+                    "KMA .fsa sequence for {} is not UTF-8: {}",
+                    reference,
+                    e
+                )
                 })?;
 
         consensus_sequences.insert(
