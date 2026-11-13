@@ -199,6 +199,33 @@ struct CardModels {
     by_aro_accession: HashMap<String, CardModel>,
 }
 
+#[derive(Debug, Clone)]
+struct RgiAlleleSummary {
+    id: String,
+    cvterm_name: String,
+    aro_accession: String,
+    model_type: String,
+    database: String,
+    reference_allele_source: String,
+    observed_in_genomes: String,
+    observed_in_plasmids: String,
+    observed_in_pathogens: Vec<String>,
+    range_of_reference_allele_source: f64,
+    reads: RgiReadCounts,
+    alignments: Vec<RgiAlignment>,
+    mapq_average: String,
+    mate_pair: Vec<String>,
+    percent_coverage_covered: String,
+    percent_coverage_uncovered: String,
+    length_coverage_covered: String,
+    length_coverage_uncovered: String,
+    reference_sequence_length: String,
+    resistomes: HashMap<String, Vec<String>>,
+    depth: String,
+    snps: String,
+    consensus_sequence_dna: String,
+}
+
 /// Load the subset of CARD `card.json` required by RunRgiBwtKma.
 ///
 /// This is the native equivalent of BWT.py `get_model_details()`.
@@ -1880,6 +1907,141 @@ fn resolve_card_model<'a>(
                 aro_accession
             )
         })
+}
+
+fn build_rgi_allele_summaries(
+    card_models: &CardModels,
+    read_counts: &HashMap<String, RgiReadCounts>,
+    alignments: &HashMap<String, Vec<RgiAlignment>>,
+    coverage: &HashMap<String, RgiCoverage>,
+    sidecars: &KmaSidecarResults,
+) -> anyhow::Result<Vec<RgiAlleleSummary>> {
+    let mut summaries = Vec::with_capacity(read_counts.len());
+
+    for (alignment_hit, reads) in read_counts {
+        let model = resolve_card_model(card_models, alignment_hit)?;
+
+        let hit_alignments = alignments
+            .get(alignment_hit)
+            .cloned()
+            .unwrap_or_default();
+
+        let mapq_average = if hit_alignments.is_empty() {
+            0.0
+        } else {
+            hit_alignments
+                .iter()
+                .map(|alignment| alignment.mapq as f64)
+                .sum::<f64>()
+                / hit_alignments.len() as f64
+        };
+
+        // Match BWT.py summary(): retain unique RNEXT/MRNM values when the
+        // mate maps to a different reference, excluding linkage back to the
+        // current ARO accession.
+        let current_aro = format!("ARO:{}", model.aro_accession);
+        let mut mate_pair = Vec::<String>::new();
+        for alignment in &hit_alignments {
+            if alignment.mrnm != "="
+                && !alignment.mrnm.contains(&current_aro)
+                && !mate_pair.iter().any(|mate| mate == &alignment.mrnm)
+            {
+                mate_pair.push(alignment.mrnm.clone());
+            }
+        }
+
+        let hit_coverage = coverage.get(alignment_hit).ok_or_else(|| {
+            anyhow!(
+                "RunRgiBwtKma missing genomecov result for mapped reference '{}'",
+                alignment_hit
+            )
+        })?;
+
+        if hit_coverage.reference_length == 0 {
+            return Err(anyhow!(
+                "RunRgiBwtKma genomecov reported zero reference length for '{}'",
+                alignment_hit
+            ));
+        }
+
+        if reads.reference_length != hit_coverage.reference_length {
+            return Err(anyhow!(
+                "RunRgiBwtKma reference length mismatch for '{}': idxstats={}, genomecov={}",
+                alignment_hit,
+                reads.reference_length,
+                hit_coverage.reference_length
+            ));
+        }
+
+        let percent_covered =
+            hit_coverage.covered_bases as f64 / hit_coverage.reference_length as f64 * 100.0;
+        let percent_uncovered =
+            hit_coverage.uncovered_bases as f64 / hit_coverage.reference_length as f64 * 100.0;
+
+        let mut resistomes = model.categories.clone();
+        resistomes
+            .entry("AMR Gene Family".to_string())
+            .or_default();
+        resistomes
+            .entry("Drug Class".to_string())
+            .or_default();
+        resistomes
+            .entry("Resistance Mechanism".to_string())
+            .or_default();
+
+        // Canonical CARD branch of BWT.py summary(). The current WDL invokes
+        // `rgi bwt -a kma` without WildCARD or bait reporting.
+        let depth = sidecars
+            .read_depth
+            .get(alignment_hit)
+            .cloned()
+            .unwrap_or_default();
+
+        let snps = sidecars
+            .mutations
+            .get(alignment_hit)
+            .map(|items| items.join("; "))
+            .unwrap_or_default();
+
+        let consensus_sequence_dna = sidecars
+            .consensus_sequences
+            .get(alignment_hit)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "RunRgiBwtKma missing KMA consensus sequence for mapped reference '{}'",
+                    alignment_hit
+                )
+            })?;
+
+        summaries.push(RgiAlleleSummary {
+            id: alignment_hit.clone(),
+            cvterm_name: model.model_name.clone(),
+            aro_accession: model.aro_accession.clone(),
+            model_type: model.model_type.clone(),
+            database: "CARD".to_string(),
+            reference_allele_source: "CARD curation".to_string(),
+            observed_in_genomes: "no data".to_string(),
+            observed_in_plasmids: "no data".to_string(),
+            observed_in_pathogens: model.taxon.clone(),
+            range_of_reference_allele_source: 100.0,
+            reads: reads.clone(),
+            alignments: hit_alignments,
+            mapq_average: format!("{:.2}", mapq_average),
+            mate_pair,
+            percent_coverage_covered: format!("{:.2}", percent_covered),
+            percent_coverage_uncovered: format!("{:.2}", percent_uncovered),
+            length_coverage_covered: hit_coverage.covered_bases.to_string(),
+            length_coverage_uncovered: hit_coverage.uncovered_bases.to_string(),
+            reference_sequence_length: hit_coverage.reference_length.to_string(),
+            resistomes,
+            depth,
+            snps,
+            consensus_sequence_dna,
+        });
+    }
+
+    Ok(summaries)
 }
 
 pub async fn run(
@@ -3570,6 +3732,58 @@ pub async fn run(
                 );
             }
 
+            // All inputs consumed by BWT.py summary() are now available. The
+            // sidecar task has been running concurrently since KMA launch; await it
+            // here at the report-integration boundary.
+            let kma_sidecars = kma_sidecar_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunKMA sidecar task panicked: {}", e
+                    ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] KMA sidecar results ready: depths={}, consensus={}, mutation_refs={}",
+                kma_sidecars.read_depth.len(),
+                kma_sidecars.consensus_sequences.len(),
+                kma_sidecars.mutations.len(),
+            );
+
+            let rgi_allele_summaries = build_rgi_allele_summaries(
+                &card_models,
+                &rgi_read_counts,
+                &rgi_alignments,
+                &rgi_coverage,
+                &kma_sidecars,
+            )
+                .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma allele summaries constructed: {}",
+                rgi_allele_summaries.len()
+            );
+
+            for summary in &rgi_allele_summaries {
+                info!(
+                    "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} all={} coverage={}% ({}/{}) mapq={} mates={} depth={} snps={} consensus_bp={}",
+                    summary.id,
+                    summary.cvterm_name,
+                    summary.aro_accession,
+                    summary.reads.mapped,
+                    summary.reads.all,
+                    summary.percent_coverage_covered,
+                    summary.length_coverage_covered,
+                    summary.reference_sequence_length,
+                    summary.mapq_average,
+                    summary.mate_pair.len(),
+                    summary.depth,
+                    summary.snps,
+                    summary.consensus_sequence_dna.len(),
+                );
+            }
+
             let (
                 validation_stats,
                 ercc_filtered_count,
@@ -3759,22 +3973,6 @@ pub async fn run(
             }
 
 
-
-            let kma_sidecars = kma_sidecar_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunKMA sidecar task panicked: {}", e
-                    ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] KMA sidecar results ready: depths={}, consensus={}, mutation_refs={}",
-                kma_sidecars.read_depth.len(),
-                kma_sidecars.consensus_sequences.len(),
-                kma_sidecars.mutations.len(),
-            );
 
             spades.completion_task
                 .await
