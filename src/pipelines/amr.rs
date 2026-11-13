@@ -1794,6 +1794,94 @@ fn parse_rgi_alignment(line: &str) -> anyhow::Result<RgiAlignment> {
     })
 }
 
+fn resolve_card_model<'a>(
+    card_models: &'a CardModels,
+    alignment_hit: &str,
+) -> anyhow::Result<&'a CardModel> {
+    let fields: Vec<&str> = alignment_hit.split('|').collect();
+
+    // Match BWT.py get_model_id():
+    //
+    //   if alignment_hit[0:22] == "Prevalence_Sequence_ID"
+    //      or alignment_hit[0:4] == "ARO:":
+    //
+    //       model_id = alignment_hit.split("|")[1].split(":")[1]
+    //
+    if alignment_hit.starts_with("Prevalence_Sequence_ID")
+        || alignment_hit.starts_with("ARO:")
+    {
+        let model_field = fields.get(1).ok_or_else(|| {
+            anyhow!(
+                "CARD reference '{}' is missing the model-id field",
+                alignment_hit
+            )
+        })?;
+
+        let model_id = model_field
+            .split_once(':')
+            .map(|(_, value)| value)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "CARD reference '{}' has malformed model-id field '{}'",
+                    alignment_hit,
+                    model_field
+                )
+            })?;
+
+        return card_models
+            .by_model_id
+            .get(model_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "CARD reference '{}' resolved model id '{}' \
+                     but that model is absent from card.json",
+                    alignment_hit,
+                    model_id
+                )
+            });
+    }
+
+    // Match BWT.py fallback:
+    //
+    //   accession =
+    //       alignment_hit.split("|")[4].split(":")[1]
+    //
+    //   model_id =
+    //       models_by_accession[accession]["model_id"]
+    //
+    let accession_field = fields.get(4).ok_or_else(|| {
+        anyhow!(
+            "CARD reference '{}' is missing the ARO accession field",
+            alignment_hit
+        )
+    })?;
+
+    let aro_accession = accession_field
+        .split_once(':')
+        .map(|(_, value)| value)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "CARD reference '{}' has malformed ARO accession field '{}'",
+                alignment_hit,
+                accession_field
+            )
+        })?;
+
+    card_models
+        .by_aro_accession
+        .get(aro_accession)
+        .ok_or_else(|| {
+            anyhow!(
+                "CARD reference '{}' resolved ARO accession '{}' \
+                 but that accession is absent from card.json",
+                alignment_hit,
+                aro_accession
+            )
+        })
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -3088,6 +3176,22 @@ pub async fn run(
                 );
             }
 
+            for reference in rgi_read_counts.keys() {
+                let model =
+                    resolve_card_model(&card_models, reference)
+                        .map_err(PipelineError::Other)?;
+
+                info!(
+                    "[AMR] CARD reference resolved: \
+                     reference={} model_id={} aro_accession={} \
+                     model_name={} model_type={}",
+                    reference,
+                    model.model_id,
+                    model.aro_accession,
+                    model.model_name,
+                    model.model_type,
+                    );
+            }
 
 
             // ------------------------------------------------------------
