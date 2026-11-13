@@ -34,6 +34,7 @@ use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file, write_byte_stream_to_file};
 use crate::utils::sambam::parse_sam_record;
+use crate::utils::sequence::translate_rgi_kma_consensus;
 use crate::utils::streams::{
     bytes_to_lines,
     fanout_to_channels,
@@ -224,6 +225,7 @@ struct RgiAlleleSummary {
     depth: String,
     snps: String,
     consensus_sequence_dna: String,
+    consensus_sequence_protein: String,
 }
 
 /// Load the subset of CARD `card.json` required by RunRgiBwtKma.
@@ -2014,6 +2016,18 @@ fn build_rgi_allele_summaries(
                 )
             })?;
 
+        // Match BWT.py: table 11, first with CDS validation and then with
+        // ordinary codon translation as the fallback. Terminal partial codons
+        // are padded with N only for translation and removed from the protein.
+        let consensus_sequence_protein =
+            translate_rgi_kma_consensus(&consensus_sequence_dna).map_err(|e| {
+                anyhow!(
+                    "RunRgiBwtKma failed translating KMA consensus for '{}': {}",
+                    alignment_hit,
+                    e
+                )
+            })?;
+
         summaries.push(RgiAlleleSummary {
             id: alignment_hit.clone(),
             cvterm_name: model.model_name.clone(),
@@ -2038,6 +2052,7 @@ fn build_rgi_allele_summaries(
             depth,
             snps,
             consensus_sequence_dna,
+            consensus_sequence_protein,
         });
     }
 
@@ -3767,7 +3782,7 @@ pub async fn run(
 
             for summary in &rgi_allele_summaries {
                 info!(
-                    "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} all={} coverage={}% ({}/{}) mapq={} mates={} depth={} snps={} consensus_bp={}",
+                    "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} all={} coverage={}% ({}/{}) mapq={} mates={} depth={} snps={} consensus_bp={} protein_aa={}",
                     summary.id,
                     summary.cvterm_name,
                     summary.aro_accession,
@@ -3781,6 +3796,7 @@ pub async fn run(
                     summary.depth,
                     summary.snps,
                     summary.consensus_sequence_dna.len(),
+                    summary.consensus_sequence_protein.len(),
                 );
             }
 
