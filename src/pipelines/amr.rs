@@ -2328,6 +2328,163 @@ async fn write_rgi_allele_mapping_tab(
 /// Native equivalent of the gene-level half of BWT.py `get_summary()`.
 /// Groups allele summaries by ARO accession and emits the exact 26-column
 /// `sr_amr_report.gene_mapping_data.txt` report used by RGI.
+/// Write the two durable mapping-statistics artifacts required by the
+/// RunRgiBwtKma WDL output contract.
+///
+/// Match RGI BWT.py `get_stats()` directly against the already-materialized
+/// final BAM:
+///
+///   bamtools stats -in <bam> > sr_amr_report.overall_mapping_stats.txt
+///   samtools flagstat <bam>   >> sr_amr_report.artifacts_mapping_stats.txt
+///
+/// The artifacts report starts with the exact four-line RGI header. No RGI
+/// temporary BAMs or Python scratch files are recreated.
+async fn write_rgi_mapping_stats(
+    config: Arc<RunConfig>,
+    bam_path: &std::path::Path,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let overall_path = config
+        .out_dir
+        .join("sr_amr_report.overall_mapping_stats.txt");
+    let artifacts_path = config
+        .out_dir
+        .join("sr_amr_report.artifacts_mapping_stats.txt");
+
+    // RGI: bamtools stats -in <final BAM> > overall_mapping_stats.txt
+    let bamtools_args = vec![
+        "stats".to_string(),
+        "-in".to_string(),
+        bam_path.to_string_lossy().to_string(),
+    ];
+
+    info!(
+        "[AMR] RunRgiBwtKma bamtools stats args: {:?}",
+        bamtools_args
+    );
+
+    let (mut bamtools_child, bamtools_stderr_task) = spawn_cmd(
+        config.clone(),
+        BAMTOOLS_TAG,
+        bamtools_args,
+        config.args.verbose,
+        None,
+    )
+        .await?;
+
+    let bamtools_stdout = parse_child_output(
+        &mut bamtools_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        &config,
+    )
+        .await?;
+
+    let overall_write_task = tokio::spawn(stream_to_file(
+        bamtools_stdout,
+        overall_path.clone(),
+    ));
+
+    let bamtools_status = bamtools_child.wait().await?;
+
+    overall_write_task
+        .await
+        .map_err(|e| anyhow!("bamtools stats output writer panicked: {}", e))??;
+
+    bamtools_stderr_task
+        .await
+        .map_err(|e| anyhow!("bamtools stats stderr task panicked: {}", e))??;
+
+    if !bamtools_status.success() {
+        return Err(anyhow!(
+            "bamtools stats failed with exit status {}",
+            bamtools_status
+        ));
+    }
+
+    // RGI writes this header before appending samtools flagstat stdout.
+    const ARTIFACTS_HEADER: &str =
+        "**********************************************\nStats for Artifacts: \n**********************************************\n\n";
+
+    tokio::fs::write(&artifacts_path, ARTIFACTS_HEADER.as_bytes())
+        .await
+        .map_err(|e| anyhow!(
+            "Failed to write RGI artifacts mapping stats header {}: {}",
+            artifacts_path.display(),
+            e
+        ))?;
+
+    // RGI: samtools flagstat <final BAM> >> artifacts_mapping_stats.txt
+    // SamtoolsSubcommand currently has no Flagstat variant, so invoke the
+    // command through the existing generic process runner rather than adding
+    // a fake translation through another subcommand.
+    let flagstat_args = vec![
+        "flagstat".to_string(),
+        bam_path.to_string_lossy().to_string(),
+    ];
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools flagstat args: {:?}",
+        flagstat_args
+    );
+
+    let (mut flagstat_child, flagstat_stderr_task) = spawn_cmd(
+        config.clone(),
+        SAMTOOLS_TAG,
+        flagstat_args,
+        config.args.verbose,
+        None,
+    )
+        .await?;
+
+    let mut flagstat_stdout = parse_child_output(
+        &mut flagstat_child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        &config,
+    )
+        .await?;
+
+    let mut flagstat_bytes = Vec::<u8>::new();
+    while let Some(item) = flagstat_stdout.recv().await {
+        let ParseOutput::Bytes(bytes) = item else {
+            return Err(anyhow!(
+                "samtools flagstat produced unexpected non-byte output"
+            ));
+        };
+        flagstat_bytes.extend_from_slice(&bytes);
+    }
+
+    let flagstat_status = flagstat_child.wait().await?;
+
+    flagstat_stderr_task
+        .await
+        .map_err(|e| anyhow!("samtools flagstat stderr task panicked: {}", e))??;
+
+    if !flagstat_status.success() {
+        return Err(anyhow!(
+            "samtools flagstat failed with exit status {}",
+            flagstat_status
+        ));
+    }
+
+    use tokio::io::AsyncWriteExt;
+    let mut artifacts_file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&artifacts_path)
+        .await?;
+    artifacts_file.write_all(&flagstat_bytes).await?;
+    artifacts_file.flush().await?;
+
+    info!(
+        "[AMR] RunRgiBwtKma mapping statistics ready: overall={}, artifacts={}",
+        overall_path.display(),
+        artifacts_path.display()
+    );
+
+    Ok((overall_path, artifacts_path))
+}
+
+
 async fn write_rgi_gene_mapping_tab(
     out_dir: &std::path::Path,
     summaries: &[RgiAlleleSummary],
@@ -3671,6 +3828,27 @@ pub async fn run(
     "[AMR] RunRgiBwtKma BAM index ready: {}",
     sorted_bai_path.display()
 );
+
+            // ------------------------------------------------------------
+            // WDL-required RGI mapping statistics.
+            //
+            // The final BAM and BAI are complete at this boundary. Generate
+            // the two durable get_stats() artifacts directly from that BAM.
+            // ------------------------------------------------------------
+
+            let (overall_mapping_stats_path, artifacts_mapping_stats_path) =
+                write_rgi_mapping_stats(
+                    config.clone(),
+                    &sorted_bam_path,
+                )
+                    .await
+                    .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] RunRgiBwtKma WDL mapping stats ready: overall={}, artifacts={}",
+                overall_mapping_stats_path.display(),
+                artifacts_mapping_stats_path.display(),
+            );
 
             // ------------------------------------------------------------
             // Pull per-reference alignment counts with samtools idxstats.
