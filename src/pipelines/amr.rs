@@ -1999,13 +1999,13 @@ fn build_rgi_allele_summaries(
             .cloned()
             .unwrap_or_default();
 
-        let snps = sidecars
+        let mut snps = sidecars
             .mutations
             .get(alignment_hit)
             .map(|items| items.join("; "))
             .unwrap_or_default();
 
-        let consensus_sequence_dna = sidecars
+        let mut consensus_sequence_dna = sidecars
             .consensus_sequences
             .get(alignment_hit)
             .cloned()
@@ -2019,7 +2019,7 @@ fn build_rgi_allele_summaries(
         // Match BWT.py: table 11, first with CDS validation and then with
         // ordinary codon translation as the fallback. Terminal partial codons
         // are padded with N only for translation and removed from the protein.
-        let consensus_sequence_protein =
+        let mut consensus_sequence_protein =
             translate_rgi_kma_consensus(&consensus_sequence_dna).map_err(|e| {
                 anyhow!(
                     "RunRgiBwtKma failed translating KMA consensus for '{}': {}",
@@ -2027,6 +2027,29 @@ fn build_rgi_allele_summaries(
                     e
                 )
             })?;
+
+        // Match BWT.py summary(): retain the allele and depth at any KMA depth,
+        // but suppress SNP and consensus reporting when depth is below 5.
+        // Python uses float(read_coverage_depth.strip() or 0), so an absent or
+        // whitespace-only depth is treated as 0.0.
+        let depth_value = if depth.trim().is_empty() {
+            0.0
+        } else {
+            depth.trim().parse::<f64>().map_err(|e| {
+                anyhow!(
+                    "RunRgiBwtKma invalid KMA depth {:?} for '{}': {}",
+                    depth,
+                    alignment_hit,
+                    e
+                )
+            })?
+        };
+
+        if depth_value < 5.0 {
+            snps.clear();
+            consensus_sequence_dna.clear();
+            consensus_sequence_protein.clear();
+        }
 
         summaries.push(RgiAlleleSummary {
             id: alignment_hit.clone(),
@@ -3782,7 +3805,7 @@ pub async fn run(
 
             for summary in &rgi_allele_summaries {
                 info!(
-                    "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} all={} coverage={}% ({}/{}) mapq={} mates={} depth={} snps={} consensus_bp={} protein_aa={}",
+                    "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} all={} coverage={}% ({}/{}) mapq={} mates={} depth={} snps_present={} consensus_bp={} protein_aa={}",
                     summary.id,
                     summary.cvterm_name,
                     summary.aro_accession,
@@ -3794,7 +3817,7 @@ pub async fn run(
                     summary.mapq_average,
                     summary.mate_pair.len(),
                     summary.depth,
-                    summary.snps,
+                    !summary.snps.is_empty(),
                     summary.consensus_sequence_dna.len(),
                     summary.consensus_sequence_protein.len(),
                 );
