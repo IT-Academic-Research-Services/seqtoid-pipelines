@@ -4010,6 +4010,42 @@ pub async fn run(
                 rgi_read_counts.len()
             );
 
+            // ------------------------------------------------------------
+            // WDL-required RGI per-reference mapping statistics.
+            //
+            // BWT.py get_reads_count() writes this artifact from the same
+            // idxstats rows retained above (mapped > 0). Therefore the exact
+            // RGI count is simply the number of entries in rgi_read_counts;
+            // no temporary sr_amr_report.temp.txt boundary is required.
+            // ------------------------------------------------------------
+
+            let reference_mapping_stats_path =
+                out_dir.join("sr_amr_report.reference_mapping_stats.txt");
+
+            let reference_mapping_stats = format!(
+                "**********************************************\nStats for Reference: \n**********************************************\n\nhow many reference terms (or ARO terms): {}\n\n",
+                rgi_read_counts.len(),
+            );
+
+            tokio::fs::write(
+                &reference_mapping_stats_path,
+                reference_mapping_stats.as_bytes(),
+            )
+                .await
+                .map_err(|e| {
+                    PipelineError::IOError(format!(
+                        "Failed to write {}: {}",
+                        reference_mapping_stats_path.display(),
+                        e
+                    ))
+                })?;
+
+            info!(
+                "[AMR] RunRgiBwtKma reference mapping stats ready: {} ({} mapped references)",
+                reference_mapping_stats_path.display(),
+                rgi_read_counts.len(),
+            );
+
             for (reference, counts) in &rgi_read_counts {
                 info!(
                     "[AMR] RGI idxstats: reference={} length={} mapped={} unmapped={} all={}",
