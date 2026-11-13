@@ -16,7 +16,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
-                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG,
+                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG, PIGZ_TAG,
                           BedtoolsSubcommand, SamtoolsSubcommand, BamtoolsSubcommand};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
@@ -27,6 +27,7 @@ use crate::utils::command::kma::KmaConfig;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::bamtools::BamtoolsConfig;
 use crate::utils::command::bedtools::BedtoolsConfig;
+use crate::utils::command::pigz::PigzConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
@@ -128,6 +129,13 @@ struct KmaSamResults {
     /// KMA records that are not usable alignments despite potentially
     /// misleading FLAG values, e.g. RNAME="*", POS=0, CIGAR="*".
     invalid_alignment_records: u64,
+}
+
+#[derive(Debug)]
+struct KmaSidecarResults {
+    mutations: HashMap<String, Vec<String>>,
+    read_depth: HashMap<String, String>,
+    consensus_sequences: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1016,6 +1024,278 @@ async fn run_kma_amr(
     })
 }
 
+async fn consume_kma_sidecars(
+    config: Arc<RunConfig>,
+    output_prefix: PathBuf,
+) -> anyhow::Result<KmaSidecarResults> {
+    let res_path =
+        PathBuf::from(format!("{}.res", output_prefix.display()));
+
+    let fsa_path =
+        PathBuf::from(format!("{}.fsa", output_prefix.display()));
+
+    let vcf_path =
+        PathBuf::from(format!("{}.vcf.gz", output_prefix.display()));
+
+    // ================================================================
+    // KMA .res
+    //
+    // RGI retains:
+    //
+    //   column 1 -> template/reference
+    //   column 9 -> depth
+    //
+    // Preserve depth as text because downstream RGI-compatible report
+    // generation consumes the textual value rather than performing
+    // arithmetic on it here.
+    // ================================================================
+
+    let res_text = tokio::fs::read_to_string(&res_path)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to read KMA .res {}: {}",
+                res_path.display(),
+                e
+            )
+        })?;
+
+    let mut read_depth =
+        HashMap::<String, String>::new();
+
+    for (line_no, line) in res_text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> =
+            line.split('\t').collect();
+
+        if fields.len() < 9 {
+            return Err(anyhow!(
+                "Malformed KMA .res line {} in {}: \
+                 expected >=9 tab-separated fields, got {}",
+                line_no + 1,
+                res_path.display(),
+                fields.len()
+            ));
+        }
+
+        read_depth.insert(
+            fields[0].to_string(),
+            fields[8].to_string(),
+        );
+    }
+
+    // ================================================================
+    // KMA .fsa
+    //
+    // Use the pipeline FASTA reader rather than introducing a second
+    // FASTA parser.
+    //
+    // Retain:
+    //
+    //   reference -> consensus sequence
+    // ================================================================
+
+    let fsa_rx = read_fasta(
+        fsa_path.clone(),
+        u64::MAX,
+        None,
+        None,
+        &config,
+    )
+        .map_err(|e| {
+            anyhow!(
+            "Failed to open KMA .fsa {}: {}",
+            fsa_path.display(),
+            e
+        )
+        })?;
+
+    let mut fsa_stream =
+        ReceiverStream::new(fsa_rx);
+
+    let mut consensus_sequences =
+        HashMap::<String, String>::new();
+
+    while let Some(item) = fsa_stream.next().await {
+        let ParseOutput::Fasta(record) = item else {
+            return Err(anyhow!(
+                "KMA .fsa parser produced non-FASTA output for {}",
+                fsa_path.display()
+            ));
+        };
+
+        let reference =
+            record.id().to_string();
+
+        let sequence =
+            String::from_utf8(record.seq().to_vec())
+                .map_err(|e| {
+                    anyhow!(
+                        "KMA .fsa sequence for {} is not UTF-8: {}",
+                        reference,
+                        e
+                    )
+                })?;
+
+        consensus_sequences.insert(
+            reference,
+            sequence,
+        );
+    }
+
+    // ================================================================
+    // KMA .vcf.gz
+    //
+    // Decompress exactly once:
+    //
+    //     .vcf.gz
+    //        |
+    //        v
+    //     pigz -d -c
+    //        |
+    //        v
+    //     ParseMode::Lines
+    //        |
+    //        v
+    //     ParseOutput::Bytes(one complete VCF line)
+    //
+    // parse_lines() already removes trailing LF and CR, so the Bytes
+    // variant received below contains the complete logical line without
+    // its line ending.
+    //
+    // RGI-compatible mutation representation:
+    //
+    //     REF + POS + ALT
+    //
+    // e.g.
+    //
+    //     A173G
+    // ================================================================
+
+    let pigz_config =
+        PigzConfig::decompress_stdout(vcf_path.clone());
+
+    let pigz_args = generate_cli(
+        PIGZ_TAG,
+        &config,
+        Some(&pigz_config),
+    )?;
+
+    let (
+        mut pigz_child,
+        pigz_stderr_task,
+    ) = spawn_cmd(
+        config.clone(),
+        PIGZ_TAG,
+        pigz_args,
+        config.args.verbose,
+        None,
+    )
+        .await?;
+
+    let mut vcf_rx = parse_child_output(
+        &mut pigz_child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        &config,
+    )
+        .await?;
+
+    let mut mutations =
+        HashMap::<String, Vec<String>>::new();
+
+    while let Some(item) = vcf_rx.recv().await {
+        let ParseOutput::Bytes(line_bytes) = item else {
+            return Err(anyhow!(
+                "KMA VCF decompressor produced unexpected \
+                 non-byte ParseOutput"
+            ));
+        };
+
+        let line =
+            std::str::from_utf8(&line_bytes)
+                .map_err(|e| {
+                    anyhow!(
+                        "KMA VCF {} contains non-UTF8 data: {}",
+                        vcf_path.display(),
+                        e
+                    )
+                })?;
+
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> =
+            line.split('\t').collect();
+
+        if fields.len() < 5 {
+            return Err(anyhow!(
+                "Malformed KMA VCF record in {}: \
+                 expected >=5 tab-separated fields: {}",
+                vcf_path.display(),
+                line
+            ));
+        }
+
+        let chrom = fields[0];
+        let pos = fields[1];
+        let reference = fields[3];
+        let alternate = fields[4];
+
+        mutations
+            .entry(chrom.to_string())
+            .or_default()
+            .push(format!(
+                "{}{}{}",
+                reference,
+                pos,
+                alternate
+            ));
+    }
+
+    // parse_child_output() takes ownership of stdout, so reaching EOF on
+    // vcf_rx means pigz has closed stdout. Reap the process and stderr
+    // task explicitly and propagate any decompression failure.
+
+    let pigz_status =
+        pigz_child.wait().await?;
+
+    pigz_stderr_task
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "KMA VCF pigz stderr task panicked: {}",
+                e
+            )
+        })??;
+
+    if !pigz_status.success() {
+        return Err(anyhow!(
+            "pigz failed decompressing {} with status {}",
+            vcf_path.display(),
+            pigz_status
+        ));
+    }
+
+    info!(
+        "[AMR] KMA sidecars parsed: \
+         depths={}, consensus={}, mutation_refs={}",
+        read_depth.len(),
+        consensus_sequences.len(),
+        mutations.len()
+    );
+
+    Ok(KmaSidecarResults {
+        mutations,
+        read_depth,
+        consensus_sequences,
+    })
+}
+
 fn parse_kma_sq_header(line: &str) -> anyhow::Result<Option<KmaReference>> {
     if !line.starts_with("@SQ\t") {
         return Ok(None);
@@ -1487,6 +1767,17 @@ pub async fn run(
             let kma_sam_task = tokio::spawn(
                 consume_kma_sam(kma_sam_stream)
             );
+
+            // KMA sidecars are valid only after KMA exits. Own that synchronization
+            // in a dedicated task so BAM/SPAdes processing remains concurrent.
+            let kma_sidecar_config = config.clone();
+            let kma_sidecar_prefix = kma_output_prefix.clone();
+            let kma_sidecar_task = tokio::spawn(async move {
+                kma_completion_task
+                    .await
+                    .map_err(|e| anyhow!("RunKMA completion task panicked: {}", e))??;
+                consume_kma_sidecars(kma_sidecar_config, kma_sidecar_prefix).await
+            });
 
             // ------------------------------------------------------------
             // Stream raw KMA SAM directly through the same samtools fixmate
@@ -2894,15 +3185,21 @@ pub async fn run(
 
 
 
-            kma_completion_task
+            let kma_sidecars = kma_sidecar_task
                 .await
                 .map_err(|e| {
                     PipelineError::Other(anyhow!(
-            "RunKMA completion task panicked: {}",
-            e
-        ))
+                        "RunKMA sidecar task panicked: {}", e
+                    ))
                 })?
                 .map_err(PipelineError::Other)?;
+
+            info!(
+                "[AMR] KMA sidecar results ready: depths={}, consensus={}, mutation_refs={}",
+                kma_sidecars.read_depth.len(),
+                kma_sidecars.consensus_sequences.len(),
+                kma_sidecars.mutations.len(),
+            );
 
             spades.completion_task
                 .await
