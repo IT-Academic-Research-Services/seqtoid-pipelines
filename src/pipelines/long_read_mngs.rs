@@ -44,6 +44,7 @@ use crate::utils::command::fastp::FastpConfig;
 use crate::utils::command::minimap2::{Minimap2Config};
 use crate::utils::command::samtools::{SamtoolsConfig};
 use crate::utils::command::minimap2::{minimap2_index_prep};
+use crate::utils::command::pigz::PigzConfig;
 use crate::utils::command::flye::FlyeConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
 use crate::utils::coverage_viz::generate_coverage_viz;
@@ -170,15 +171,19 @@ async fn validate_input(
     // stream_to_cmd(), compresses them with pigz, and writes the compressed
     // stdout to sample_validated.fastq.gz.
 
-    let pigz_args = generate_cli(
-        PIGZ_TAG,
-        &config,
-        None,
-    )
-        .map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+    let pigz_config =
+        PigzConfig::compress_stdout();
+
+    let pigz_args =
+        generate_cli(
+            PIGZ_TAG,
+            &config,
+            Some(&pigz_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?;
 
     let (
         pigz_child,

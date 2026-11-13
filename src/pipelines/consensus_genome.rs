@@ -28,6 +28,7 @@ use crate::config::defs::{ReadStats, RunConfig};
 use crate::utils::command::bcftools::BcftoolsConfig;
 use crate::utils::command::kraken2::Kraken2Config;
 use crate::utils::command::minimap2::{minimap2_index_prep, Minimap2Config};
+use crate::utils::command::pigz::PigzConfig;
 use crate::utils::command::quast::QuastConfig;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::seqkit::SeqkitConfig;
@@ -165,11 +166,21 @@ async fn validate_input(
     let val_out_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
     let val_pigz_stream = val_streams_iter.next().ok_or(PipelineError::EmptyStream)?;
 
+    let val_pigz_config =
+        PigzConfig::compress_stdout();
+
     let val_pigz_args =
-        generate_cli(PIGZ_TAG, &config, None).map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+        generate_cli(
+            PIGZ_TAG,
+            &config,
+            Some(&val_pigz_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
+
     let (val_pigz_child, val_pigz_stream_task, val_pigz_err_task) = stream_to_cmd(
         config.clone(),
         val_pigz_stream,
@@ -449,12 +460,21 @@ async fn align_to_host(
         return Err(PipelineError::EmptyStream);
     }
 
+    let pigz_config =
+        PigzConfig::compress_stdout();
+
     // Pigz for compression
     let pigz_args =
-        generate_cli(PIGZ_TAG, &config, None).map_err(|e| PipelineError::ToolExecution {
-            tool: PIGZ_TAG.to_string(),
-            error: e.to_string(),
-        })?;
+        generate_cli(
+            PIGZ_TAG,
+            &config,
+            Some(&pigz_config),
+        )
+            .map_err(|e| PipelineError::ToolExecution {
+                tool: PIGZ_TAG.to_string(),
+                error: e.to_string(),
+            })?;
+
     let (pigz_child, pigz_stream_task, pigz_err_task) = stream_to_cmd(
         config.clone(),
         no_host_file_stream,
@@ -1836,8 +1856,15 @@ async fn filter_with_kraken(
     // Write durable
     // -------------------------------------------------------------------------
 
+    let pigz_config =
+        PigzConfig::compress_stdout();
+
     let pigz_args =
-        generate_cli(PIGZ_TAG, &config, None)
+        generate_cli(
+            PIGZ_TAG,
+            &config,
+            Some(&pigz_config),
+        )
             .map_err(|e| PipelineError::ToolExecution {
                 tool: PIGZ_TAG.to_string(),
                 error: e.to_string(),

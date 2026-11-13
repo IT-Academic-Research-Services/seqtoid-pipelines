@@ -232,48 +232,167 @@ pub mod fastp {
     }
 }
 
-mod pigz {
-    use crate::config::defs::{RunConfig, PIGZ_TAG};
-    use crate::utils::command::{version_check, ArgGenerator};
+pub mod pigz {
+    use std::path::PathBuf;
+
+    use anyhow::{anyhow, Result};
+
+    use crate::config::defs::{
+        PigzMode,
+        RunConfig,
+        PIGZ_TAG,
+    };
+    use crate::utils::command::{
+        version_check,
+        ArgGenerator,
+    };
     use crate::utils::streams::ChildStream;
+
+    #[derive(Debug, Clone)]
+    pub struct PigzConfig {
+        pub mode: PigzMode,
+
+        /// Write compressed/decompressed data to stdout rather than creating
+        /// or replacing a file.
+        pub stdout: bool,
+
+        /// Optional input file. Leave None when pigz should consume stdin.
+        pub input: Option<PathBuf>,
+
+        /// Explicit thread override.
+        ///
+        /// None uses RunConfig::thread_allocation(PIGZ_TAG, None).
+        pub threads: Option<usize>,
+
+        /// Additional ordered pigz options.
+        pub option_fields: Vec<(String, Option<String>)>,
+    }
+
+    impl PigzConfig {
+        /// Existing pipeline behavior:
+        ///
+        ///     pigz -c -p N
+        ///
+        /// Input is expected on stdin and compressed data is written to stdout.
+        pub fn compress_stdout() -> Self {
+            Self {
+                mode: PigzMode::Compress,
+                stdout: true,
+                input: None,
+                threads: None,
+                option_fields: Vec::new(),
+            }
+        }
+
+        /// Decompress a gzip file directly to stdout:
+        ///
+        ///     pigz -d -c -p N <input>
+        ///
+        /// This is the form needed for the KMA .vcf.gz sidecar.
+        pub fn decompress_stdout(
+            input: impl Into<PathBuf>,
+        ) -> Self {
+            Self {
+                mode: PigzMode::Decompress,
+                stdout: true,
+                input: Some(input.into()),
+                threads: None,
+                option_fields: Vec::new(),
+            }
+        }
+
+        pub fn threads(
+            mut self,
+            threads: usize,
+        ) -> Self {
+            self.threads = Some(threads.max(1));
+            self
+        }
+
+        pub fn option(
+            mut self,
+            option: impl Into<String>,
+            value: impl Into<String>,
+        ) -> Self {
+            self.option_fields
+                .push((option.into(), Some(value.into())));
+            self
+        }
+
+        pub fn flag(
+            mut self,
+            flag: impl Into<String>,
+        ) -> Self {
+            self.option_fields.push((flag.into(), None));
+            self
+        }
+    }
 
     pub struct PigzArgGenerator;
 
-    /// Checks if `pigz` is present and returns its version.
-    ///
-    /// # Arguments
-    ///
-    /// * `config`: the run configuration
-    ///
-    /// # Returns
-    ///
-    /// Result<f32>: the pigz version
-    #[allow(dead_code)]
-    pub async fn pigz_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
-        let version = version_check(
+    pub async fn pigz_presence_check(
+        config: &RunConfig,
+    ) -> Result<f32> {
+        version_check(
             PIGZ_TAG,
             vec!["--version"],
             0,
             1,
             ChildStream::Stdout,
             None,
-            &config,
+            config,
         )
-        .await?;
-        Ok(version)
+            .await
     }
 
     impl ArgGenerator for PigzArgGenerator {
         fn generate_args(
             &self,
             run_config: &RunConfig,
-            _extra: Option<&dyn std::any::Any>,
-        ) -> anyhow::Result<Vec<String>> {
-            let mut args_vec: Vec<String> = Vec::new();
-            args_vec.push("-c".to_string());
-            args_vec.push("-p".to_string());
-            args_vec.push(RunConfig::thread_allocation(run_config, PIGZ_TAG, None).to_string());
-            Ok(args_vec)
+            extra: Option<&dyn std::any::Any>,
+        ) -> Result<Vec<String>> {
+            let config = extra
+                .and_then(|e| e.downcast_ref::<PigzConfig>())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "pigz requires a PigzConfig as extra argument"
+                    )
+                })?;
+
+            let mut args = Vec::new();
+
+            if config.mode == PigzMode::Decompress {
+                args.push("-d".to_string());
+            }
+
+            if config.stdout {
+                args.push("-c".to_string());
+            }
+
+            let threads = config
+                .threads
+                .unwrap_or_else(|| {
+                    run_config.thread_allocation(PIGZ_TAG, None)
+                });
+
+            args.push("-p".to_string());
+            args.push(threads.max(1).to_string());
+
+            for (key, value) in &config.option_fields {
+                args.push(key.clone());
+
+                if let Some(value) = value {
+                    args.push(value.clone());
+                }
+            }
+
+            if let Some(input) = &config.input {
+                args.push(
+                    input.to_string_lossy().to_string()
+                );
+            }
+
+            Ok(args)
         }
     }
 }

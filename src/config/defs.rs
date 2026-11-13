@@ -173,6 +173,12 @@ pub enum BedtoolsSubcommand {
     Genomecov,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PigzMode {
+    Compress,
+    Decompress,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CoreAllocation {
     Maximal,
