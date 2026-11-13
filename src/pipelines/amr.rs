@@ -158,6 +158,13 @@ struct RgiAlignment {
     mrnm: String,
 }
 
+#[derive(Debug, Clone)]
+struct RgiCoverage {
+    reference_length: u64,
+    covered_bases: u64,
+    uncovered_bases: u64,
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -3002,9 +3009,150 @@ pub async fn run(
                     .await
                     .map_err(PipelineError::Other)?;
 
+            // RGI reduces the default genomecov histogram with:
+            //
+            //   awk '$2 > 0' | cut -f1,3,4,5
+            //
+            // and get_coverage_details() sums column 3 (bases at each positive
+            // depth) per reference. Reproduce that reduction directly in memory.
+            // `genome` rows are whole-input aggregates, not reference reports.
+            let mut rgi_coverage = HashMap::<String, RgiCoverage>::new();
 
+            while let Some(item) = genomecov_rx.recv().await {
+                let ParseOutput::Bytes(line_bytes) = item else {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma bedtools genomecov expected line-oriented Bytes output"
+                    )));
+                };
 
+                let line = std::str::from_utf8(&line_bytes).map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma bedtools genomecov emitted non-UTF8 output: {}",
+                        e
+                    ))
+                })?;
 
+                if line.is_empty() {
+                    continue;
+                }
+
+                let fields: Vec<&str> = line.split('\t').collect();
+                if fields.len() != 5 {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma bedtools genomecov expected 5 tab-separated fields, got {}: {}",
+                        fields.len(),
+                        line
+                    )));
+                }
+
+                let reference = fields[0];
+                if reference == "genome" {
+                    continue;
+                }
+
+                let depth = fields[1].parse::<u64>().map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma invalid genomecov depth '{}' for reference '{}': {}",
+                        fields[1], reference, e
+                    ))
+                })?;
+
+                // Match RGI's `awk '$2 > 0'` exactly.
+                if depth == 0 {
+                    continue;
+                }
+
+                let bases_at_depth = fields[2].parse::<u64>().map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma invalid genomecov base count '{}' for reference '{}': {}",
+                        fields[2], reference, e
+                    ))
+                })?;
+
+                let reference_length = fields[3].parse::<u64>().map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma invalid genomecov reference length '{}' for reference '{}': {}",
+                        fields[3], reference, e
+                    ))
+                })?;
+
+                let coverage = rgi_coverage
+                    .entry(reference.to_string())
+                    .or_insert(RgiCoverage {
+                        reference_length,
+                        covered_bases: 0,
+                        uncovered_bases: 0,
+                    });
+
+                if coverage.reference_length != reference_length {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma inconsistent genomecov reference length for '{}': {} then {}",
+                        reference, coverage.reference_length, reference_length
+                    )));
+                }
+
+                coverage.covered_bases = coverage
+                    .covered_bases
+                    .checked_add(bases_at_depth)
+                    .ok_or_else(|| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma genomecov covered-base count overflow for '{}'",
+                            reference
+                        ))
+                    })?;
+            }
+
+            // stdout is drained, so bedtools can now be reaped safely.
+            let genomecov_status = genomecov_child.wait().await.map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma bedtools genomecov wait failed: {}",
+                    e
+                ))
+            })?;
+
+            genomecov_stderr_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma bedtools genomecov stderr task panicked: {}",
+                        e
+                    ))
+                })?
+                .map_err(PipelineError::Other)?;
+
+            if !genomecov_status.success() {
+                return Err(PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma bedtools genomecov failed with exit status {}",
+                    genomecov_status
+                )));
+            }
+
+            for (reference, coverage) in rgi_coverage.iter_mut() {
+                coverage.uncovered_bases = coverage
+                    .reference_length
+                    .checked_sub(coverage.covered_bases)
+                    .ok_or_else(|| {
+                        PipelineError::Other(anyhow!(
+                            "RunRgiBwtKma genomecov covered bases exceed reference length for '{}': covered={}, length={}",
+                            reference, coverage.covered_bases, coverage.reference_length
+                        ))
+                    })?;
+            }
+
+            info!(
+                "[AMR] RunRgiBwtKma genomecov parsed: {} references with positive-depth coverage",
+                rgi_coverage.len()
+            );
+
+            for (reference, coverage) in &rgi_coverage {
+                info!(
+                    "[AMR] RGI coverage: reference={} length={} covered={} uncovered={}",
+                    reference,
+                    coverage.reference_length,
+                    coverage.covered_bases,
+                    coverage.uncovered_bases
+                );
+            }
 
             let (
                 validation_stats,
