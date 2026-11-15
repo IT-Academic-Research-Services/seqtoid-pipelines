@@ -141,9 +141,14 @@ pub struct HostFilterOutputs {
     /// Consumers of the FASTQ streams must be installed before awaiting this.
     pub duplicate_clusters: JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>>,
 
-    /// Optional live structured interleaved FASTQ stream containing the exact
-    /// host-filtered records entering dedup.
-    pub pre_dedup_interleaved: Option<ReceiverStream<ParseOutput>>,
+    /// Optional materialized pre-dedup FASTQ paths, in R1/R2 order. These are
+    /// the exact host-filtered records entering dedup. The files live in a
+    /// TempDir owned by the caller through `final_temp_dirs`.
+    pub pre_dedup_files: Option<Vec<PathBuf>>,
+
+    /// Completes only after every pre-dedup FASTQ writer has flushed and closed.
+    /// A consumer must await this before opening `pre_dedup_files`.
+    pub pre_dedup_materialization: Option<JoinHandle<Result<(), anyhow::Error>>>,
 }
 
 pub(crate) struct HostFilterCompletion {
@@ -9596,44 +9601,118 @@ pub(crate) async fn run_host_filter(
             post_filter_stream.into_inner()
         };
 
-    // Optionally expose the exact host-filtered records entering dedup as
-    // live, deinterleaved streams. The dedup branch and the retained branch
-    // are installed concurrently; no FASTQ checkpoint is created here.
-    let (pre_dedup_for_dedup, pre_dedup_interleaved) = if retain_pre_dedup {
-        let (pre_dedup_streams, pre_dedup_router_done_rx) = fanout_to_channels(
-            ReceiverStream::new(pre_dedup_parsed_stream),
-            2,
-            "pre_dedup_output",
-            &config,
-            StreamDataType::IlluminaFastq,
-        )
-            .await
-            .map_err(|_| PipelineError::StreamDataDropped)?;
+    // Optionally retain the exact host-filtered records entering dedup. Unlike
+    // the dedup branch, this is a replay boundary: RunRedup must scan the same
+    // pre-dedup reads only after the duplicate clusters and surviving
+    // representatives are known. Materialize that branch now instead of
+    // retaining every SequenceRecord in RAM.
+    //
+    // IMPORTANT: do not await the materialization here. The sibling dedup
+    // branch is live and can backpressure through bounded channels. We install
+    // all file writers immediately and return their completion handle together
+    // with the paths. RunRedup awaits that handle before reopening the files.
+    let (pre_dedup_for_dedup, pre_dedup_files, pre_dedup_materialization) =
+        if retain_pre_dedup {
+            let (pre_dedup_streams, pre_dedup_router_done_rx) = fanout_to_channels(
+                ReceiverStream::new(pre_dedup_parsed_stream),
+                2,
+                "pre_dedup_output",
+                &config,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
 
-        cleanup_receivers.push(pre_dedup_router_done_rx);
+            cleanup_receivers.push(pre_dedup_router_done_rx);
 
-        let mut pre_dedup_streams = pre_dedup_streams.into_iter();
-
-        let dedup_input = pre_dedup_streams
-            .next()
-            .ok_or(PipelineError::EmptyStream)?;
-
-        let retained_input = ReceiverStream::new(
-            pre_dedup_streams
+            let mut pre_dedup_streams = pre_dedup_streams.into_iter();
+            let dedup_input = pre_dedup_streams
                 .next()
-                .ok_or(PipelineError::EmptyStream)?,
-        );
+                .ok_or(PipelineError::EmptyStream)?;
+            let retained_input = ReceiverStream::new(
+                pre_dedup_streams
+                    .next()
+                    .ok_or(PipelineError::EmptyStream)?,
+            );
 
-        (
-            dedup_input,
-            Some(retained_input),
-        )
-    } else {
-        (
-            pre_dedup_parsed_stream,
-            None,
-        )
-    };
+            let pre_dedup_temp_dir = choose_temp_dir(
+                config.input_size,
+                &config.ram_temp_dir,
+                &config.args.nvme_scratch,
+                2,
+                false,
+            )
+                .await?;
+
+            let pre_dedup_r1_path = pre_dedup_temp_dir.path().join("pre_dedup_R1.fastq");
+            let pre_dedup_r2_path = paired.then(|| {
+                pre_dedup_temp_dir.path().join("pre_dedup_R2.fastq")
+            });
+
+            let (r1_rx, r2_rx_opt, deinterleave_task) = deinterleave_fastq_stream(
+                retained_input,
+                paired,
+                config.base_buffer_size * 4,
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let r1_write_task = write_parse_output_to_file(
+                &pre_dedup_r1_path,
+                ReceiverStream::new(r1_rx),
+                Some(config.base_buffer_size * 4),
+            )
+                .await
+                .map_err(PipelineError::Other)?;
+
+            let r2_write_task = match (r2_rx_opt, pre_dedup_r2_path.as_ref()) {
+                (Some(r2_rx), Some(path)) => Some(
+                    write_parse_output_to_file(
+                        path,
+                        ReceiverStream::new(r2_rx),
+                        Some(config.base_buffer_size * 4),
+                    )
+                        .await
+                        .map_err(PipelineError::Other)?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(PipelineError::Other(anyhow!(
+                        "pre-dedup R2 stream/path cardinality mismatch"
+                    )));
+                }
+            };
+
+            let materialization = tokio::spawn(async move {
+                deinterleave_task
+                    .await
+                    .map_err(|e| anyhow!("Pre-dedup deinterleave task panicked: {}", e))??;
+
+                r1_write_task
+                    .await
+                    .map_err(|e| anyhow!("Pre-dedup R1 writer task panicked: {}", e))??;
+
+                if let Some(task) = r2_write_task {
+                    task.await
+                        .map_err(|e| anyhow!("Pre-dedup R2 writer task panicked: {}", e))??;
+                }
+
+                info!("Pre-dedup FASTQ materialization complete");
+                Ok::<(), anyhow::Error>(())
+            });
+
+            let mut paths = vec![pre_dedup_r1_path];
+            if let Some(path) = pre_dedup_r2_path {
+                paths.push(path);
+            }
+
+            // Keep the directory alive until every host-filter consumer is done.
+            host_filter_temp_dirs.push(pre_dedup_temp_dir);
+
+            (dedup_input, Some(paths), Some(materialization))
+        } else {
+            (pre_dedup_parsed_stream, None, None)
+        };
 
     let (
         dedup_stream,
@@ -9738,7 +9817,8 @@ pub(crate) async fn run_host_filter(
         non_host_r2,
         subsampled_interleaved,
         duplicate_clusters: dedup_finalize_task,
-        pre_dedup_interleaved,
+        pre_dedup_files,
+        pre_dedup_materialization,
     };
 
     Ok(HostFilterCompletion {
@@ -9911,35 +9991,22 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         non_host_r2,
         subsampled_interleaved: _,
         duplicate_clusters: duplicate_clusters_task,
-        pre_dedup_interleaved,
+        pre_dedup_files,
+        pre_dedup_materialization,
     } = outputs;
 
-    // The normal short-read pipeline requires separate R1/R2 pre-dedup
-    // checkpoint files. Keep that representation change here, at the
-    // short-read caller boundary, rather than inside run_host_filter().
-    let pre_dedup_interleaved = pre_dedup_interleaved.ok_or_else(|| {
+    let pre_dedup_files = pre_dedup_files.ok_or_else(|| {
         PipelineError::InvalidConfig(
-            "short-read host filter requested pre-dedup stream but it was absent"
+            "short-read host filter requested pre-dedup files but they were absent"
                 .to_string(),
         )
     })?;
-
-    let (
-        pre_dedup_r1_rx,
-        pre_dedup_r2_rx_opt,
-        pre_dedup_deinterleave_handle,
-    ) = deinterleave_fastq_stream(
-        pre_dedup_interleaved,
-        paired,
-        config.base_buffer_size * 4,
-    )
-        .await
-        .map_err(PipelineError::Other)?;
-
-    cleanup_tasks.push(pre_dedup_deinterleave_handle);
-
-    let pre_dedup_r1 = ReceiverStream::new(pre_dedup_r1_rx);
-    let pre_dedup_r2 = pre_dedup_r2_rx_opt.map(ReceiverStream::new);
+    let pre_dedup_materialization = pre_dedup_materialization.ok_or_else(|| {
+        PipelineError::InvalidConfig(
+            "short-read host filter requested pre-dedup materialization but its completion task was absent"
+                .to_string(),
+        )
+    })?;
 
     // ---------------------------------------------------------------------
     // Short-read hard checkpoint.
@@ -9992,47 +10059,14 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         }
     };
 
-    let pre_dedup_r1_write_task_fut = write_parse_output_to_file(
-        &pre_dedup_r1_path,
-        pre_dedup_r1,
-        Some(config.base_buffer_size * 4),
-    );
-
-    let pre_dedup_r2_write_task_fut = async {
-        match (pre_dedup_r2, pre_dedup_r2_path_opt.as_ref()) {
-            (Some(stream), Some(path)) => {
-                write_parse_output_to_file(
-                    path,
-                    stream,
-                    Some(config.base_buffer_size * 4),
-                )
-                    .await
-                    .map(Some)
-            }
-            (None, None) => Ok(None),
-            _ => Err(anyhow!(
-            "pre-dedup R2 stream/path cardinality mismatch"
-        )),
-        }
-    };
-
-    // Installing all four writers concurrently is important: pre-dedup R1/R2
-    // and the dedup branch share a bounded fanout upstream.
-    let (
-        r1_write_task,
-        r2_write_task_opt,
-        pre_dedup_r1_write_task,
-        pre_dedup_r2_write_task_opt,
-    ) = tokio::try_join!(
+    // The pre-dedup files are already being materialized by run_host_filter().
+    // Drain the normal non-host streams concurrently, then wait for the
+    // pre-dedup file barrier before copying the sidecars into out_dir.
+    let (r1_write_task, r2_write_task_opt) = tokio::try_join!(
         r1_write_task_fut,
         r2_write_task_fut,
-        pre_dedup_r1_write_task_fut,
-        pre_dedup_r2_write_task_fut,
     )?;
 
-    // This is intentionally the hard file boundary for short-read mNGS.
-    // Once these complete, the distributed non-host alignment stages can open
-    // stable files without constraining run_host_filter() or AMR to files.
     tokio::try_join!(
         async {
             r1_write_task
@@ -10048,20 +10082,42 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
             Ok::<(), anyhow::Error>(())
         },
         async {
-            pre_dedup_r1_write_task
+            pre_dedup_materialization
                 .await
-                .map_err(|e| anyhow!("Pre-dedup R1 sidecar writer task panicked: {}", e))??;
-            Ok::<(), anyhow::Error>(())
-        },
-        async {
-            if let Some(task) = pre_dedup_r2_write_task_opt {
-                task.await
-                    .map_err(|e| anyhow!("Pre-dedup R2 sidecar writer task panicked: {}", e))??;
-            }
+                .map_err(|e| anyhow!("Pre-dedup materialization task panicked: {}", e))??;
             Ok::<(), anyhow::Error>(())
         },
     )
         .map_err(PipelineError::Other)?;
+
+    if pre_dedup_files.len() != if paired { 2 } else { 1 } {
+        return Err(PipelineError::Other(anyhow!(
+            "pre-dedup file cardinality mismatch: paired={}, files={}",
+            paired,
+            pre_dedup_files.len()
+        )));
+    }
+
+    copy_file_streaming(
+        &pre_dedup_files[0],
+        &pre_dedup_r1_path,
+        Some(config.clone()),
+        None,
+    )
+        .await
+        .map_err(PipelineError::Other)?
+        .await
+        .map_err(|e| PipelineError::Other(anyhow!("Pre-dedup R1 copy task panicked: {}", e)))?
+        .map_err(PipelineError::Other)?;
+
+    if let (Some(src), Some(dst)) = (pre_dedup_files.get(1), pre_dedup_r2_path_opt.as_ref()) {
+        copy_file_streaming(src, dst, Some(config.clone()), None)
+            .await
+            .map_err(PipelineError::Other)?
+            .await
+            .map_err(|e| PipelineError::Other(anyhow!("Pre-dedup R2 copy task panicked: {}", e)))?
+            .map_err(PipelineError::Other)?;
+    }
 
     // Dedup finalization can only complete after its stream reaches EOF.  At
     // this point all live output branches have been drained, so it is safe to

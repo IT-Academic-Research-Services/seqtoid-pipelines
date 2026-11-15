@@ -509,7 +509,7 @@ async fn load_card_models(
     })
 }
 
-/// Native streaming equivalent of the WDL RunRedup task.
+/// Native equivalent of the WDL RunRedup task with a materialized pre-dedup replay boundary.
 ///
 /// WDL semantics:
 ///   1. `subsampled_reads` form the prefix of each `redups_N.fa`.
@@ -525,7 +525,8 @@ async fn load_card_models(
 /// reproduced here.
 async fn run_redup(
     config: Arc<RunConfig>,
-    mut host_filtered_stream: ReceiverStream<ParseOutput>,
+    pre_dedup_files: Vec<PathBuf>,
+    pre_dedup_materialization: Option<JoinHandle<Result<(), anyhow::Error>>>,
     mut subsampled_stream: ReceiverStream<ParseOutput>,
     paired: bool,
     duplicate_clusters_task: JoinHandle<
@@ -533,6 +534,14 @@ async fn run_redup(
     >,
 ) -> Result<RunRedupHandle, PipelineError> {
     let part_count = if paired { 2 } else { 1 };
+
+    if pre_dedup_files.len() != part_count {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRedup expected {} pre-dedup FASTQ file(s), got {}",
+            part_count,
+            pre_dedup_files.len()
+        )));
+    }
 
     let mut output_streams = Vec::with_capacity(part_count);
     let mut output_txs = Vec::with_capacity(part_count);
@@ -544,46 +553,6 @@ async fn run_redup(
         output_txs.push(tx);
         output_streams.push(ReceiverStream::new(rx));
     }
-
-    // Drain the pre-dedup stream immediately. It is upstream of dedup and
-    // therefore cannot be left unread while dedup/subsampling finalize.
-    //
-    // Keep records separated by end so duplicate members can later be
-    // appended to the corresponding redups_N.fa output.
-    let host_buffer_task = tokio::spawn(async move {
-        let mut records_by_part =
-            (0..part_count)
-                .map(|_| Vec::<SequenceRecord>::new())
-                .collect::<Vec<_>>();
-
-        let mut record_index = 0usize;
-
-        while let Some(item) = host_filtered_stream.next().await {
-            let ParseOutput::Fastq(record) = item else {
-                return Err(anyhow!(
-                    "RunRedup expected FASTQ on interleaved host-filtered stream"
-                ));
-            };
-
-            let part_index = if paired {
-                record_index % 2
-            } else {
-                0
-            };
-
-            records_by_part[part_index].push(record);
-            record_index += 1;
-        }
-
-        if paired && record_index % 2 != 0 {
-            return Err(anyhow!(
-                "RunRedup received incomplete paired pre-dedup stream: {} records",
-                record_index
-            ));
-        }
-
-        Ok::<Vec<Vec<SequenceRecord>>, anyhow::Error>(records_by_part)
-    });
 
     // Forward the complete subsampled input immediately as FASTA while
     // recording which deduplicated representatives survived subsampling.
@@ -632,14 +601,19 @@ async fn run_redup(
             ));
         }
 
-        Ok::<_, anyhow::Error>((
-            passed_representatives,
-            output_txs,
-        ))
+        Ok::<_, anyhow::Error>((passed_representatives, output_txs))
     });
 
+    let completion_config = config.clone();
     let completion_task = tokio::spawn(async move {
-        // Both live inputs already have consumers installed above.
+        // The pre-dedup materializer is installed inside run_host_filter before
+        // this task is created, so it drains the retained fanout concurrently
+        // with dedup/subsampling. Wait for the hard file boundary before replay.
+        if let Some(task) = pre_dedup_materialization {
+            task.await
+                .map_err(|e| anyhow!("RunRedup pre-dedup materialization task panicked: {}", e))??;
+        }
+
         let duplicate_clusters = duplicate_clusters_task
             .await
             .map_err(|e| {
@@ -651,18 +625,9 @@ async fn run_redup(
 
         let (passed_representatives, output_txs) = prefix_task
             .await
-            .map_err(|e| {
-                anyhow!("RunRedup prefix task panicked: {}", e)
-            })??;
+            .map_err(|e| anyhow!("RunRedup prefix task panicked: {}", e))??;
 
-        let host_records_by_part = host_buffer_task
-            .await
-            .map_err(|e| {
-                anyhow!("RunRedup host-buffer task panicked: {}", e)
-            })??;
-
-        let mut duplicate_member_ids =
-            HashSet::<String>::new();
+        let mut duplicate_member_ids = HashSet::<String>::new();
 
         for entry in duplicate_clusters.iter() {
             let rep_id = entry.key();
@@ -681,13 +646,40 @@ async fn run_redup(
             }
         }
 
-        for (part_index, host_records) in
-            host_records_by_part.into_iter().enumerate()
-        {
-            let tx = &output_txs[part_index];
+        // The cluster map is no longer needed once the selected member IDs are
+        // known. Drop it before the potentially large FASTQ replay.
+        drop(duplicate_clusters);
+        drop(passed_representatives);
 
-            // Preserve original pre-dedup order within each end.
-            for record in host_records {
+        info!(
+            "[AMR] RunRedup replaying {} materialized pre-dedup FASTQ file(s) for {} duplicate members",
+            pre_dedup_files.len(),
+            duplicate_member_ids.len()
+        );
+
+        for (part_index, path) in pre_dedup_files.into_iter().enumerate() {
+            let (mut host_stream, reader_task) = fastq_file_to_record_stream(
+                path.clone(),
+                completion_config.clone(),
+                &format!("amr_redup_pre_dedup_part_{}", part_index + 1),
+            )
+                .await
+                .map_err(|e| anyhow!("RunRedup failed opening {}: {}", path.display(), e))?;
+
+            let tx = &output_txs[part_index];
+            let mut scanned = 0u64;
+            let mut appended = 0u64;
+
+            while let Some(item) = host_stream.next().await {
+                let ParseOutput::Fastq(record) = item else {
+                    return Err(anyhow!(
+                        "RunRedup expected FASTQ while replaying {}",
+                        path.display()
+                    ));
+                };
+
+                scanned += 1;
+
                 if !duplicate_member_ids.contains(record.id()) {
                     continue;
                 }
@@ -706,7 +698,24 @@ async fn run_redup(
                             part_index + 1
                         )
                     })?;
+
+                appended += 1;
             }
+
+            reader_task
+                .await
+                .map_err(|e| anyhow!(
+                    "RunRedup FASTQ reader task panicked for {}: {}",
+                    path.display(), e
+                ))??;
+
+            info!(
+                "[AMR] RunRedup replay part {} complete: scanned={}, appended={}, path={}",
+                part_index + 1,
+                scanned,
+                appended,
+                path.display()
+            );
         }
 
         Ok::<(), anyhow::Error>(())
@@ -2834,7 +2843,7 @@ pub async fn run(
             //
             // Raw AMR consumes:
             //
-            //   * pre_dedup_interleaved
+            //   * pre_dedup_files + pre_dedup_materialization
             //   * subsampled_interleaved
             //   * duplicate_clusters
             //
@@ -2850,7 +2859,8 @@ pub async fn run(
                 non_host_r2,
                 subsampled_interleaved,
                 duplicate_clusters,
-                pre_dedup_interleaved,
+                pre_dedup_files,
+                pre_dedup_materialization,
             } = outputs;
 
             // ------------------------------------------------------------
@@ -2882,10 +2892,17 @@ pub async fn run(
             // Validate and take the AMR-specific retained streams.
             // ------------------------------------------------------------
 
-            let pre_dedup_stream =
-                pre_dedup_interleaved.ok_or_else(|| {
+            let pre_dedup_files =
+                pre_dedup_files.ok_or_else(|| {
                     PipelineError::Other(anyhow!(
-                        "AMR raw RunRedup missing retained interleaved pre-dedup stream"
+                        "AMR raw RunRedup missing materialized pre-dedup FASTQ paths"
+                    ))
+                })?;
+
+            let pre_dedup_materialization =
+                pre_dedup_materialization.ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "AMR raw RunRedup missing pre-dedup materialization completion task"
                     ))
                 })?;
 
@@ -2898,32 +2915,27 @@ pub async fn run(
 
             info!(
                 "[AMR] host-filter streaming outputs ready: \
-                 pre_dedup_interleaved=true, \
+                 pre_dedup_files={}, \
                  subsampled_interleaved=true, \
                  non_host_r1=draining, non_host_r2={}, \
                  duplicate_clusters=pending",
+                pre_dedup_files.len(),
                 has_non_host_r2,
             );
 
             // ------------------------------------------------------------
             // Install RunRedup consumers immediately.
             //
-            // Both retained streams are structured interleaved FASTQ:
-            //
-            //   pre_dedup_stream
-            //       exact host-filtered records immediately before dedup
-            //
-            //   subsampled_stream
-            //       deduplicated + subsampled representatives
-            //
-            // duplicate_clusters completes only after dedup reaches EOF.
-            // run_redup() installs consumers for both live streams before
-            // awaiting that task.
+            // The subsampled representatives remain a live interleaved FASTQ
+            // stream. The exact pre-dedup reads are now replayable FASTQ files.
+            // run_redup() starts consuming the live subsampled stream immediately
+            // and awaits the pre-dedup materialization barrier before file replay.
             // ------------------------------------------------------------
 
             let redup = run_redup(
                 config.clone(),
-                pre_dedup_stream,
+                pre_dedup_files,
+                Some(pre_dedup_materialization),
                 subsampled_stream,
                 paired,
                 duplicate_clusters,
@@ -4871,45 +4883,15 @@ pub async fn run(
                 subsampled_r1
             };
 
-            let (pre_r1, task) =
-                fastq_file_to_record_stream(
-                    pre_dedup_r1,
-                    config.clone(),
-                    "amr_filtered_pre_dedup_r1",
-                )
-                    .await?;
-
-            input_tasks.push(task);
-
-            let pre_dedup_stream = if let Some(path) = pre_dedup_r2 {
-                let (pre_r2, task) =
-                    fastq_file_to_record_stream(
-                        path,
-                        config.clone(),
-                        "amr_filtered_pre_dedup_r2",
-                    )
-                        .await?;
-
-                input_tasks.push(task);
-
-                let (interleaved_rx, interleave_task) =
-                    interleave_fastq_streams(
-                        pre_r1.into_inner(),
-                        pre_r2.into_inner(),
-                        config.base_buffer_size * 4,
-                    )
-                        .await?;
-
-                input_tasks.push(interleave_task);
-
-                ReceiverStream::new(interleaved_rx)
-            } else {
-                pre_r1
-            };
+            let mut pre_dedup_files = vec![pre_dedup_r1];
+            if let Some(path) = pre_dedup_r2 {
+                pre_dedup_files.push(path);
+            }
 
             let redup = run_redup(
                 config.clone(),
-                pre_dedup_stream,
+                pre_dedup_files,
+                None,
                 subsampled_stream,
                 paired,
                 load_duplicate_clusters_csv(clusters_path),
