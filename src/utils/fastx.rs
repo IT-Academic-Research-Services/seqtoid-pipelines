@@ -1509,14 +1509,27 @@ pub async fn stream_record_counter(
             ParseOutput::Bytes(chunk) => {
                 pending.extend_from_slice(&chunk);
 
-                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
-                    let mut line: Vec<u8> = pending.drain(..=pos).collect();
+                // Walk complete lines by offset. Do NOT drain from the front for
+                // every line: Vec::drain(..=pos) shifts the entire remaining buffer
+                // on every iteration and becomes quadratic for large FASTX chunks.
+                let mut line_start = 0usize;
 
-                    // Remove '\n' and optional '\r'.
-                    line.pop();
-                    if line.last() == Some(&b'\r') {
-                        line.pop();
+                while let Some(relative_newline) =
+                    pending[line_start..].iter().position(|&b| b == b'\n')
+                {
+                    let newline = line_start + relative_newline;
+
+                    // Exclude '\n' and optional preceding '\r'.
+                    let mut line_end = newline;
+                    if line_end > line_start && pending[line_end - 1] == b'\r' {
+                        line_end -= 1;
                     }
+
+                    let line = &pending[line_start..line_end];
+
+                    // Advance now. `line` remains valid until pending is compacted
+                    // after the loop.
+                    line_start = newline + 1;
 
                     if line.is_empty() {
                         continue;
@@ -1529,7 +1542,7 @@ pub async fn stream_record_counter(
                                 byte_format = Some(b'@');
                                 fastq_line_count = 1;
 
-                                current_record.extend_from_slice(&line);
+                                current_record.extend_from_slice(line);
                                 current_record.push(b'\n');
 
                                 if early_exit {
@@ -1544,14 +1557,14 @@ pub async fn stream_record_counter(
                             b'>' => {
                                 byte_format = Some(b'>');
 
-                                current_record.extend_from_slice(&line);
+                                current_record.extend_from_slice(line);
                                 current_record.push(b'\n');
                             }
 
                             _ => {
                                 return Err(anyhow!(
-                                    "Invalid FASTX byte stream: expected '@' or '>' header"
-                                ));
+                        "Invalid FASTX byte stream: expected '@' or '>' header"
+                    ));
                             }
                         }
 
@@ -1560,7 +1573,7 @@ pub async fn stream_record_counter(
 
                     match byte_format {
                         Some(b'@') => {
-                            current_record.extend_from_slice(&line);
+                            current_record.extend_from_slice(line);
                             current_record.push(b'\n');
 
                             fastq_line_count += 1;
@@ -1593,7 +1606,6 @@ pub async fn stream_record_counter(
                         Some(b'>') => {
                             // A new '>' starts the next FASTA record.
                             if line[0] == b'>' {
-                                // Finalize the previous record.
                                 if !current_record.is_empty() {
                                     let read_length =
                                         parse_record_length(&current_record)?;
@@ -1616,17 +1628,26 @@ pub async fn stream_record_counter(
                                     }
                                 }
 
-                                current_record.extend_from_slice(&line);
+                                current_record.extend_from_slice(line);
                                 current_record.push(b'\n');
                             } else {
-                                // Sequence line belonging to current FASTA record.
-                                current_record.extend_from_slice(&line);
+                                current_record.extend_from_slice(line);
                                 current_record.push(b'\n');
                             }
                         }
 
                         _ => unreachable!(),
                     }
+                }
+
+                // Everything before line_start consisted of complete lines and has
+                // already been consumed. Compact ONCE per incoming chunk rather than
+                // once per FASTX line.
+                if line_start != 0 {
+                    let remaining = pending.len() - line_start;
+
+                    pending.copy_within(line_start.., 0);
+                    pending.truncate(remaining);
                 }
             }
         }
