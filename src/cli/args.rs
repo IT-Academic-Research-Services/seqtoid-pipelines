@@ -298,6 +298,12 @@ pub struct Arguments {
     pub amr_duplicate_clusters: Option<String>,
 
     #[arg(
+        long = "amr-kma-db",
+        help = "AMR: KMA CARD reference database prefix"
+    )]
+    pub amr_kma_db: Option<String>,
+
+    #[arg(
         long = "amr-card-json",
         help = "AMR: path to the CARD card.json model metadata database"
     )]

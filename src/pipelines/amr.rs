@@ -2191,14 +2191,26 @@ pub async fn run(
     // Shared WDL RunRgiBwtKma: BOTH input modes execute everything below.
     // These scratch directories belong to shared processing, not host filtering.
     let mut final_temp_dirs: Vec<TempDir> = Vec::new();
+
+
+    let kma_db = config
+        .args
+        .amr_kma_db
+        .as_deref()
+        .ok_or_else(|| {
+            PipelineError::InvalidConfig(
+                "--amr-kma-db is required for AMR".to_string()
+            )
+        })?;
+
     let kma = run_kma_amr(
         config.clone(),
         kma_streams,
-        PathBuf::from(
-            "/data/refs/card/rgi_db/localDB/bwt/card_reference/kma"
-        ),
+        PathBuf::from(kma_db),
     )
         .await?;
+
+
     let RunKmaHandle {
         sam_stream: kma_sam_stream,
         samtools_stream: kma_samtools_stream,
