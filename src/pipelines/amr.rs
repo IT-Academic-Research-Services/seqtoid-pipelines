@@ -160,6 +160,27 @@ struct RgiAlignment {
     mrnm: String,
 }
 
+#[derive(Debug, Clone)]
+struct CardModel {
+    model_id: String,
+    aro_accession: String,
+    model_name: String,
+    model_type: String,
+
+    // BWT.py:
+    // category_aro_class_name -> unique category_aro_name values
+    categories: HashMap<String, Vec<String>>,
+
+    // Unique first-two-word NCBI taxonomy names, preserving encounter order.
+    taxon: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CardModels {
+    by_model_id: HashMap<String, CardModel>,
+    by_aro_accession: HashMap<String, CardModel>,
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -1358,6 +1379,188 @@ async fn read_kma_sidecars(config: Arc<RunConfig>, prefix: &std::path::Path) -> 
         mutations.values().map(Vec::len).sum::<usize>()
     );
     Ok(KmaSidecars { read_depth, consensus_dna, mutations })
+}
+
+async fn load_card_models(
+    path: &std::path::Path,
+) -> anyhow::Result<CardModels> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| anyhow!(
+            "Failed to read CARD metadata {}: {}",
+            path.display(),
+            e
+        ))?;
+
+    let root: serde_json::Value =
+        serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow!(
+                "Failed to parse CARD metadata {}: {}",
+                path.display(),
+                e
+            ))?;
+
+    let object = root.as_object().ok_or_else(|| {
+        anyhow!(
+            "CARD metadata root is not a JSON object: {}",
+            path.display()
+        )
+    })?;
+
+    let mut by_model_id = HashMap::new();
+    let mut by_aro_accession = HashMap::new();
+
+    for (key, value) in object {
+        // Match BWT.py: if i.isdigit()
+        if key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let model = value.as_object().ok_or_else(|| {
+            anyhow!("CARD model {} is not a JSON object", key)
+        })?;
+
+        let required_string =
+            |field: &str| -> anyhow::Result<String> {
+                model
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "CARD model {} missing string field {:?}",
+                            key,
+                            field
+                        )
+                    })
+            };
+
+        let model_id = required_string("model_id")?;
+        let aro_accession = required_string("ARO_accession")?;
+        let model_name = required_string("model_name")?;
+        let model_type = required_string("model_type")?;
+
+        let mut categories =
+            HashMap::<String, Vec<String>>::new();
+
+        if let Some(category_object) =
+            model.get("ARO_category")
+                .and_then(serde_json::Value::as_object)
+        {
+            for category in category_object.values() {
+                let Some(category) = category.as_object() else {
+                    continue;
+                };
+
+                let Some(class_name) = category
+                    .get("category_aro_class_name")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+
+                let Some(category_name) = category
+                    .get("category_aro_name")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+
+                let values =
+                    categories.entry(class_name.to_string())
+                        .or_default();
+
+                // Match BWT.py uniqueness behavior.
+                if !values.iter().any(|v| v == category_name) {
+                    values.push(category_name.to_string());
+                }
+            }
+        }
+
+        let mut taxon = Vec::<String>::new();
+
+        if let Some(sequences) = model
+            .get("model_sequences")
+            .and_then(|v| v.get("sequence"))
+            .and_then(serde_json::Value::as_object)
+        {
+            for sequence in sequences.values() {
+                let Some(name) = sequence
+                    .get("NCBI_taxonomy")
+                    .and_then(|v| v.get("NCBI_taxonomy_name"))
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+
+                // Exact BWT.py:
+                // " ".join(name.split()[:2])
+                let taxa = name
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                if !taxa.is_empty()
+                    && !taxon.iter().any(|existing| existing == &taxa)
+                {
+                    taxon.push(taxa);
+                }
+            }
+        }
+
+        let card_model = CardModel {
+            model_id: model_id.clone(),
+            aro_accession: aro_accession.clone(),
+            model_name,
+            model_type,
+            categories,
+            taxon,
+        };
+
+        by_model_id.insert(model_id, card_model.clone());
+        by_aro_accession.insert(aro_accession, card_model);
+    }
+
+    info!(
+        "[AMR] CARD metadata loaded: models={} aro_accessions={}",
+        by_model_id.len(),
+        by_aro_accession.len()
+    );
+
+    Ok(CardModels {
+        by_model_id,
+        by_aro_accession,
+    })
+}
+
+fn value_after_colon(field: &str) -> Option<&str> {
+    field.split_once(':').map(|(_, value)| value)
+}
+
+fn resolve_card_model<'a>(
+    alignment_hit: &str,
+    models: &'a CardModels,
+) -> Option<&'a CardModel> {
+    let fields: Vec<&str> = alignment_hit.split('|').collect();
+
+    if alignment_hit.starts_with("Prevalence_Sequence_ID")
+        || alignment_hit.starts_with("ARO:")
+    {
+        let model_id =
+            fields.get(1)
+                .and_then(|field| value_after_colon(field));
+
+        return model_id
+            .and_then(|id| models.by_model_id.get(id));
+    }
+
+    let accession =
+        fields.get(4)
+            .and_then(|field| value_after_colon(field));
+
+    accession
+        .and_then(|aro| models.by_aro_accession.get(aro))
 }
 
 pub async fn run(
@@ -3375,6 +3578,49 @@ pub async fn run(
     );
     // Missing per-reference evidence is not fatal here: BWT.py handles it
     // during summary construction. No depth suppression is applied yet.
+
+    let card_json = config
+        .args
+        .amr_card_json
+        .as_deref()
+        .ok_or_else(|| {
+            PipelineError::InvalidConfig(
+                "--amr-card-json is required for AMR".to_string()
+            )
+        })?;
+
+    let card_json =
+        resolve_existing_input_path(card_json, &cwd, true)?;
+
+    let card_models =
+        load_card_models(&card_json)
+            .await
+            .map_err(PipelineError::Other)?;
+
+    let mut resolved = 0usize;
+    let mut unresolved = Vec::new();
+
+    for reference in rgi_read_counts.keys() {
+        if resolve_card_model(reference, &card_models).is_some() {
+            resolved += 1;
+        } else {
+            unresolved.push(reference.clone());
+        }
+    }
+
+    info!(
+    "[AMR] CARD model resolution: mapped_references={} resolved={} unresolved={}",
+    rgi_read_counts.len(),
+    resolved,
+    unresolved.len()
+);
+
+    for reference in &unresolved {
+        warn!(
+        "[AMR] CARD model unresolved: reference={}",
+        reference
+    );
+    }
 
     preparation_task.await
         .map_err(|e| PipelineError::Other(anyhow!(
