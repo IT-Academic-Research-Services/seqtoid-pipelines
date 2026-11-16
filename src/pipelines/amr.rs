@@ -138,6 +138,16 @@ struct RgiReadCounts {
     all: u64,
 }
 
+/// Per-reference breadth of coverage from the BEDTools genomecov histogram.
+/// This is not KMA's read depth, which is consumed separately from its .res file.
+#[derive(Debug, Clone, Default)]
+struct RgiCoverage {
+    reference_length: u64,
+    covered_bases: u64,
+    uncovered_bases: u64,
+    percent_coverage: f64,
+}
+
 #[derive(Debug, Clone)]
 struct RgiAlignment {
     qname: String,
@@ -2698,9 +2708,115 @@ pub async fn run(
                     .await
                     .map_err(PipelineError::Other)?;
 
+            // Sum histogram base counts, not the rounded fraction column.
+            // Keep only idxstats references with mapped reads, as RGI reporting
+            // does. BEDTools' aggregate "genome" rows are not reference rows.
+            let mut rgi_coverage = HashMap::<String, RgiCoverage>::new();
+            while let Some(item) = genomecov_rx.recv().await {
+                let ParseOutput::Bytes(bytes) = item else {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma genomecov expected line-oriented Bytes output"
+                    )));
+                };
+                let line = std::str::from_utf8(&bytes)
+                    .map_err(|e| PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma genomecov emitted non-UTF8 output: {}", e
+                    )))?
+                    .trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    continue;
+                }
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() != 5 {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma genomecov expected 5 fields: {:?}", line
+                    )));
+                }
+                if fields[0] == "genome" {
+                    continue;
+                }
+                let Some(counts) = rgi_read_counts.get(fields[0]) else {
+                    continue;
+                };
+                let parse_integer = |value: &str| -> Result<u64, PipelineError> {
+                    value.parse::<u64>().map_err(|e| PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma invalid genomecov integer {:?} in {:?}: {}",
+                        value, line, e
+                    )))
+                };
+                let depth = parse_integer(fields[1])?;
+                let bases = parse_integer(fields[2])?;
+                let length = parse_integer(fields[3])?;
+                if length == 0 || length != counts.reference_length {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma genomecov length mismatch for {}: histogram={}, idxstats={}",
+                        fields[0], length, counts.reference_length
+                    )));
+                }
+                let coverage = rgi_coverage.entry(fields[0].to_string())
+                    .or_insert_with(|| RgiCoverage {
+                        reference_length: length,
+                        ..Default::default()
+                    });
+                let bucket = if depth == 0 {
+                    &mut coverage.uncovered_bases
+                } else {
+                    &mut coverage.covered_bases
+                };
+                *bucket = bucket.checked_add(bases).ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma genomecov base-count overflow for {}", fields[0]
+                    ))
+                })?;
+            }
 
+            // Drain stdout before waiting, so BEDTools cannot block on its pipe.
+            let genomecov_status = genomecov_child.wait().await
+                .map_err(|e| PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma genomecov wait failed: {}", e
+                )))?;
+            genomecov_stderr_task.await
+                .map_err(|e| PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma genomecov stderr task panicked: {}", e
+                )))?
+                .map_err(PipelineError::Other)?;
+            if !genomecov_status.success() {
+                return Err(PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma genomecov failed with exit status {}", genomecov_status
+                )));
+            }
 
-
+            // Require a complete histogram for every reportable reference.
+            // A fully covered reference legitimately has no depth-zero row.
+            let mut coverage_references: Vec<&String> = rgi_read_counts.keys().collect();
+            coverage_references.sort();
+            for reference in coverage_references {
+                let coverage = rgi_coverage.get_mut(reference).ok_or_else(|| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma genomecov missing mapped reference {}", reference
+                    ))
+                })?;
+                if coverage.covered_bases.checked_add(coverage.uncovered_bases)
+                    != Some(coverage.reference_length)
+                {
+                    return Err(PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma incomplete genomecov histogram for {}: covered={}, uncovered={}, length={}",
+                        reference, coverage.covered_bases, coverage.uncovered_bases,
+                        coverage.reference_length
+                    )));
+                }
+                coverage.percent_coverage =
+                    100.0 * coverage.covered_bases as f64 / coverage.reference_length as f64;
+                info!(
+                    "[AMR] RGI coverage: reference={} length={} covered={} uncovered={} coverage={:.2}%",
+                    reference, coverage.reference_length, coverage.covered_bases,
+                    coverage.uncovered_bases, coverage.percent_coverage
+                );
+            }
+            info!(
+                "[AMR] RunRgiBwtKma genomecov complete: {} reportable references",
+                rgi_coverage.len()
+            );
 
             let (
                 validation_stats,
