@@ -34,6 +34,7 @@ use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file, write_byte_stream_to_file};
 use crate::utils::sambam::parse_sam_record;
+use crate::utils::sequence::translate_rgi_kma_consensus;
 use crate::utils::streams::{
     bytes_to_lines,
     fanout_to_channels,
@@ -229,6 +230,7 @@ fn build_rgi_allele_summaries(
 
     let mut summaries = Vec::new();
     let mut skipped_no_consensus = 0usize;
+    let mut skipped_translation_error = 0usize;
 
     for alignment_hit in references {
         let Some(model) = resolve_card_model(alignment_hit, models) else {
@@ -238,12 +240,41 @@ fn build_rgi_allele_summaries(
             continue;
         };
 
-        let Some(consensus_sequence_dna) = sidecars.consensus_dna.get(alignment_hit) else {
-            // BWT.py accesses consensus_sequence[alignment_hit] inside a try block
-            // and returns {} when KMA had too few reads to create a consensus.
+        let Some(consensus_sequence_dna) =
+            sidecars.consensus_dna.get(alignment_hit)
+        else {
+            // Match BWT.py:
+            // consensus_sequence[alignment_hit] raises inside the outer KMA try,
+            // which warns and returns {} for this allele.
             skipped_no_consensus += 1;
+
+            warn!(
+        "[AMR] model with id: {}, has few mapped reads to make consensus \
+         sequence skipping: missing consensus for {}",
+        model.model_id,
+        alignment_hit
+    );
+
             continue;
         };
+
+        let consensus_sequence_protein =
+            match translate_rgi_kma_consensus(consensus_sequence_dna) {
+                Ok(protein) => protein,
+
+                Err(e) => {
+                    // Match BWT.py's outer KMA exception handler:
+                    // warn + return {} for this allele, NOT pipeline failure.
+                    warn!(
+                "[AMR] model with id: {}, has few mapped reads to make consensus \
+                 sequence skipping: {}",
+                model.model_id,
+                e
+            );
+                    skipped_translation_error += 1;
+                    continue;
+                }
+            };
 
         let counts = reads.get(alignment_hit).expect("reference came from reads keys");
         let cov = coverage.get(alignment_hit).ok_or_else(|| anyhow!(
@@ -321,14 +352,19 @@ fn build_rgi_allele_summaries(
             depth,
             snps,
             consensus_sequence_dna: consensus_sequence_dna.clone(),
-            consensus_sequence_protein: String::new(),
+            consensus_sequence_protein,
         });
     }
 
     info!(
-        "[AMR] RGI allele summaries built: reportable_references={} summaries={} skipped_no_consensus={}",
-        reads.len(), summaries.len(), skipped_no_consensus
-    );
+    "[AMR] RGI allele summaries built: \
+     reportable_references={} summaries={} \
+     skipped_no_consensus={} skipped_translation_error={}",
+    reads.len(),
+    summaries.len(),
+    skipped_no_consensus,
+    skipped_translation_error
+);
 
     Ok(summaries)
 }
