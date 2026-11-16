@@ -1223,12 +1223,13 @@ pub async fn run(
 ) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir()
         .map_err(|e| PipelineError::Other(e.into()))?;
-
     let out_dir = config.out_dir.clone();
-
     info!("Starting AMR pipeline.");
 
-    match AmrInputMode::from_config(&config)? {
+    // WDL branch boundary: only input preparation differs by input mode.
+    // Return live reads BEFORE awaiting preparation: bounded producers need
+    // the shared KMA consumer below to be installed before they can finish.
+    let (kma_streams, preparation_task) = match AmrInputMode::from_config(&config)? {
         AmrInputMode::Raw => {
             info!(
                 "[AMR] raw input selected; running shared host filtering"
@@ -1428,7 +1429,7 @@ pub async fn run(
 
 
             let mut spades_streams = Vec::new();
-            let mut kma_streams = Vec::new();
+            let mut downstream_streams = Vec::new();
             let mut redup_fanout_tasks = Vec::new();
 
             for (idx, redup_stream) in
@@ -1447,7 +1448,7 @@ pub async fn run(
                     ReceiverStream::new(branches.remove(0))
                 );
 
-                kma_streams.push(
+                downstream_streams.push(
                     ReceiverStream::new(branches.remove(0))
                 );
 
@@ -1462,463 +1463,428 @@ pub async fn run(
             )
                 .await?;
 
-            let kma = run_kma_amr(
-                config.clone(),
-                kma_streams,
-                PathBuf::from(
-                    "/data/refs/card/rgi_db/localDB/bwt/card_reference/kma"
-                ),
-            )
-                .await?;
-            let RunKmaHandle {
-                sam_stream: kma_sam_stream,
-                samtools_stream: kma_samtools_stream,
-                sam_fanout_done,
-                sam_lines_task,
-                completion_task: kma_completion_task,
-                output_temp_dir: kma_output_temp_dir,
-                output_prefix: kma_output_prefix,
-            } = kma;
-            // Keep KMA sidecars alive through downstream AMR post-processing.
-            final_temp_dirs.push(kma_output_temp_dir);
-
             let redup_completion_task = redup.completion_task;
+            let preparation_out_dir = out_dir.clone();
+            let preparation_task = tokio::spawn(async move {
+                let out_dir = preparation_out_dir;
+                // ------------------------------------------------------------
+                // Drain validation / QC results.
+                // ------------------------------------------------------------
 
-            // ------------------------------------------------------------
-            // Parse KMA SAM stdout directly into the native AMR
-            // representation.
-            //
-            // This consumer is installed immediately after RunKMA returns so
-            // KMA stdout can never block on the bounded line channel.
-            // ------------------------------------------------------------
+                let validation_and_qc_fut = async move {
+                    let stats =
+                        join_with_error_handling(val_count_task).await?;
 
-            let kma_sam_task = tokio::spawn(
-                consume_kma_sam(kma_sam_stream)
-            );
+                    info!(
+                        "[AMR] validation: raw_reads={}, raw_bases={}, \
+                         validated_reads={}, validated_bases={}, \
+                         undersized={}, oversized={}",
+                        stats.raw_reads,
+                        stats.raw_bases,
+                        stats.validated,
+                        stats.validated_bases,
+                        stats.undersized,
+                        stats.oversized,
+                    );
 
-            // ------------------------------------------------------------
-            // Stream raw KMA SAM directly through the same samtools fixmate
-            // transformation used by RGI.
-            //
-            // RGI:
-            //
-            //   samtools fixmate
-            //       --verbosity 0
-            //       -z all
-            //       --threads N
-            //       -m
-            //       input.sam
-            //       -O bam
-            //       output.bam
-            //
-            // Here both file operands are "-" so the transformation remains
-            // fully streaming:
-            //
-            //   KMA stdout -> samtools fixmate stdin -> BAM stdout
-            // ------------------------------------------------------------
-
-            let fixmate_threads =
-                config.thread_allocation(SAMTOOLS_TAG, Some("fixmate"));
-
-            let fixmate_config =
-                SamtoolsConfig::new(SamtoolsSubcommand::Fixmate)
-                    .option("--verbosity", "0")
-                    .option("-z", "all")
-                    .option("--threads", fixmate_threads.to_string())
-                    .flag("-m")
-                    .option("-O", "bam")
-                    .positional("-")
-                    .positional("-");
-
-            let fixmate_args = generate_cli(
-                SAMTOOLS_TAG,
-                &config,
-                Some(&fixmate_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-    "[AMR] RunRgiBwtKma samtools fixmate args: {:?}",
-    fixmate_args
-);
-
-            let (
-                fixmate_child,
-                fixmate_stdin_task,
-                fixmate_stderr_task,
-            ) = stream_to_cmd(
-                config.clone(),
-                kma_samtools_stream,
-                SAMTOOLS_TAG,
-                fixmate_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-                None,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            // ------------------------------------------------------------
-            // Stream fixmate BAM stdout directly into samtools sort.
-            //
-            // RGI:
-            //
-            //   samtools sort
-            //       --threads N
-            //       -T <prefix>.sorted
-            //       -o <sorted.bam>
-            //       <unsorted.bam>
-            //
-            // We preserve the sort operation but keep the pipeline streaming:
-            //
-            //   fixmate stdout -> samtools sort stdin -> sorted BAM stdout
-            //
-            // No intermediate unsorted BAM is materialized.
-            // ------------------------------------------------------------
-
-            let fixmate_stdout = {
-                let mut child_guard = fixmate_child.lock().await;
-
-                child_guard
-                    .stdout
-                    .take()
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools fixmate stdout not available"
-            ))
-                    })?
-            };
-
-            let fixmate_bam_rx = parse_bytes(
-                fixmate_stdout,
-                &config,
-                StreamDataType::JustBytes,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let sort_temp_dir = choose_temp_dir(
-                config.input_size,
-                &config.ram_temp_dir,
-                &config.args.nvme_scratch,
-                4,
-                false,
-            )
-                .await?;
-
-            let sort_temp_prefix =
-                sort_temp_dir.path().join("sr_amr_report.sorted");
-
-            let sort_threads =
-                config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
-
-            let sort_config =
-                SamtoolsConfig::new(SamtoolsSubcommand::Sort)
-                    .option("--threads", sort_threads.to_string())
-                    .option(
-                        "-T",
-                        sort_temp_prefix.to_string_lossy().to_string(),
-                    )
-                    .option("-O", "bam")
-                    .positional("-");
-
-            let sort_args = generate_cli(
-                SAMTOOLS_TAG,
-                &config,
-                Some(&sort_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-    "[AMR] RunRgiBwtKma samtools sort args: {:?}",
-    sort_args
-);
-
-            let (
-                sort_child,
-                sort_stdin_task,
-                sort_stderr_task,
-            ) = stream_to_cmd(
-                config.clone(),
-                fixmate_bam_rx,
-                SAMTOOLS_TAG,
-                sort_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-                None,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-
-
-            // ------------------------------------------------------------
-            // Stream the coordinate-sorted BAM through the same predicate-free
-            // bamtools filter transformation used by RGI, then re-emit it with
-            // samtools before materializing the final length_100 BAM:
-            //
-            //   sort_stdout
-            //       -> parse_bytes
-            //       -> stream_to_cmd(BAMTOOLS_TAG, ["filter"])
-            //       -> parse_bytes
-            //       -> stream_to_cmd(SAMTOOLS_TAG, ["view", "-b", "-"])
-            //       -> parse_bytes
-            //       -> write_byte_stream_to_file(length_100.bam)
-            //
-            // BamTools 2.5.2 accepts BAM on stdin and emits the same decoded
-            // alignments as its file-based filter invocation, but its stdout BAM
-            // omits the BGZF EOF marker. `samtools view -b -` re-emits a properly
-            // finalized BAM while preserving the alignment stream. This lets us
-            // avoid both RGI's sorted.temp.bam materialization and its unused
-            // intermediate BAI; the only BAM file boundary is the durable
-            // sr_amr_report.sorted.length_100.bam required downstream.
-            // ------------------------------------------------------------
-
-            let sort_stdout = {
-                let mut child_guard = sort_child.lock().await;
-
-                child_guard
-                    .stdout
-                    .take()
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools sort stdout not available"
-                        ))
-                    })?
-            };
-
-            let sorted_bam_rx = parse_bytes(
-                sort_stdout,
-                &config,
-                StreamDataType::JustBytes,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let bamtools_config =
-                BamtoolsConfig::new(BamtoolsSubcommand::Filter);
-
-            let bamtools_args = generate_cli(
-                BAMTOOLS_TAG,
-                &config,
-                Some(&bamtools_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma bamtools filter args: {:?}",
-                bamtools_args
-            );
-
-            let (
-                bamtools_child,
-                bamtools_stdin_task,
-                bamtools_stderr_task,
-            ) = stream_to_cmd(
-                config.clone(),
-                sorted_bam_rx,
-                BAMTOOLS_TAG,
-                bamtools_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-                None,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let bamtools_stdout = {
-                let mut child_guard = bamtools_child.lock().await;
-
-                child_guard
-                    .stdout
-                    .take()
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma bamtools filter stdout not available"
-                        ))
-                    })?
-            };
-
-            let bamtools_bam_rx = parse_bytes(
-                bamtools_stdout,
-                &config,
-                StreamDataType::JustBytes,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let finalize_config =
-                SamtoolsConfig::new(SamtoolsSubcommand::View)
-                    .flag("-b")
-                    .positional("-");
-
-            let finalize_args = generate_cli(
-                SAMTOOLS_TAG,
-                &config,
-                Some(&finalize_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma samtools BAM finalizer args: {:?}",
-                finalize_args
-            );
-
-            let (
-                finalize_child,
-                finalize_stdin_task,
-                finalize_stderr_task,
-            ) = stream_to_cmd(
-                config.clone(),
-                bamtools_bam_rx,
-                SAMTOOLS_TAG,
-                finalize_args,
-                StreamDataType::JustBytes,
-                config.args.verbose,
-                None,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let finalize_stdout = {
-                let mut child_guard = finalize_child.lock().await;
-
-                child_guard
-                    .stdout
-                    .take()
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools BAM finalizer stdout not available"
-                        ))
-                    })?
-            };
-
-            let final_bam_rx = parse_bytes(
-                finalize_stdout,
-                &config,
-                StreamDataType::JustBytes,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let sorted_bam_path =
-                out_dir.join("sr_amr_report.sorted.length_100.bam");
-
-            let sorted_bam_write_task = write_byte_stream_to_file(
-                &sorted_bam_path,
-                ReceiverStream::new(final_bam_rx),
-                config.clone(),
-                StreamDataType::JustBytes,
-                "RunRgiBwtKma length_100 BAM",
-                false,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            // Keep samtools sort scratch alive until sort has completed.
-            final_temp_dirs.push(sort_temp_dir);
-
-
-            // ------------------------------------------------------------
-            // Drain validation / QC results.
-            // ------------------------------------------------------------
-
-            let validation_and_qc_fut = async move {
-                let stats =
-                    join_with_error_handling(val_count_task).await?;
-
-                info!(
-                    "[AMR] validation: raw_reads={}, raw_bases={}, \
-                     validated_reads={}, validated_bases={}, \
-                     undersized={}, oversized={}",
-                    stats.raw_reads,
-                    stats.raw_bases,
-                    stats.validated,
-                    stats.validated_bases,
-                    stats.undersized,
-                    stats.oversized,
-                );
-
-                let qc_fastp_read_count =
-                    match qc_count_result_rx.await {
-                        Ok(Ok(count)) => {
-                            info!(
-                                "[AMR] fastp output reads: {}",
+                    let qc_fastp_read_count =
+                        match qc_count_result_rx.await {
+                            Ok(Ok(count)) => {
+                                info!(
+                                    "[AMR] fastp output reads: {}",
+                                    count
+                                );
                                 count
-                            );
-                            count
-                        }
+                            }
 
-                        Ok(Err(e)) => {
-                            error!(
-                                "[AMR] error getting fastp \
-                                 read count: {}",
+                            Ok(Err(e)) => {
+                                error!(
+                                    "[AMR] error getting fastp \
+                                     read count: {}",
+                                    e
+                                );
+                                0
+                            }
+
+                            Err(e) => {
+                                error!(
+                                    "[AMR] fastp count receiver \
+                                     dropped: {}",
+                                    e
+                                );
+                                0
+                            }
+                        };
+
+                    let ercc_filtered_count =
+                        ercc_count_rx
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "ERCC count receiver failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                    Ok::<_, PipelineError>((
+                        stats,
+                        ercc_filtered_count,
+                        qc_fastp_read_count,
+                    ))
+                };
+
+                // ------------------------------------------------------------
+                // Drain BAM writers and host counts.
+                // ------------------------------------------------------------
+
+                let host_counts_fut = async move {
+                    ercc_bt2_bam_write_handle
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(anyhow!(
+                                "ERCC BAM writer task panicked: {}",
                                 e
+                            ))
+                        })?
+                        .map_err(PipelineError::Other)?;
+
+                    host_bt2_bam_write_handle
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(anyhow!(
+                                "Host Bowtie2 BAM writer task \
+                                 panicked: {}",
+                                e
+                            ))
+                        })?
+                        .map_err(PipelineError::Other)?;
+
+                    if let Some(handle) =
+                        optional_human_bam_write_handle
+                    {
+                        handle
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Human BAM writer task \
+                                     panicked: {}",
+                                    e
+                                ))
+                            })?
+                            .map_err(PipelineError::Other)?;
+                    }
+
+                    let host_bt2_count =
+                        host_bt2_count_rx
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Host Bowtie2 count receiver \
+                                     failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                    let host_hisat2_count =
+                        host_hisat2_count_rx
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Host HISAT2 count receiver \
+                                     failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                    info!(
+                        "[AMR] host filtering counts: \
+                         bowtie2={}, hisat2={}",
+                        host_bt2_count,
+                        host_hisat2_count
+                    );
+
+                    Ok::<_, PipelineError>((
+                        host_bt2_count,
+                        host_hisat2_count,
+                    ))
+                };
+
+                // ------------------------------------------------------------
+                // Drain Kallisto.
+                // ------------------------------------------------------------
+
+                let out_dir_kallisto = out_dir.clone();
+
+                let kallisto_fut = async move {
+                    let kallisto_exit =
+                        join_with_error_handling(
+                            kallisto_exit_task
+                        )
+                            .await;
+
+                    match kallisto_exit {
+                        Ok(_) => {
+                            info!(
+                                "[AMR] Kallisto completed successfully"
                             );
-                            0
                         }
 
                         Err(e) => {
-                            error!(
-                                "[AMR] fastp count receiver \
-                                 dropped: {}",
+                            warn!(
+                                "[AMR] Kallisto failed \
+                                 (non-fatal, possibly no ERCC \
+                                 spike-in): {}",
                                 e
                             );
-                            0
                         }
-                    };
+                    }
 
-                let ercc_filtered_count =
-                    ercc_count_rx
-                        .await
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "ERCC count receiver failed: {}",
-                                e
-                            ))
-                        })?;
+                    let results_task =
+                        kallisto_results(
+                            out_dir_kallisto.join("kallisto"),
+                            kallisto_ercc_tx,
+                        )
+                            .await?;
 
-                Ok::<_, PipelineError>((
-                    stats,
+                    join_with_error_handling(results_task).await?;
+
+                    let results =
+                        kallisto_ercc_rx
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Kallisto results receiver \
+                                     failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                    info!(
+                        "[AMR] Kallisto results drained: \
+                         ercc_entries={}, transcript_mappings={}",
+                        results.ercc_counts.len(),
+                        results.transcript_to_gene.len(),
+                    );
+
+                    Ok::<(), PipelineError>(())
+                };
+
+                // ------------------------------------------------------------
+                // Drain dedup / subsampling counts.
+                // ------------------------------------------------------------
+
+                let dedup_and_subsample_fut = async move {
+                    let unique_units =
+                        dedup_count_rx
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Dedup count receiver failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                    let unique_reads =
+                        unique_units * if paired { 2 } else { 1 };
+
+                    let subsample_units =
+                        subsample_count_rx
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Other(anyhow!(
+                                    "Subsample count receiver \
+                                     failed: {}",
+                                    e
+                                ))
+                            })?;
+
+                    let subsample_reads =
+                        subsample_units * if paired { 2 } else { 1 };
+
+                    info!(
+                        "[AMR] dedup/subsample: \
+                         unique_reads={}, subsampled_reads={}",
+                        unique_reads,
+                        subsample_reads
+                    );
+
+                    Ok::<_, PipelineError>((
+                        unique_reads,
+                        subsample_reads,
+                    ))
+                };
+
+                let (validation_and_qc, host_counts, (), dedup_and_subsample) =
+                    tokio::try_join!(
+                        validation_and_qc_fut,
+                        host_counts_fut,
+                        kallisto_fut,
+                        dedup_and_subsample_fut,
+                    )?;
+                let (
+                    validation_stats,
                     ercc_filtered_count,
                     qc_fastp_read_count,
-                ))
-            };
+                ) = validation_and_qc;
 
-            // ------------------------------------------------------------
-            // Drain BAM writers and host counts.
-            // ------------------------------------------------------------
+                let (
+                    host_bt2_filtered_count,
+                    host_hisat2_filtered_count,
+                ) = host_counts;
 
-            let host_counts_fut = async move {
-                ercc_bt2_bam_write_handle
+                let (
+                    unique_reads,
+                    subsample_reads,
+                ) = dedup_and_subsample;
+
+                // ------------------------------------------------------------
+                // Write host-filter result artifacts.
+                //
+                // These exist only for raw AMR input because only raw input
+                // executes the host-filter stage.
+                // ------------------------------------------------------------
+
+                write_count_file(
+                    &out_dir,
+                    "fastqs.count",
+                    validation_stats.raw_reads,
+                )
+                    .await?;
+
+                write_count_file(
+                    &out_dir,
+                    "validate_input_out.count",
+                    validation_stats.validated,
+                )
+                    .await?;
+
+                let validation_summary = serde_json::json!({
+                    "<50": validation_stats.validation_too_short,
+                    "50-500": validation_stats.validation_normal,
+                    "500-10000": validation_stats.validation_long,
+                    "10000+": validation_stats.validation_too_long,
+                });
+
+                let validation_summary_path =
+                    out_dir.join("validate_input_summary.json");
+
+                tokio::fs::write(
+                    &validation_summary_path,
+                    serde_json::to_vec(
+                        &validation_summary
+                    )
+                        .map_err(|e| {
+                            PipelineError::Other(e.into())
+                        })?,
+                )
+                    .await
+                    .map_err(|e| {
+                        PipelineError::IOError(format!(
+                            "Failed to write {}: {}",
+                            validation_summary_path.display(),
+                            e
+                        ))
+                    })?;
+
+                write_count_file(
+                    &out_dir,
+                    "fastp_out.count",
+                    qc_fastp_read_count,
+                )
+                    .await?;
+
+                write_count_file(
+                    &out_dir,
+                    "bowtie2_ercc_filtered_out.count",
+                    ercc_filtered_count,
+                )
+                    .await?;
+
+                write_count_file(
+                    &out_dir,
+                    "bowtie2_host_filtered_out.count",
+                    host_bt2_filtered_count,
+                )
+                    .await?;
+
+                write_count_file(
+                    &out_dir,
+                    "hisat2_host_filtered_out.count",
+                    host_hisat2_filtered_count,
+                )
+                    .await?;
+
+                write_count_file(
+                    &out_dir,
+                    "czid_dedup_out.count",
+                    unique_reads,
+                )
+                    .await?;
+
+                write_count_file(
+                    &out_dir,
+                    "subsampled_out.count",
+                    subsample_reads,
+                )
+                    .await?;
+
+                redup_completion_task
                     .await
                     .map_err(|e| {
                         PipelineError::Other(anyhow!(
-                            "ERCC BAM writer task panicked: {}",
-                            e
-                        ))
+                "RunRedup task panicked: {}",
+                e
+            ))
                     })?
                     .map_err(PipelineError::Other)?;
 
-                host_bt2_bam_write_handle
-                    .await
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "Host Bowtie2 BAM writer task \
-                             panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                if let Some(handle) =
-                    optional_human_bam_write_handle
-                {
-                    handle
+                // Every RunRedup item must have reached both SPAdes and KMA.
+                for (idx, done_rx) in redup_fanout_tasks.into_iter().enumerate() {
+                    done_rx
                         .await
                         .map_err(|e| {
                             PipelineError::Other(anyhow!(
-                                "Human BAM writer task \
+                    "RunRedup fanout {} completion receiver dropped: {}",
+                    idx + 1,
+                    e
+                ))
+                        })?
+                        .map_err(PipelineError::Other)?;
+                }
+
+                spades.completion_task
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Other(anyhow!(
+                "RunSpades task panicked: {}",
+                e
+            ))
+                    })?
+                    .map_err(PipelineError::Other)?;
+
+                info!(
+                    "[AMR] raw contigs ready: {} (scaffolds: {})",
+                    spades.contigs_path.display(),
+                    spades.scaffolds_path.display()
+                );
+
+                // ------------------------------------------------------------
+                // Drain cleanup owned by the host-filter stage.
+                // ------------------------------------------------------------
+
+                info!(
+                    "[AMR] draining {} cleanup tasks and \
+                     {} cleanup receivers",
+                    cleanup_tasks.len(),
+                    cleanup_receivers.len()
+                );
+
+                for task in cleanup_tasks {
+                    task
+                        .await
+                        .map_err(|e| {
+                            PipelineError::Other(anyhow!(
+                                "AMR host-filter cleanup task \
                                  panicked: {}",
                                 e
                             ))
@@ -1926,1176 +1892,30 @@ pub async fn run(
                         .map_err(PipelineError::Other)?;
                 }
 
-                let host_bt2_count =
-                    host_bt2_count_rx
-                        .await
+                for rx in cleanup_receivers {
+                    rx.await
                         .map_err(|e| {
                             PipelineError::Other(anyhow!(
-                                "Host Bowtie2 count receiver \
-                                 failed: {}",
+                                "AMR host-filter cleanup receiver \
+                                 dropped: {}",
                                 e
                             ))
-                        })?;
-
-                let host_hisat2_count =
-                    host_hisat2_count_rx
-                        .await
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "Host HISAT2 count receiver \
-                                 failed: {}",
-                                e
-                            ))
-                        })?;
-
-                info!(
-                    "[AMR] host filtering counts: \
-                     bowtie2={}, hisat2={}",
-                    host_bt2_count,
-                    host_hisat2_count
-                );
-
-                Ok::<_, PipelineError>((
-                    host_bt2_count,
-                    host_hisat2_count,
-                ))
-            };
-
-            // ------------------------------------------------------------
-            // Drain Kallisto.
-            // ------------------------------------------------------------
-
-            let out_dir_kallisto = out_dir.clone();
-
-            let kallisto_fut = async move {
-                let kallisto_exit =
-                    join_with_error_handling(
-                        kallisto_exit_task
-                    )
-                        .await;
-
-                match kallisto_exit {
-                    Ok(_) => {
-                        info!(
-                            "[AMR] Kallisto completed successfully"
-                        );
-                    }
-
-                    Err(e) => {
-                        warn!(
-                            "[AMR] Kallisto failed \
-                             (non-fatal, possibly no ERCC \
-                             spike-in): {}",
-                            e
-                        );
-                    }
-                }
-
-                let results_task =
-                    kallisto_results(
-                        out_dir_kallisto.join("kallisto"),
-                        kallisto_ercc_tx,
-                    )
-                        .await?;
-
-                join_with_error_handling(results_task).await?;
-
-                let results =
-                    kallisto_ercc_rx
-                        .await
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "Kallisto results receiver \
-                                 failed: {}",
-                                e
-                            ))
-                        })?;
-
-                info!(
-                    "[AMR] Kallisto results drained: \
-                     ercc_entries={}, transcript_mappings={}",
-                    results.ercc_counts.len(),
-                    results.transcript_to_gene.len(),
-                );
-
-                Ok::<(), PipelineError>(())
-            };
-
-            // ------------------------------------------------------------
-            // Drain dedup / subsampling counts.
-            // ------------------------------------------------------------
-
-            let dedup_and_subsample_fut = async move {
-                let unique_units =
-                    dedup_count_rx
-                        .await
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "Dedup count receiver failed: {}",
-                                e
-                            ))
-                        })?;
-
-                let unique_reads =
-                    unique_units * if paired { 2 } else { 1 };
-
-                let subsample_units =
-                    subsample_count_rx
-                        .await
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "Subsample count receiver \
-                                 failed: {}",
-                                e
-                            ))
-                        })?;
-
-                let subsample_reads =
-                    subsample_units * if paired { 2 } else { 1 };
-
-                info!(
-                    "[AMR] dedup/subsample: \
-                     unique_reads={}, subsampled_reads={}",
-                    unique_reads,
-                    subsample_reads
-                );
-
-                Ok::<_, PipelineError>((
-                    unique_reads,
-                    subsample_reads,
-                ))
-            };
-
-            // ------------------------------------------------------------
-            // Complete all host-filter result branches.
-            // ------------------------------------------------------------
-
-            // ------------------------------------------------------------
-            // Complete the streaming
-            // KMA -> fixmate -> sort -> bamtools -> samtools view -> BAM chain.
-            //
-            // All stdout consumers have already been installed above, so it
-            // is now safe to await producer/process completion. The final BAM
-            // is not considered ready until every stdin/process task has
-            // completed successfully and samtools view stdout has been fully
-            // materialized.
-            // ------------------------------------------------------------
-
-            let rgi_bwt_bam_fut = async move {
-                let (
-                    fixmate_stdin_result,
-                    sort_stdin_result,
-                    bamtools_stdin_result,
-                    finalize_stdin_result,
-                    sorted_bam_write_result,
-                ) = tokio::join!(
-                    fixmate_stdin_task,
-                    sort_stdin_task,
-                    bamtools_stdin_task,
-                    finalize_stdin_task,
-                    sorted_bam_write_task,
-                );
-
-                fixmate_stdin_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools fixmate stdin task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                sort_stdin_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools sort stdin task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                bamtools_stdin_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma bamtools filter stdin task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                finalize_stdin_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools BAM finalizer stdin task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                sorted_bam_write_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma length_100 BAM writer task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                let (
-                    fixmate_stderr_result,
-                    sort_stderr_result,
-                    bamtools_stderr_result,
-                    finalize_stderr_result,
-                ) = tokio::join!(
-                    fixmate_stderr_task,
-                    sort_stderr_task,
-                    bamtools_stderr_task,
-                    finalize_stderr_task,
-                );
-
-                fixmate_stderr_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools fixmate stderr task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                sort_stderr_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools sort stderr task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                bamtools_stderr_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma bamtools filter stderr task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                finalize_stderr_result
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools BAM finalizer stderr task panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-
-                info!(
-                    "[AMR] RunRgiBwtKma length_100 BAM ready: {}",
-                    sorted_bam_path.display()
-                );
-
-                Ok::<PathBuf, PipelineError>(sorted_bam_path)
-            };
-
-            let (
-                validation_and_qc,
-                host_counts,
-                (),
-                dedup_and_subsample,
-                sorted_bam_path,
-            ) = tokio::try_join!(
-                validation_and_qc_fut,
-                host_counts_fut,
-                kallisto_fut,
-                dedup_and_subsample_fut,
-                rgi_bwt_bam_fut,
-            )?;
-
-            // ------------------------------------------------------------
-            // Index the completed coordinate-sorted AMR BAM.
-            //
-            // rgi_bwt_bam_fut does not return until the final
-            // sr_amr_report.sorted.length_100.bam writer has reached EOF.
-            // samtools index therefore starts only after the durable BAM
-            // file boundary is complete.
-            // ------------------------------------------------------------
-
-            let sorted_bai_path =
-                PathBuf::from(format!("{}.bai", sorted_bam_path.display()));
-
-            let index_threads =
-                config.thread_allocation(SAMTOOLS_TAG, Some("index"));
-
-            let index_config =
-                SamtoolsConfig::new(SamtoolsSubcommand::Index)
-                    .option("-@", index_threads.to_string())
-                    .flag("-b")
-                    .positional(
-                        sorted_bam_path
-                            .to_string_lossy()
-                            .to_string(),
-                    )
-                    .positional(
-                        sorted_bai_path
-                            .to_string_lossy()
-                            .to_string(),
-                    );
-
-            let index_args = generate_cli(
-                SAMTOOLS_TAG,
-                &config,
-                Some(&index_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-    "[AMR] RunRgiBwtKma samtools index args: {:?}",
-    index_args
-);
-
-            let (mut index_child, index_stderr_task) =
-                spawn_cmd(
-                    config.clone(),
-                    SAMTOOLS_TAG,
-                    index_args,
-                    config.args.verbose,
-                    None,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            let index_status =
-                index_child
-                    .wait()
-                    .await
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                "RunRgiBwtKma samtools index wait failed: {}",
-                e
-            ))
-                    })?;
-
-            index_stderr_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunRgiBwtKma samtools index stderr task panicked: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            if !index_status.success() {
-                return Err(PipelineError::Other(anyhow!(
-        "RunRgiBwtKma samtools index failed with exit status {}",
-        index_status
-    )));
-            }
-
-            if !sorted_bai_path.is_file() {
-                return Err(PipelineError::Other(anyhow!(
-        "RunRgiBwtKma samtools index completed but BAI was not created: {}",
-        sorted_bai_path.display()
-    )));
-            }
-
-            info!(
-    "[AMR] RunRgiBwtKma BAM index ready: {}",
-    sorted_bai_path.display()
-);
-
-            // ------------------------------------------------------------
-            // Pull per-reference alignment counts with samtools idxstats.
-            //
-            // RGI materializes this stdout as sr_amr_report.temp.txt and
-            // get_reads_count() later keeps only rows with mapped > 0.
-            // There is no external-tool requirement for that text-file
-            // boundary, so consume idxstats stdout directly and preserve the
-            // same mapped-reference semantics in memory.
-            // ------------------------------------------------------------
-
-            let idxstats_config =
-                SamtoolsConfig::new(SamtoolsSubcommand::Idxstats)
-                    .positional(
-                        sorted_bam_path
-                            .to_string_lossy()
-                            .to_string(),
-                    );
-
-            let idxstats_args = generate_cli(
-                SAMTOOLS_TAG,
-                &config,
-                Some(&idxstats_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma samtools idxstats args: {:?}",
-                idxstats_args
-            );
-
-            let (mut idxstats_child, idxstats_stderr_task) =
-                spawn_cmd(
-                    config.clone(),
-                    SAMTOOLS_TAG,
-                    idxstats_args,
-                    config.args.verbose,
-                    None,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            let mut idxstats_stdout = parse_child_output(
-                &mut idxstats_child,
-                ChildStream::Stdout,
-                ParseMode::Lines,
-                &config,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            let mut rgi_read_counts = HashMap::<String, RgiReadCounts>::new();
-
-            while let Some(item) = idxstats_stdout.recv().await {
-                let ParseOutput::Bytes(line_bytes) = item else {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma samtools idxstats expected line-oriented Bytes output"
-                    )));
-                };
-
-                let line = std::str::from_utf8(&line_bytes)
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools idxstats emitted non-UTF8 output: {}",
-                            e
-                        ))
-                    })?
-                    .trim_end_matches(['\r', '\n']);
-
-                if line.is_empty() {
-                    continue;
-                }
-
-                let fields: Vec<&str> = line.split('\t').collect();
-
-                if fields.len() != 4 {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma samtools idxstats expected 4 tab-separated fields, got {}: {}",
-                        fields.len(),
-                        line
-                    )));
-                }
-
-                let reference_length = fields[1]
-                    .parse::<u64>()
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma invalid idxstats reference length '{}': {}",
-                            fields[1],
-                            e
-                        ))
-                    })?;
-
-                let mapped = fields[2]
-                    .parse::<u64>()
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma invalid idxstats mapped count '{}': {}",
-                            fields[2],
-                            e
-                        ))
-                    })?;
-
-                let unmapped = fields[3]
-                    .parse::<u64>()
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma invalid idxstats unmapped count '{}': {}",
-                            fields[3],
-                            e
-                        ))
-                    })?;
-
-                // Match RGI get_reads_count(): retain only references with at
-                // least one mapped read. The '*' idxstats row therefore drops
-                // out naturally because its mapped count is zero.
-                if mapped > 0 {
-                    rgi_read_counts.insert(
-                        fields[0].to_string(),
-                        RgiReadCounts {
-                            reference_length,
-                            mapped,
-                            unmapped,
-                            all: mapped + unmapped,
-                        },
-                    );
-                }
-            }
-
-            let idxstats_status = idxstats_child
-                .wait()
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma samtools idxstats wait failed: {}",
-                        e
-                    ))
-                })?;
-
-            idxstats_stderr_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma samtools idxstats stderr task panicked: {}",
-                        e
-                    ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            if !idxstats_status.success() {
-                return Err(PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma samtools idxstats failed with exit status {}",
-                    idxstats_status
-                )));
-            }
-
-            info!(
-                "[AMR] RunRgiBwtKma idxstats parsed: {} references with mapped reads",
-                rgi_read_counts.len()
-            );
-
-            for (reference, counts) in &rgi_read_counts {
-                info!(
-                    "[AMR] RGI idxstats: reference={} length={} mapped={} unmapped={} all={}",
-                    reference,
-                    counts.reference_length,
-                    counts.mapped,
-                    counts.unmapped,
-                    counts.all,
-                );
-            }
-
-
-
-            // ------------------------------------------------------------
-            // Pull alignment records from the completed AMR BAM and build
-            // the in-memory alignment representation used by RGI reporting.
-            //
-            // RGI:
-            //
-            //   samtools view --threads <threads> <bam>
-            //       | cut -f 1,2,3,4,5,7
-            //       | sort -s -n -k 1,1
-            //
-            // followed by preload_alignments(), which groups the selected
-            // SAM fields by RNAME.
-            //
-            // We eliminate both cut and sort. samtools view stdout is parsed
-            // one SAM line at a time and the six fields retained by RGI are
-            // extracted directly:
-            //
-            //   QNAME, FLAG, RNAME, POS, MAPQ, RNEXT
-            //
-            // Alignments are grouped directly by RNAME, so no temporary
-            // sr_amr_report.seqs.temp.txt file is required.
-            // ------------------------------------------------------------
-
-            let view_threads =
-                config.thread_allocation(SAMTOOLS_TAG, Some("view"));
-
-            let view_config =
-                SamtoolsConfig::new(SamtoolsSubcommand::View)
-                    .option("-@", view_threads.to_string())
-                    .positional(
-                        sorted_bam_path
-                            .to_string_lossy()
-                            .to_string(),
-                    );
-
-            let view_args = generate_cli(
-                SAMTOOLS_TAG,
-                &config,
-                Some(&view_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma samtools view args: {:?}",
-                view_args
-            );
-
-            let (mut view_child, view_stderr_task) =
-                spawn_cmd(
-                    config.clone(),
-                    SAMTOOLS_TAG,
-                    view_args,
-                    config.args.verbose,
-                    None,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            // ParseMode::Lines emits one complete SAM line per
-            // ParseOutput::Bytes, with trailing CR/LF removed.
-            let mut view_rx =
-                parse_child_output(
-                    &mut view_child,
-                    ChildStream::Stdout,
-                    ParseMode::Lines,
-                    &config,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            let mut rgi_alignments:
-                HashMap<String, Vec<RgiAlignment>> = HashMap::new();
-
-            let mut alignment_count: u64 = 0;
-
-            while let Some(item) = view_rx.recv().await {
-                let bytes = match item {
-                    ParseOutput::Bytes(bytes) => bytes,
-
-                    other => {
-                        return Err(PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools view produced unexpected \
-                             parse output: {:?}",
-                            other
-                        )));
-                    }
-                };
-
-                let line =
-                    std::str::from_utf8(&bytes)
-                        .map_err(|e| {
-                            PipelineError::Other(anyhow!(
-                                "RunRgiBwtKma samtools view emitted \
-                                 non-UTF8 SAM line: {}",
-                                e
-                            ))
-                        })?;
-
-                let alignment =
-                    parse_rgi_alignment(line)
+                        })?
                         .map_err(PipelineError::Other)?;
+                }
 
-                alignment_count += 1;
-
-                rgi_alignments
-                    .entry(alignment.rname.clone())
-                    .or_default()
-                    .push(alignment);
-            }
-
-            // stdout is completely drained at this point, so samtools can
-            // safely be awaited without risking a blocked stdout pipe.
-            let view_status =
-                view_child
-                    .wait()
-                    .await
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma samtools view wait failed: {}",
-                            e
-                        ))
-                    })?;
-
-            view_stderr_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma samtools view stderr task panicked: {}",
-                        e
-                    ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            if !view_status.success() {
-                return Err(PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma samtools view failed with exit status {}",
-                    view_status
-                )));
-            }
-
-            info!(
-                "[AMR] RunRgiBwtKma samtools view parsed: \
-                 {} alignment records across {} reference names",
-                alignment_count,
-                rgi_alignments.len()
-            );
-
-            for (rname, alignments) in &rgi_alignments {
+                // Keep host-filter temp directories alive until all
+                // host-filter outputs and cleanup work have completed.
                 info!(
-                    "[AMR] RGI alignments: reference={} records={}",
-                    rname,
-                    alignments.len()
+                    "[AMR] raw-input host filtering complete: \
+                     {} retained temp directories can now be released",
+                    final_temp_dirs.len()
                 );
-            }
-
-            // ------------------------------------------------------------
-            // Compute the coverage histogram used by RGI reporting.
-            //
-            // IMPORTANT FILE BOUNDARY:
-            //
-            // sr_amr_report.sorted.length_100.bam is fully materialized
-            // before execution can reach this point. rgi_bwt_bam_fut awaited
-            // sorted_bam_write_task to EOF and returned sorted_bam_path only
-            // after that writer completed successfully.
-            //
-            // The BAM has also already been successfully indexed and consumed
-            // by samtools idxstats and samtools view above.
-            //
-            // RGI:
-            //
-            //   bedtools genomecov
-            //       -ibam sr_amr_report.sorted.length_100.bam
-            //
-            // RGI writes genomecov stdout to
-            // sr_amr_report.coverage_all_positions.temp.txt. We do not need
-            // that temporary file boundary, so keep stdout as a line stream.
-            // Parsing/aggregation of the histogram is the following stage.
-            // ------------------------------------------------------------
-
-            if !sorted_bam_path.is_file() {
-                return Err(PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma BEDTools genomecov input BAM is missing: {}",
-                    sorted_bam_path.display()
-                )));
-            }
-
-            let genomecov_config =
-                BedtoolsConfig::new(BedtoolsSubcommand::Genomecov)
-                    .option(
-                        "-ibam",
-                        sorted_bam_path
-                            .to_string_lossy()
-                            .to_string(),
-                    );
-
-            let genomecov_args = generate_cli(
-                BEDTOOLS_TAG,
-                &config,
-                Some(&genomecov_config),
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma bedtools genomecov args: {:?}",
-                genomecov_args
-            );
-
-            let (mut genomecov_child, genomecov_stderr_task) =
-                spawn_cmd(
-                    config.clone(),
-                    BEDTOOLS_TAG,
-                    genomecov_args,
-                    config.args.verbose,
-                    None,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            // genomecov emits a tab-delimited coverage histogram on stdout.
-            // Keep it line-oriented so the next stage can parse each histogram
-            // record directly without materializing RGI's temporary text file.
-            let mut genomecov_rx =
-                parse_child_output(
-                    &mut genomecov_child,
-                    ChildStream::Stdout,
-                    ParseMode::Lines,
-                    &config,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            // Sum histogram base counts, not the rounded fraction column.
-            // Keep only idxstats references with mapped reads, as RGI reporting
-            // does. BEDTools' aggregate "genome" rows are not reference rows.
-            let mut rgi_coverage = HashMap::<String, RgiCoverage>::new();
-            while let Some(item) = genomecov_rx.recv().await {
-                let ParseOutput::Bytes(bytes) = item else {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma genomecov expected line-oriented Bytes output"
-                    )));
-                };
-                let line = std::str::from_utf8(&bytes)
-                    .map_err(|e| PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma genomecov emitted non-UTF8 output: {}", e
-                    )))?
-                    .trim_end_matches(['\r', '\n']);
-                if line.is_empty() {
-                    continue;
-                }
-                let fields: Vec<&str> = line.split_whitespace().collect();
-                if fields.len() != 5 {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma genomecov expected 5 fields: {:?}", line
-                    )));
-                }
-                if fields[0] == "genome" {
-                    continue;
-                }
-                let Some(counts) = rgi_read_counts.get(fields[0]) else {
-                    continue;
-                };
-                let parse_integer = |value: &str| -> Result<u64, PipelineError> {
-                    value.parse::<u64>().map_err(|e| PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma invalid genomecov integer {:?} in {:?}: {}",
-                        value, line, e
-                    )))
-                };
-                let depth = parse_integer(fields[1])?;
-                let bases = parse_integer(fields[2])?;
-                let length = parse_integer(fields[3])?;
-                if length == 0 || length != counts.reference_length {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma genomecov length mismatch for {}: histogram={}, idxstats={}",
-                        fields[0], length, counts.reference_length
-                    )));
-                }
-                let coverage = rgi_coverage.entry(fields[0].to_string())
-                    .or_insert_with(|| RgiCoverage {
-                        reference_length: length,
-                        ..Default::default()
-                    });
-                let bucket = if depth == 0 {
-                    &mut coverage.uncovered_bases
-                } else {
-                    &mut coverage.covered_bases
-                };
-                *bucket = bucket.checked_add(bases).ok_or_else(|| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma genomecov base-count overflow for {}", fields[0]
-                    ))
-                })?;
-            }
-
-            // Drain stdout before waiting, so BEDTools cannot block on its pipe.
-            let genomecov_status = genomecov_child.wait().await
-                .map_err(|e| PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma genomecov wait failed: {}", e
-                )))?;
-            genomecov_stderr_task.await
-                .map_err(|e| PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma genomecov stderr task panicked: {}", e
-                )))?
-                .map_err(PipelineError::Other)?;
-            if !genomecov_status.success() {
-                return Err(PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma genomecov failed with exit status {}", genomecov_status
-                )));
-            }
-
-            // Require a complete histogram for every reportable reference.
-            // A fully covered reference legitimately has no depth-zero row.
-            let mut coverage_references: Vec<&String> = rgi_read_counts.keys().collect();
-            coverage_references.sort();
-            for reference in coverage_references {
-                let coverage = rgi_coverage.get_mut(reference).ok_or_else(|| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma genomecov missing mapped reference {}", reference
-                    ))
-                })?;
-                if coverage.covered_bases.checked_add(coverage.uncovered_bases)
-                    != Some(coverage.reference_length)
-                {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma incomplete genomecov histogram for {}: covered={}, uncovered={}, length={}",
-                        reference, coverage.covered_bases, coverage.uncovered_bases,
-                        coverage.reference_length
-                    )));
-                }
-                coverage.percent_coverage =
-                    100.0 * coverage.covered_bases as f64 / coverage.reference_length as f64;
-                info!(
-                    "[AMR] RGI coverage: reference={} length={} covered={} uncovered={} coverage={:.2}%",
-                    reference, coverage.reference_length, coverage.covered_bases,
-                    coverage.uncovered_bases, coverage.percent_coverage
-                );
-            }
-            info!(
-                "[AMR] RunRgiBwtKma genomecov complete: {} reportable references",
-                rgi_coverage.len()
-            );
-
-            let (
-                validation_stats,
-                ercc_filtered_count,
-                qc_fastp_read_count,
-            ) = validation_and_qc;
-
-            let (
-                host_bt2_filtered_count,
-                host_hisat2_filtered_count,
-            ) = host_counts;
-
-            let (
-                unique_reads,
-                subsample_reads,
-            ) = dedup_and_subsample;
-
-            // ------------------------------------------------------------
-            // Write host-filter result artifacts.
-            //
-            // These exist only for raw AMR input because only raw input
-            // executes the host-filter stage.
-            // ------------------------------------------------------------
-
-            write_count_file(
-                &out_dir,
-                "fastqs.count",
-                validation_stats.raw_reads,
-            )
-                .await?;
-
-            write_count_file(
-                &out_dir,
-                "validate_input_out.count",
-                validation_stats.validated,
-            )
-                .await?;
-
-            let validation_summary = serde_json::json!({
-                "<50": validation_stats.validation_too_short,
-                "50-500": validation_stats.validation_normal,
-                "500-10000": validation_stats.validation_long,
-                "10000+": validation_stats.validation_too_long,
+                Ok::<(), PipelineError>(())
             });
-
-            let validation_summary_path =
-                out_dir.join("validate_input_summary.json");
-
-            tokio::fs::write(
-                &validation_summary_path,
-                serde_json::to_vec(
-                    &validation_summary
-                )
-                    .map_err(|e| {
-                        PipelineError::Other(e.into())
-                    })?,
-            )
-                .await
-                .map_err(|e| {
-                    PipelineError::IOError(format!(
-                        "Failed to write {}: {}",
-                        validation_summary_path.display(),
-                        e
-                    ))
-                })?;
-
-            write_count_file(
-                &out_dir,
-                "fastp_out.count",
-                qc_fastp_read_count,
-            )
-                .await?;
-
-            write_count_file(
-                &out_dir,
-                "bowtie2_ercc_filtered_out.count",
-                ercc_filtered_count,
-            )
-                .await?;
-
-            write_count_file(
-                &out_dir,
-                "bowtie2_host_filtered_out.count",
-                host_bt2_filtered_count,
-            )
-                .await?;
-
-            write_count_file(
-                &out_dir,
-                "hisat2_host_filtered_out.count",
-                host_hisat2_filtered_count,
-            )
-                .await?;
-
-            write_count_file(
-                &out_dir,
-                "czid_dedup_out.count",
-                unique_reads,
-            )
-                .await?;
-
-            write_count_file(
-                &out_dir,
-                "subsampled_out.count",
-                subsample_reads,
-            )
-                .await?;
-
-            // ------------------------------------------------------------
-            // Complete RunRedup and both downstream consumers.
-            // ------------------------------------------------------------
-
-            redup_completion_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunRedup task panicked: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            // Every RunRedup item must have reached both SPAdes and KMA.
-            for (idx, done_rx) in redup_fanout_tasks.into_iter().enumerate() {
-                done_rx
-                    .await
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                "RunRedup fanout {} completion receiver dropped: {}",
-                idx + 1,
-                e
-            ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-            }
-
-            // KMA stdout must be drained concurrently with KMA execution.
-            // At this point wait for both sides to finish.
-            let kma_sam_results = kma_sam_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunKMA SAM parser task panicked: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            sam_lines_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunKMA SAM line adapter task panicked: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            sam_fanout_done
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunKMA SAM fanout completion receiver dropped: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-
-
-            info!(
-        "[AMR] RunKMA native results: records={}, mapped={}, references={}",
-        kma_sam_results.total_records,
-        kma_sam_results.alignments.len(),
-        kma_sam_results.references.len(),
-    );
-
-            for alignment in &kma_sam_results.alignments {
-                info!(
-        "[AMR] KMA mapped: qname={} flag={} rname={} pos={} mapq={} cigar={}",
-        alignment.qname,
-        alignment.flag,
-        alignment.rname,
-        alignment.pos,
-        alignment.mapq,
-        alignment.cigar,
-    );
-            }
-
-
-
-            kma_completion_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunKMA completion task panicked: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            spades.completion_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-            "RunSpades task panicked: {}",
-            e
-        ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] raw contigs ready: {} (scaffolds: {})",
-                spades.contigs_path.display(),
-                spades.scaffolds_path.display()
-            );
-
-            // ------------------------------------------------------------
-            // Drain cleanup owned by the host-filter stage.
-            // ------------------------------------------------------------
-
-            info!(
-                "[AMR] draining {} cleanup tasks and \
-                 {} cleanup receivers",
-                cleanup_tasks.len(),
-                cleanup_receivers.len()
-            );
-
-            for task in cleanup_tasks {
-                task
-                    .await
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "AMR host-filter cleanup task \
-                             panicked: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-            }
-
-            for rx in cleanup_receivers {
-                rx.await
-                    .map_err(|e| {
-                        PipelineError::Other(anyhow!(
-                            "AMR host-filter cleanup receiver \
-                             dropped: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(PipelineError::Other)?;
-            }
-
-            // Keep host-filter temp directories alive until all
-            // host-filter outputs and cleanup work have completed.
-            info!(
-                "[AMR] raw-input host filtering complete: \
-                 {} retained temp directories can now be released",
-                final_temp_dirs.len()
-            );
+            (downstream_streams, preparation_task)
         }
-
         AmrInputMode::Filtered => {
-            // ------------------------------------------------------------
-            // Already-filtered input.
-            //
-            // This corresponds to the WDL filtered_sample branch.
-            // There is no host-filter invocation in that branch, so:
-            //
-            //   - run_host_filter() is not called
-            //   - HostFilterCompletion does not exist
-            //   - validation/QC/ERCC/host/dedup/subsample receivers
-            //     do not exist
-            //   - no host-filter count/report artifacts are written
-            //
-            // Later AMR stages will begin directly from the supplied
-            // filtered-sample inputs.
-            // ------------------------------------------------------------
-
             info!(
                 "[AMR] filtered input selected; \
                  skipping host filtering"
@@ -3206,41 +2026,1192 @@ pub async fn run(
 
 
 
-            let mut redup_write_tasks = Vec::new();
-            for (idx, stream) in redup.redups_streams.into_iter().enumerate() {
-                redup_write_tasks.push(write_fasta_stream_to_file(
-                    stream,
-                    out_dir.join(format!("redups_{}.fa", idx + 1)),
-                    config.clone(),
-                    StreamDataType::JustBytes,
-                    &format!("AMR filtered RunRedup part {}", idx + 1),
-                ));
-            }
-
-            redup.completion_task
-                .await
-                .map_err(|e| PipelineError::Other(anyhow!("Filtered RunRedup task panicked: {}", e)))?
-                .map_err(PipelineError::Other)?;
-
-            for task in input_tasks {
-                task.await
-                    .map_err(|e| PipelineError::Other(anyhow!("Filtered FASTQ adapter task panicked: {}", e)))?
+            let downstream_streams = redup.redups_streams;
+            let preparation_task = tokio::spawn(async move {
+                redup.completion_task.await
+                    .map_err(|e| PipelineError::Other(anyhow!(
+                        "Filtered RunRedup task panicked: {}", e
+                    )))?
                     .map_err(PipelineError::Other)?;
-            }
-
-            for task in redup_write_tasks {
-                task.await
-                    .map_err(|e| PipelineError::Other(anyhow!("Filtered RunRedup writer task panicked: {}", e)))?
-                    .map_err(PipelineError::Other)?;
-            }
+                for task in input_tasks {
+                    task.await
+                        .map_err(|e| PipelineError::Other(anyhow!(
+                            "Filtered FASTQ adapter task panicked: {}", e
+                        )))?
+                        .map_err(PipelineError::Other)?;
+                }
+                Ok::<(), PipelineError>(())
+            });
+            (downstream_streams, preparation_task)
         }
+    };
+
+    // Shared WDL RunRgiBwtKma: BOTH input modes execute everything below.
+    // These scratch directories belong to shared processing, not host filtering.
+    let mut final_temp_dirs: Vec<TempDir> = Vec::new();
+    let kma = run_kma_amr(
+        config.clone(),
+        kma_streams,
+        PathBuf::from(
+            "/data/refs/card/rgi_db/localDB/bwt/card_reference/kma"
+        ),
+    )
+        .await?;
+    let RunKmaHandle {
+        sam_stream: kma_sam_stream,
+        samtools_stream: kma_samtools_stream,
+        sam_fanout_done,
+        sam_lines_task,
+        completion_task: kma_completion_task,
+        output_temp_dir: kma_output_temp_dir,
+        output_prefix: kma_output_prefix,
+    } = kma;
+    // Keep KMA sidecars alive through downstream AMR post-processing.
+    final_temp_dirs.push(kma_output_temp_dir);
+
+
+    // ------------------------------------------------------------
+    // Parse KMA SAM stdout directly into the native AMR
+    // representation.
+    //
+    // This consumer is installed immediately after RunKMA returns so
+    // KMA stdout can never block on the bounded line channel.
+    // ------------------------------------------------------------
+
+    let kma_sam_task = tokio::spawn(
+        consume_kma_sam(kma_sam_stream)
+    );
+
+    // ------------------------------------------------------------
+    // Stream raw KMA SAM directly through the same samtools fixmate
+    // transformation used by RGI.
+    //
+    // RGI:
+    //
+    //   samtools fixmate
+    //       --verbosity 0
+    //       -z all
+    //       --threads N
+    //       -m
+    //       input.sam
+    //       -O bam
+    //       output.bam
+    //
+    // Here both file operands are "-" so the transformation remains
+    // fully streaming:
+    //
+    //   KMA stdout -> samtools fixmate stdin -> BAM stdout
+    // ------------------------------------------------------------
+
+    let fixmate_threads =
+        config.thread_allocation(SAMTOOLS_TAG, Some("fixmate"));
+
+    let fixmate_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::Fixmate)
+            .option("--verbosity", "0")
+            .option("-z", "all")
+            .option("--threads", fixmate_threads.to_string())
+            .flag("-m")
+            .option("-O", "bam")
+            .positional("-")
+            .positional("-");
+
+    let fixmate_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&fixmate_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools fixmate args: {:?}",
+        fixmate_args
+    );
+
+    let (
+        fixmate_child,
+        fixmate_stdin_task,
+        fixmate_stderr_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        kma_samtools_stream,
+        SAMTOOLS_TAG,
+        fixmate_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    // ------------------------------------------------------------
+    // Stream fixmate BAM stdout directly into samtools sort.
+    //
+    // RGI:
+    //
+    //   samtools sort
+    //       --threads N
+    //       -T <prefix>.sorted
+    //       -o <sorted.bam>
+    //       <unsorted.bam>
+    //
+    // We preserve the sort operation but keep the pipeline streaming:
+    //
+    //   fixmate stdout -> samtools sort stdin -> sorted BAM stdout
+    //
+    // No intermediate unsorted BAM is materialized.
+    // ------------------------------------------------------------
+
+    let fixmate_stdout = {
+        let mut child_guard = fixmate_child.lock().await;
+
+        child_guard
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+        "RunRgiBwtKma samtools fixmate stdout not available"
+    ))
+            })?
+    };
+
+    let fixmate_bam_rx = parse_bytes(
+        fixmate_stdout,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let sort_temp_dir = choose_temp_dir(
+        config.input_size,
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    )
+        .await?;
+
+    let sort_temp_prefix =
+        sort_temp_dir.path().join("sr_amr_report.sorted");
+
+    let sort_threads =
+        config.thread_allocation(SAMTOOLS_TAG, Some("sort"));
+
+    let sort_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::Sort)
+            .option("--threads", sort_threads.to_string())
+            .option(
+                "-T",
+                sort_temp_prefix.to_string_lossy().to_string(),
+            )
+            .option("-O", "bam")
+            .positional("-");
+
+    let sort_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&sort_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools sort args: {:?}",
+        sort_args
+    );
+
+    let (
+        sort_child,
+        sort_stdin_task,
+        sort_stderr_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        fixmate_bam_rx,
+        SAMTOOLS_TAG,
+        sort_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+
+
+    // ------------------------------------------------------------
+    // Stream the coordinate-sorted BAM through the same predicate-free
+    // bamtools filter transformation used by RGI, then re-emit it with
+    // samtools before materializing the final length_100 BAM:
+    //
+    //   sort_stdout
+    //       -> parse_bytes
+    //       -> stream_to_cmd(BAMTOOLS_TAG, ["filter"])
+    //       -> parse_bytes
+    //       -> stream_to_cmd(SAMTOOLS_TAG, ["view", "-b", "-"])
+    //       -> parse_bytes
+    //       -> write_byte_stream_to_file(length_100.bam)
+    //
+    // BamTools 2.5.2 accepts BAM on stdin and emits the same decoded
+    // alignments as its file-based filter invocation, but its stdout BAM
+    // omits the BGZF EOF marker. `samtools view -b -` re-emits a properly
+    // finalized BAM while preserving the alignment stream. This lets us
+    // avoid both RGI's sorted.temp.bam materialization and its unused
+    // intermediate BAI; the only BAM file boundary is the durable
+    // sr_amr_report.sorted.length_100.bam required downstream.
+    // ------------------------------------------------------------
+
+    let sort_stdout = {
+        let mut child_guard = sort_child.lock().await;
+
+        child_guard
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools sort stdout not available"
+                ))
+            })?
+    };
+
+    let sorted_bam_rx = parse_bytes(
+        sort_stdout,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let bamtools_config =
+        BamtoolsConfig::new(BamtoolsSubcommand::Filter);
+
+    let bamtools_args = generate_cli(
+        BAMTOOLS_TAG,
+        &config,
+        Some(&bamtools_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma bamtools filter args: {:?}",
+        bamtools_args
+    );
+
+    let (
+        bamtools_child,
+        bamtools_stdin_task,
+        bamtools_stderr_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        sorted_bam_rx,
+        BAMTOOLS_TAG,
+        bamtools_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let bamtools_stdout = {
+        let mut child_guard = bamtools_child.lock().await;
+
+        child_guard
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma bamtools filter stdout not available"
+                ))
+            })?
+    };
+
+    let bamtools_bam_rx = parse_bytes(
+        bamtools_stdout,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let finalize_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::View)
+            .flag("-b")
+            .positional("-");
+
+    let finalize_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&finalize_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools BAM finalizer args: {:?}",
+        finalize_args
+    );
+
+    let (
+        finalize_child,
+        finalize_stdin_task,
+        finalize_stderr_task,
+    ) = stream_to_cmd(
+        config.clone(),
+        bamtools_bam_rx,
+        SAMTOOLS_TAG,
+        finalize_args,
+        StreamDataType::JustBytes,
+        config.args.verbose,
+        None,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let finalize_stdout = {
+        let mut child_guard = finalize_child.lock().await;
+
+        child_guard
+            .stdout
+            .take()
+            .ok_or_else(|| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools BAM finalizer stdout not available"
+                ))
+            })?
+    };
+
+    let final_bam_rx = parse_bytes(
+        finalize_stdout,
+        &config,
+        StreamDataType::JustBytes,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let sorted_bam_path =
+        out_dir.join("sr_amr_report.sorted.length_100.bam");
+
+    let sorted_bam_write_task = write_byte_stream_to_file(
+        &sorted_bam_path,
+        ReceiverStream::new(final_bam_rx),
+        config.clone(),
+        StreamDataType::JustBytes,
+        "RunRgiBwtKma length_100 BAM",
+        false,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    // Keep samtools sort scratch alive until sort has completed.
+    final_temp_dirs.push(sort_temp_dir);
+
+
+    // ------------------------------------------------------------
+    // Complete the streaming
+    // KMA -> fixmate -> sort -> bamtools -> samtools view -> BAM chain.
+    //
+    // All stdout consumers have already been installed above, so it
+    // is now safe to await producer/process completion. The final BAM
+    // is not considered ready until every stdin/process task has
+    // completed successfully and samtools view stdout has been fully
+    // materialized.
+    // ------------------------------------------------------------
+
+    let rgi_bwt_bam_fut = async move {
+        let (
+            fixmate_stdin_result,
+            sort_stdin_result,
+            bamtools_stdin_result,
+            finalize_stdin_result,
+            sorted_bam_write_result,
+        ) = tokio::join!(
+            fixmate_stdin_task,
+            sort_stdin_task,
+            bamtools_stdin_task,
+            finalize_stdin_task,
+            sorted_bam_write_task,
+        );
+
+        fixmate_stdin_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools fixmate stdin task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        sort_stdin_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools sort stdin task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        bamtools_stdin_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma bamtools filter stdin task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        finalize_stdin_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools BAM finalizer stdin task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        sorted_bam_write_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma length_100 BAM writer task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        let (
+            fixmate_stderr_result,
+            sort_stderr_result,
+            bamtools_stderr_result,
+            finalize_stderr_result,
+        ) = tokio::join!(
+            fixmate_stderr_task,
+            sort_stderr_task,
+            bamtools_stderr_task,
+            finalize_stderr_task,
+        );
+
+        fixmate_stderr_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools fixmate stderr task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        sort_stderr_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools sort stderr task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        bamtools_stderr_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma bamtools filter stderr task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        finalize_stderr_result
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools BAM finalizer stderr task panicked: {}",
+                    e
+                ))
+            })?
+            .map_err(PipelineError::Other)?;
+
+        info!(
+            "[AMR] RunRgiBwtKma length_100 BAM ready: {}",
+            sorted_bam_path.display()
+        );
+
+        Ok::<PathBuf, PipelineError>(sorted_bam_path)
+    };
+
+    let sorted_bam_path = rgi_bwt_bam_fut.await?;
+
+    // ------------------------------------------------------------
+    // Index the completed coordinate-sorted AMR BAM.
+    //
+    // rgi_bwt_bam_fut does not return until the final
+    // sr_amr_report.sorted.length_100.bam writer has reached EOF.
+    // samtools index therefore starts only after the durable BAM
+    // file boundary is complete.
+    // ------------------------------------------------------------
+
+    let sorted_bai_path =
+        PathBuf::from(format!("{}.bai", sorted_bam_path.display()));
+
+    let index_threads =
+        config.thread_allocation(SAMTOOLS_TAG, Some("index"));
+
+    let index_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::Index)
+            .option("-@", index_threads.to_string())
+            .flag("-b")
+            .positional(
+                sorted_bam_path
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .positional(
+                sorted_bai_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+    let index_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&index_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools index args: {:?}",
+        index_args
+    );
+
+    let (mut index_child, index_stderr_task) =
+        spawn_cmd(
+            config.clone(),
+            SAMTOOLS_TAG,
+            index_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    let index_status =
+        index_child
+            .wait()
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+        "RunRgiBwtKma samtools index wait failed: {}",
+        e
+    ))
+            })?;
+
+    index_stderr_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+    "RunRgiBwtKma samtools index stderr task panicked: {}",
+    e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    if !index_status.success() {
+        return Err(PipelineError::Other(anyhow!(
+            "RunRgiBwtKma samtools index failed with exit status {}",
+            index_status
+        )));
+    }
+
+    if !sorted_bai_path.is_file() {
+        return Err(PipelineError::Other(anyhow!(
+            "RunRgiBwtKma samtools index completed but BAI was not created: {}",
+            sorted_bai_path.display()
+        )));
+    }
+
+    info!(
+        "[AMR] RunRgiBwtKma BAM index ready: {}",
+        sorted_bai_path.display()
+    );
+
+    // ------------------------------------------------------------
+    // Pull per-reference alignment counts with samtools idxstats.
+    //
+    // RGI materializes this stdout as sr_amr_report.temp.txt and
+    // get_reads_count() later keeps only rows with mapped > 0.
+    // There is no external-tool requirement for that text-file
+    // boundary, so consume idxstats stdout directly and preserve the
+    // same mapped-reference semantics in memory.
+    // ------------------------------------------------------------
+
+    let idxstats_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::Idxstats)
+            .positional(
+                sorted_bam_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+    let idxstats_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&idxstats_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools idxstats args: {:?}",
+        idxstats_args
+    );
+
+    let (mut idxstats_child, idxstats_stderr_task) =
+        spawn_cmd(
+            config.clone(),
+            SAMTOOLS_TAG,
+            idxstats_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    let mut idxstats_stdout = parse_child_output(
+        &mut idxstats_child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        &config,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    let mut rgi_read_counts = HashMap::<String, RgiReadCounts>::new();
+
+    while let Some(item) = idxstats_stdout.recv().await {
+        let ParseOutput::Bytes(line_bytes) = item else {
+            return Err(PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools idxstats expected line-oriented Bytes output"
+            )));
+        };
+
+        let line = std::str::from_utf8(&line_bytes)
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools idxstats emitted non-UTF8 output: {}",
+                    e
+                ))
+            })?
+            .trim_end_matches(['\r', '\n']);
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split('\t').collect();
+
+        if fields.len() != 4 {
+            return Err(PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools idxstats expected 4 tab-separated fields, got {}: {}",
+                fields.len(),
+                line
+            )));
+        }
+
+        let reference_length = fields[1]
+            .parse::<u64>()
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma invalid idxstats reference length '{}': {}",
+                    fields[1],
+                    e
+                ))
+            })?;
+
+        let mapped = fields[2]
+            .parse::<u64>()
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma invalid idxstats mapped count '{}': {}",
+                    fields[2],
+                    e
+                ))
+            })?;
+
+        let unmapped = fields[3]
+            .parse::<u64>()
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma invalid idxstats unmapped count '{}': {}",
+                    fields[3],
+                    e
+                ))
+            })?;
+
+        // Match RGI get_reads_count(): retain only references with at
+        // least one mapped read. The '*' idxstats row therefore drops
+        // out naturally because its mapped count is zero.
+        if mapped > 0 {
+            rgi_read_counts.insert(
+                fields[0].to_string(),
+                RgiReadCounts {
+                    reference_length,
+                    mapped,
+                    unmapped,
+                    all: mapped + unmapped,
+                },
+            );
+        }
+    }
+
+    let idxstats_status = idxstats_child
+        .wait()
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools idxstats wait failed: {}",
+                e
+            ))
+        })?;
+
+    idxstats_stderr_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools idxstats stderr task panicked: {}",
+                e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    if !idxstats_status.success() {
+        return Err(PipelineError::Other(anyhow!(
+            "RunRgiBwtKma samtools idxstats failed with exit status {}",
+            idxstats_status
+        )));
+    }
+
+    info!(
+        "[AMR] RunRgiBwtKma idxstats parsed: {} references with mapped reads",
+        rgi_read_counts.len()
+    );
+
+    for (reference, counts) in &rgi_read_counts {
+        info!(
+            "[AMR] RGI idxstats: reference={} length={} mapped={} unmapped={} all={}",
+            reference,
+            counts.reference_length,
+            counts.mapped,
+            counts.unmapped,
+            counts.all,
+        );
     }
 
 
 
+    // ------------------------------------------------------------
+    // Pull alignment records from the completed AMR BAM and build
+    // the in-memory alignment representation used by RGI reporting.
+    //
+    // RGI:
+    //
+    //   samtools view --threads <threads> <bam>
+    //       | cut -f 1,2,3,4,5,7
+    //       | sort -s -n -k 1,1
+    //
+    // followed by preload_alignments(), which groups the selected
+    // SAM fields by RNAME.
+    //
+    // We eliminate both cut and sort. samtools view stdout is parsed
+    // one SAM line at a time and the six fields retained by RGI are
+    // extracted directly:
+    //
+    //   QNAME, FLAG, RNAME, POS, MAPQ, RNEXT
+    //
+    // Alignments are grouped directly by RNAME, so no temporary
+    // sr_amr_report.seqs.temp.txt file is required.
+    // ------------------------------------------------------------
+
+    let view_threads =
+        config.thread_allocation(SAMTOOLS_TAG, Some("view"));
+
+    let view_config =
+        SamtoolsConfig::new(SamtoolsSubcommand::View)
+            .option("-@", view_threads.to_string())
+            .positional(
+                sorted_bam_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+    let view_args = generate_cli(
+        SAMTOOLS_TAG,
+        &config,
+        Some(&view_config),
+    )
+        .map_err(PipelineError::Other)?;
+
     info!(
-        "Finished AMR host-filter staging."
+        "[AMR] RunRgiBwtKma samtools view args: {:?}",
+        view_args
     );
 
+    let (mut view_child, view_stderr_task) =
+        spawn_cmd(
+            config.clone(),
+            SAMTOOLS_TAG,
+            view_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    // ParseMode::Lines emits one complete SAM line per
+    // ParseOutput::Bytes, with trailing CR/LF removed.
+    let mut view_rx =
+        parse_child_output(
+            &mut view_child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            &config,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    let mut rgi_alignments:
+        HashMap<String, Vec<RgiAlignment>> = HashMap::new();
+
+    let mut alignment_count: u64 = 0;
+
+    while let Some(item) = view_rx.recv().await {
+        let bytes = match item {
+            ParseOutput::Bytes(bytes) => bytes,
+
+            other => {
+                return Err(PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools view produced unexpected \
+                     parse output: {:?}",
+                    other
+                )));
+            }
+        };
+
+        let line =
+            std::str::from_utf8(&bytes)
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+                        "RunRgiBwtKma samtools view emitted \
+                         non-UTF8 SAM line: {}",
+                        e
+                    ))
+                })?;
+
+        let alignment =
+            parse_rgi_alignment(line)
+                .map_err(PipelineError::Other)?;
+
+        alignment_count += 1;
+
+        rgi_alignments
+            .entry(alignment.rname.clone())
+            .or_default()
+            .push(alignment);
+    }
+
+    // stdout is completely drained at this point, so samtools can
+    // safely be awaited without risking a blocked stdout pipe.
+    let view_status =
+        view_child
+            .wait()
+            .await
+            .map_err(|e| {
+                PipelineError::Other(anyhow!(
+                    "RunRgiBwtKma samtools view wait failed: {}",
+                    e
+                ))
+            })?;
+
+    view_stderr_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiBwtKma samtools view stderr task panicked: {}",
+                e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    if !view_status.success() {
+        return Err(PipelineError::Other(anyhow!(
+            "RunRgiBwtKma samtools view failed with exit status {}",
+            view_status
+        )));
+    }
+
+    info!(
+        "[AMR] RunRgiBwtKma samtools view parsed: \
+         {} alignment records across {} reference names",
+        alignment_count,
+        rgi_alignments.len()
+    );
+
+    for (rname, alignments) in &rgi_alignments {
+        info!(
+            "[AMR] RGI alignments: reference={} records={}",
+            rname,
+            alignments.len()
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Compute the coverage histogram used by RGI reporting.
+    //
+    // IMPORTANT FILE BOUNDARY:
+    //
+    // sr_amr_report.sorted.length_100.bam is fully materialized
+    // before execution can reach this point. rgi_bwt_bam_fut awaited
+    // sorted_bam_write_task to EOF and returned sorted_bam_path only
+    // after that writer completed successfully.
+    //
+    // The BAM has also already been successfully indexed and consumed
+    // by samtools idxstats and samtools view above.
+    //
+    // RGI:
+    //
+    //   bedtools genomecov
+    //       -ibam sr_amr_report.sorted.length_100.bam
+    //
+    // RGI writes genomecov stdout to
+    // sr_amr_report.coverage_all_positions.temp.txt. We do not need
+    // that temporary file boundary, so keep stdout as a line stream.
+    // Parsing/aggregation of the histogram is the following stage.
+    // ------------------------------------------------------------
+
+    if !sorted_bam_path.is_file() {
+        return Err(PipelineError::Other(anyhow!(
+            "RunRgiBwtKma BEDTools genomecov input BAM is missing: {}",
+            sorted_bam_path.display()
+        )));
+    }
+
+    let genomecov_config =
+        BedtoolsConfig::new(BedtoolsSubcommand::Genomecov)
+            .option(
+                "-ibam",
+                sorted_bam_path
+                    .to_string_lossy()
+                    .to_string(),
+            );
+
+    let genomecov_args = generate_cli(
+        BEDTOOLS_TAG,
+        &config,
+        Some(&genomecov_config),
+    )
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "[AMR] RunRgiBwtKma bedtools genomecov args: {:?}",
+        genomecov_args
+    );
+
+    let (mut genomecov_child, genomecov_stderr_task) =
+        spawn_cmd(
+            config.clone(),
+            BEDTOOLS_TAG,
+            genomecov_args,
+            config.args.verbose,
+            None,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    // genomecov emits a tab-delimited coverage histogram on stdout.
+    // Keep it line-oriented so the next stage can parse each histogram
+    // record directly without materializing RGI's temporary text file.
+    let mut genomecov_rx =
+        parse_child_output(
+            &mut genomecov_child,
+            ChildStream::Stdout,
+            ParseMode::Lines,
+            &config,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    // Sum histogram base counts, not the rounded fraction column.
+    // Keep only idxstats references with mapped reads, as RGI reporting
+    // does. BEDTools' aggregate "genome" rows are not reference rows.
+    let mut rgi_coverage = HashMap::<String, RgiCoverage>::new();
+    while let Some(item) = genomecov_rx.recv().await {
+        let ParseOutput::Bytes(bytes) = item else {
+            return Err(PipelineError::Other(anyhow!(
+                "RunRgiBwtKma genomecov expected line-oriented Bytes output"
+            )));
+        };
+        let line = std::str::from_utf8(&bytes)
+            .map_err(|e| PipelineError::Other(anyhow!(
+                "RunRgiBwtKma genomecov emitted non-UTF8 output: {}", e
+            )))?
+            .trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() != 5 {
+            return Err(PipelineError::Other(anyhow!(
+                "RunRgiBwtKma genomecov expected 5 fields: {:?}", line
+            )));
+        }
+        if fields[0] == "genome" {
+            continue;
+        }
+        let Some(counts) = rgi_read_counts.get(fields[0]) else {
+            continue;
+        };
+        let parse_integer = |value: &str| -> Result<u64, PipelineError> {
+            value.parse::<u64>().map_err(|e| PipelineError::Other(anyhow!(
+                "RunRgiBwtKma invalid genomecov integer {:?} in {:?}: {}",
+                value, line, e
+            )))
+        };
+        let depth = parse_integer(fields[1])?;
+        let bases = parse_integer(fields[2])?;
+        let length = parse_integer(fields[3])?;
+        if length == 0 || length != counts.reference_length {
+            return Err(PipelineError::Other(anyhow!(
+                "RunRgiBwtKma genomecov length mismatch for {}: histogram={}, idxstats={}",
+                fields[0], length, counts.reference_length
+            )));
+        }
+        let coverage = rgi_coverage.entry(fields[0].to_string())
+            .or_insert_with(|| RgiCoverage {
+                reference_length: length,
+                ..Default::default()
+            });
+        let bucket = if depth == 0 {
+            &mut coverage.uncovered_bases
+        } else {
+            &mut coverage.covered_bases
+        };
+        *bucket = bucket.checked_add(bases).ok_or_else(|| {
+            PipelineError::Other(anyhow!(
+                "RunRgiBwtKma genomecov base-count overflow for {}", fields[0]
+            ))
+        })?;
+    }
+
+    // Drain stdout before waiting, so BEDTools cannot block on its pipe.
+    let genomecov_status = genomecov_child.wait().await
+        .map_err(|e| PipelineError::Other(anyhow!(
+            "RunRgiBwtKma genomecov wait failed: {}", e
+        )))?;
+    genomecov_stderr_task.await
+        .map_err(|e| PipelineError::Other(anyhow!(
+            "RunRgiBwtKma genomecov stderr task panicked: {}", e
+        )))?
+        .map_err(PipelineError::Other)?;
+    if !genomecov_status.success() {
+        return Err(PipelineError::Other(anyhow!(
+            "RunRgiBwtKma genomecov failed with exit status {}", genomecov_status
+        )));
+    }
+
+    // Require a complete histogram for every reportable reference.
+    // A fully covered reference legitimately has no depth-zero row.
+    let mut coverage_references: Vec<&String> = rgi_read_counts.keys().collect();
+    coverage_references.sort();
+    for reference in coverage_references {
+        let coverage = rgi_coverage.get_mut(reference).ok_or_else(|| {
+            PipelineError::Other(anyhow!(
+                "RunRgiBwtKma genomecov missing mapped reference {}", reference
+            ))
+        })?;
+        if coverage.covered_bases.checked_add(coverage.uncovered_bases)
+            != Some(coverage.reference_length)
+        {
+            return Err(PipelineError::Other(anyhow!(
+                "RunRgiBwtKma incomplete genomecov histogram for {}: covered={}, uncovered={}, length={}",
+                reference, coverage.covered_bases, coverage.uncovered_bases,
+                coverage.reference_length
+            )));
+        }
+        coverage.percent_coverage =
+            100.0 * coverage.covered_bases as f64 / coverage.reference_length as f64;
+        info!(
+            "[AMR] RGI coverage: reference={} length={} covered={} uncovered={} coverage={:.2}%",
+            reference, coverage.reference_length, coverage.covered_bases,
+            coverage.uncovered_bases, coverage.percent_coverage
+        );
+    }
+    info!(
+        "[AMR] RunRgiBwtKma genomecov complete: {} reportable references",
+        rgi_coverage.len()
+    );
+
+    // KMA stdout must be drained concurrently with KMA execution.
+    // At this point wait for both sides to finish.
+    let kma_sam_results = kma_sam_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+    "RunKMA SAM parser task panicked: {}",
+    e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    sam_lines_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+    "RunKMA SAM line adapter task panicked: {}",
+    e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    sam_fanout_done
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+    "RunKMA SAM fanout completion receiver dropped: {}",
+    e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+
+
+    info!(
+            "[AMR] RunKMA native results: records={}, mapped={}, references={}",
+            kma_sam_results.total_records,
+            kma_sam_results.alignments.len(),
+            kma_sam_results.references.len(),
+        );
+
+    for alignment in &kma_sam_results.alignments {
+        info!(
+            "[AMR] KMA mapped: qname={} flag={} rname={} pos={} mapq={} cigar={}",
+            alignment.qname,
+            alignment.flag,
+            alignment.rname,
+            alignment.pos,
+            alignment.mapq,
+            alignment.cigar,
+        );
+    }
+
+
+
+    kma_completion_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+    "RunKMA completion task panicked: {}",
+    e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+
+    preparation_task.await
+        .map_err(|e| PipelineError::Other(anyhow!(
+            "AMR input preparation task panicked: {}", e
+        )))??;
+
+    info!("Finished AMR processing through shared genomecov evidence collection.");
     Ok(())
 }
