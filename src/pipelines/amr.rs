@@ -181,6 +181,158 @@ struct CardModels {
     by_aro_accession: HashMap<String, CardModel>,
 }
 
+
+#[derive(Debug, Clone)]
+struct RgiAlleleSummary {
+    id: String,
+    cvterm_name: String,
+    aro_accession: String,
+    model_type: String,
+    database: String,
+    reference_allele_source: String,
+    observed_in_genomes: String,
+    observed_in_plasmids: String,
+    observed_in_pathogens: Vec<String>,
+    range_of_reference_allele_source: f64,
+    reads: RgiReadCounts,
+    alignments: Vec<RgiAlignment>,
+    mapq_average: String,
+    number_of_mapped_baits: u64,
+    number_of_mapped_baits_with_reads: u64,
+    average_bait_coverage: u64,
+    bait_coverage_coefficient_of_variation: u64,
+    mate_pair: Vec<String>,
+    percent_coverage_covered: String,
+    percent_coverage_uncovered: String,
+    length_coverage_covered: String,
+    length_coverage_uncovered: String,
+    reference_sequence_length: String,
+    mutation: String,
+    resistomes: HashMap<String, Vec<String>>,
+    predicted_pathogen: String,
+    depth: String,
+    snps: String,
+    consensus_sequence_dna: String,
+    // Filled by the next translation step; BWT.py translates before depth suppression.
+    consensus_sequence_protein: String,
+}
+
+fn build_rgi_allele_summaries(
+    reads: &HashMap<String, RgiReadCounts>,
+    coverage: &HashMap<String, RgiCoverage>,
+    alignments: &HashMap<String, Vec<RgiAlignment>>,
+    sidecars: &KmaSidecars,
+    models: &CardModels,
+) -> anyhow::Result<Vec<RgiAlleleSummary>> {
+    let mut references: Vec<&String> = reads.keys().collect();
+    references.sort();
+
+    let mut summaries = Vec::new();
+    let mut skipped_no_consensus = 0usize;
+
+    for alignment_hit in references {
+        let Some(model) = resolve_card_model(alignment_hit, models) else {
+            // Match BWT.py's outer summary() exception behavior: unresolved models
+            // do not produce an allele summary row.
+            warn!("[AMR] RGI summary skipping unresolved CARD model: {}", alignment_hit);
+            continue;
+        };
+
+        let Some(consensus_sequence_dna) = sidecars.consensus_dna.get(alignment_hit) else {
+            // BWT.py accesses consensus_sequence[alignment_hit] inside a try block
+            // and returns {} when KMA had too few reads to create a consensus.
+            skipped_no_consensus += 1;
+            continue;
+        };
+
+        let counts = reads.get(alignment_hit).expect("reference came from reads keys");
+        let cov = coverage.get(alignment_hit).ok_or_else(|| anyhow!(
+            "RGI summary missing genomecov evidence for {}", alignment_hit
+        ))?;
+        let hit_alignments = alignments.get(alignment_hit).cloned().unwrap_or_default();
+
+        let mapq_average = if hit_alignments.is_empty() {
+            0.0
+        } else {
+            hit_alignments.iter().map(|a| a.mapq as f64).sum::<f64>()
+                / hit_alignments.len() as f64
+        };
+
+        // BWT.py keeps unique MRNM values in encounter order, excluding '=' and
+        // mates whose reference string contains this model's ARO accession.
+        let aro_marker = format!("ARO:{}", model.aro_accession);
+        let mut mate_pair = Vec::<String>::new();
+        for alignment in &hit_alignments {
+            if alignment.mrnm != "="
+                && !alignment.mrnm.contains(&aro_marker)
+                && !mate_pair.iter().any(|m| m == &alignment.mrnm)
+            {
+                mate_pair.push(alignment.mrnm.clone());
+            }
+        }
+
+        // This pipeline currently uses canonical CARD references, not the
+        // optional Resistomes & Variants / wildcard input handled by BWT.py.
+        let database = "CARD".to_string();
+        let reference_allele_source = "CARD curation".to_string();
+        let observed_in_genomes = "no data".to_string();
+        let observed_in_plasmids = "no data".to_string();
+        let observed_in_pathogens = model.taxon.clone();
+        let percent_identity = 100.0;
+
+        let mut resistomes = model.categories.clone();
+        resistomes.entry("AMR Gene Family".to_string()).or_default();
+        resistomes.entry("Drug Class".to_string()).or_default();
+        resistomes.entry("Resistance Mechanism".to_string()).or_default();
+
+        let depth = sidecars.read_depth.get(alignment_hit).cloned().unwrap_or_default();
+        let snps = sidecars.mutations.get(alignment_hit)
+            .map(|items| items.join("; "))
+            .unwrap_or_default();
+
+        summaries.push(RgiAlleleSummary {
+            id: alignment_hit.clone(),
+            cvterm_name: model.model_name.clone(),
+            aro_accession: model.aro_accession.clone(),
+            model_type: model.model_type.clone(),
+            database,
+            reference_allele_source,
+            observed_in_genomes,
+            observed_in_plasmids,
+            observed_in_pathogens,
+            range_of_reference_allele_source: percent_identity,
+            reads: counts.clone(),
+            alignments: hit_alignments,
+            mapq_average: format!("{:.2}", mapq_average),
+            // include_baits is false in the WDL invocation; BWT.py returns four zeros.
+            number_of_mapped_baits: 0,
+            number_of_mapped_baits_with_reads: 0,
+            average_bait_coverage: 0,
+            bait_coverage_coefficient_of_variation: 0,
+            mate_pair,
+            percent_coverage_covered: format!("{:.2}", cov.percent_coverage),
+            percent_coverage_uncovered: format!("{:.2}", 100.0 - cov.percent_coverage),
+            length_coverage_covered: cov.covered_bases.to_string(),
+            length_coverage_uncovered: cov.uncovered_bases.to_string(),
+            reference_sequence_length: cov.reference_length.to_string(),
+            mutation: "N/A".to_string(),
+            resistomes,
+            predicted_pathogen: "N/A".to_string(),
+            depth,
+            snps,
+            consensus_sequence_dna: consensus_sequence_dna.clone(),
+            consensus_sequence_protein: String::new(),
+        });
+    }
+
+    info!(
+        "[AMR] RGI allele summaries built: reportable_references={} summaries={} skipped_no_consensus={}",
+        reads.len(), summaries.len(), skipped_no_consensus
+    );
+
+    Ok(summaries)
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -3620,6 +3772,33 @@ pub async fn run(
         "[AMR] CARD model unresolved: reference={}",
         reference
     );
+    }
+
+    // Reproduce BWT.py summary() for the canonical CARD/KMA evidence available
+    // at this checkpoint. Protein translation and depth<5 suppression are the
+    // following stages and are deliberately not applied here.
+    let rgi_allele_summaries = build_rgi_allele_summaries(
+        &rgi_read_counts,
+        &rgi_coverage,
+        &rgi_alignments,
+        &kma_sidecars,
+        &card_models,
+    ).map_err(PipelineError::Other)?;
+
+    for summary in &rgi_allele_summaries {
+        info!(
+            "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} coverage={} mapq={} depth={} snps={} consensus_bp={} mate_pairs={}",
+            summary.id,
+            summary.cvterm_name,
+            summary.aro_accession,
+            summary.reads.mapped,
+            summary.percent_coverage_covered,
+            summary.mapq_average,
+            summary.depth,
+            if summary.snps.is_empty() { 0 } else { summary.snps.split("; ").count() },
+            summary.consensus_sequence_dna.len(),
+            summary.mate_pair.len(),
+        );
     }
 
     preparation_task.await
