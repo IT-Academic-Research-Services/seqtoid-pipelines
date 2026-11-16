@@ -12,11 +12,12 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::io::AsyncBufReadExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
-                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG,
+                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG, PIGZ_TAG,
                           BedtoolsSubcommand, SamtoolsSubcommand, BamtoolsSubcommand};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
@@ -24,6 +25,7 @@ use crate::pipelines::short_read_mngs::{
     HostFilterCompletion,
 };
 use crate::utils::command::kma::KmaConfig;
+use crate::utils::command::pigz::PigzConfig;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::bamtools::BamtoolsConfig;
 use crate::utils::command::bedtools::BedtoolsConfig;
@@ -1216,6 +1218,146 @@ fn parse_rgi_alignment(line: &str) -> anyhow::Result<RgiAlignment> {
         mapq,
         mrnm: fields[6].to_string(),
     })
+}
+
+/// Evidence from BWT.py get_read_coverage/get_consensus_sequence/get_mutation_details.
+/// Depth stays textual; mutation order and duplicates are intentionally retained.
+#[derive(Debug, Default)]
+struct KmaSidecars {
+    read_depth: HashMap<String, String>,
+    consensus_dna: HashMap<String, String>,
+    mutations: HashMap<String, Vec<String>>,
+}
+
+fn kma_sidecar_path(prefix: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut path = prefix.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn parse_kma_res_line(line: &str, depths: &mut HashMap<String, String>) -> anyhow::Result<()> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields[0] == "#Template" {
+        return Ok(());
+    }
+    if fields.len() < 9 {
+        return Err(anyhow!("KMA .res row has {} fields; expected at least 9", fields.len()));
+    }
+    // BWT.py uses row[8].strip(), with last duplicate template winning.
+    depths.insert(fields[0].to_string(), fields[8].trim().to_string());
+    Ok(())
+}
+
+fn parse_kma_vcf_line(line: &str, mutations: &mut HashMap<String, Vec<String>>) -> anyhow::Result<()> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    // Match BWT.py's contains test, not just starts_with('#').
+    if fields[0].contains('#') {
+        return Ok(());
+    }
+    if fields.len() < 5 {
+        return Err(anyhow!("KMA VCF row has {} fields; expected at least 5", fields.len()));
+    }
+    // No QUAL/FILTER/ALT filtering, normalization, sorting, or deduplication.
+    mutations.entry(fields[0].to_string()).or_default().push(format!(
+        "{}{}{}", fields[3].trim(), fields[1].trim(), fields[4].trim()
+    ));
+    Ok(())
+}
+
+async fn read_kma_res(path: &std::path::Path) -> anyhow::Result<HashMap<String, String>> {
+    let file = tokio::fs::File::open(path).await
+        .map_err(|e| anyhow!("Open KMA sidecar {}: {}", path.display(), e))?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut depths = HashMap::new();
+    let mut row = 0u64;
+    while let Some(line) = lines.next_line().await? {
+        row += 1;
+        parse_kma_res_line(&line, &mut depths)
+            .map_err(|e| anyhow!("{} row {}: {}", path.display(), row, e))?;
+    }
+    Ok(depths)
+}
+
+async fn read_kma_fsa(path: &std::path::Path) -> anyhow::Result<HashMap<String, String>> {
+    let file = tokio::fs::File::open(path).await
+        .map_err(|e| anyhow!("Open KMA sidecar {}: {}", path.display(), e))?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut sequences = HashMap::new();
+    let mut id: Option<String> = None;
+    let mut sequence = String::new();
+    while let Some(line) = lines.next_line().await? {
+        if let Some(header) = line.strip_prefix('>') {
+            if let Some(previous) = id.take() {
+                if sequences.insert(previous.clone(), std::mem::take(&mut sequence)).is_some() {
+                    return Err(anyhow!("Duplicate FASTA ID {:?} in {}", previous, path.display()));
+                }
+            }
+            // SeqIO record.id is the first whitespace-separated header token.
+            id = Some(header.split_whitespace().next()
+                .ok_or_else(|| anyhow!("Empty FASTA header in {}", path.display()))?.to_string());
+        } else if id.is_some() {
+            // Biopython plain FASTA removes spaces and tabs, preserves case/gaps.
+            sequence.extend(line.chars().filter(|c| *c != ' ' && *c != '\t'));
+        }
+    }
+    if let Some(previous) = id {
+        if sequences.insert(previous.clone(), sequence).is_some() {
+            return Err(anyhow!("Duplicate FASTA ID {:?} in {}", previous, path.display()));
+        }
+    }
+    Ok(sequences)
+}
+
+async fn read_kma_vcf(
+    config: Arc<RunConfig>,
+    path: PathBuf,
+) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    let pigz_config = PigzConfig::decompress_stdout(path.clone());
+    let args = generate_cli(PIGZ_TAG, &config, Some(&pigz_config))?;
+    info!("[AMR] KMA VCF pigz args: {:?}", args);
+    let (mut child, stderr_task) = spawn_cmd(
+        config.clone(), PIGZ_TAG, args, config.args.verbose, None,
+    ).await?;
+
+    // Read stdout directly so I/O errors propagate (parse_lines only logs them).
+    // The process is still launched exclusively through the shared launcher.
+    let parse_result = async {
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("KMA VCF pigz stdout unavailable"))?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let mut mutations = HashMap::new();
+        let mut row = 0u64;
+        while let Some(line) = lines.next_line().await? {
+            row += 1;
+            parse_kma_vcf_line(&line, &mut mutations)
+                .map_err(|e| anyhow!("{} row {}: {}", path.display(), row, e))?;
+        }
+        Ok::<_, anyhow::Error>(mutations)
+    }.await;
+    // On parse/read failure, close stdout and terminate/reap the producer.
+    if parse_result.is_err() {
+        let _ = child.kill().await;
+    }
+    let status = child.wait().await;
+    let stderr_result = stderr_task.await;
+    let mutations = parse_result?;
+    let status = status?;
+    stderr_result.map_err(|e| anyhow!("KMA VCF pigz stderr task panicked: {}", e))??;
+    if !status.success() {
+        return Err(anyhow!("KMA VCF pigz failed for {}: {}", path.display(), status));
+    }
+    Ok(mutations)
+}
+
+async fn read_kma_sidecars(config: Arc<RunConfig>, prefix: &std::path::Path) -> anyhow::Result<KmaSidecars> {
+    let read_depth = read_kma_res(&kma_sidecar_path(prefix, ".res")).await?;
+    let consensus_dna = read_kma_fsa(&kma_sidecar_path(prefix, ".fsa")).await?;
+    let mutations = read_kma_vcf(config, kma_sidecar_path(prefix, ".vcf.gz")).await?;
+    info!(
+        "[AMR] KMA sidecars parsed: res_references={} fsa_references={} vcf_references={} mutation_records={}",
+        read_depth.len(), consensus_dna.len(), mutations.len(),
+        mutations.values().map(Vec::len).sum::<usize>()
+    );
+    Ok(KmaSidecars { read_depth, consensus_dna, mutations })
 }
 
 pub async fn run(
@@ -3207,11 +3349,70 @@ pub async fn run(
         .map_err(PipelineError::Other)?;
 
 
+    // KMA has completed successfully; shared scratch still owns all sidecars.
+    // Keep these maps in memory for subsequent allele-summary construction.
+    let kma_sidecars = read_kma_sidecars(config.clone(), &kma_output_prefix)
+        .await.map_err(PipelineError::Other)?;
+    let missing_depth = rgi_read_counts.keys()
+        .filter(|r| !kma_sidecars.read_depth.contains_key(*r)).count();
+    let missing_consensus = rgi_read_counts.keys()
+        .filter(|r| !kma_sidecars.consensus_dna.contains_key(*r)).count();
+    info!(
+        "[AMR] KMA sidecar mapped-reference check: mapped_references={} missing_depth={} missing_consensus={} mutation_references={}",
+        rgi_read_counts.len(), missing_depth, missing_consensus, kma_sidecars.mutations.len()
+    );
+    // Missing per-reference evidence is not fatal here: BWT.py handles it
+    // during summary construction. No depth suppression is applied yet.
+
     preparation_task.await
         .map_err(|e| PipelineError::Other(anyhow!(
             "AMR input preparation task panicked: {}", e
         )))??;
 
-    info!("Finished AMR processing through shared genomecov evidence collection.");
+    info!("Finished AMR processing through shared genomecov and KMA sidecar evidence collection.");
     Ok(())
 }
+
+
+
+
+#[cfg(test)]
+mod kma_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn res_preserves_depth_text_and_last_duplicate() {
+        let mut depths = HashMap::new();
+        parse_kma_res_line("#Template\tignored", &mut depths).unwrap();
+        parse_kma_res_line("ref\t1\t2\t3\t4\t5\t6\t7\t 0.50 \t9", &mut depths).unwrap();
+        assert_eq!(depths["ref"], "0.50");
+        parse_kma_res_line("ref\t1\t2\t3\t4\t5\t6\t7\t5.00", &mut depths).unwrap();
+        assert_eq!(depths["ref"], "5.00");
+        assert!(parse_kma_res_line("bad", &mut depths).is_err());
+    }
+
+    #[test]
+    fn vcf_preserves_order_duplicates_and_unfiltered_alt() {
+        let mut mutations = HashMap::new();
+        parse_kma_vcf_line("##fileformat=VCFv4.2", &mut mutations).unwrap();
+        for _ in 0..2 {
+            parse_kma_vcf_line("ref\t 12 \t.\t A \t C,G \t0\tFAIL", &mut mutations).unwrap();
+        }
+        parse_kma_vcf_line("ref\t13\t.\tT\t.", &mut mutations).unwrap();
+        assert_eq!(mutations["ref"], vec!["A12C,G", "A12C,G", "T13."]);
+        assert!(parse_kma_vcf_line("bad", &mut mutations).is_err());
+    }
+
+    #[tokio::test]
+    async fn fsa_multiline_case_gaps_and_duplicate_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.fsa");
+        tokio::fs::write(&path, b">ref description\nAc g\nT\t-N\n>empty\n").await.unwrap();
+        let sequences = read_kma_fsa(&path).await.unwrap();
+        assert_eq!(sequences["ref"], "AcgT-N");
+        assert_eq!(sequences["empty"], "");
+        tokio::fs::write(&path, b">ref one\nA\n>ref two\nC\n").await.unwrap();
+        assert!(read_kma_fsa(&path).await.is_err());
+    }
+}
+
