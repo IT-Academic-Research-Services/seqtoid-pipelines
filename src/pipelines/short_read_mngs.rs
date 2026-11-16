@@ -2635,9 +2635,6 @@ async fn dedup(
                 let worker_tx =
                     &worker_txs[i % num_workers];
 
-                if (i + 1) % 50_000 == 0 {
-                    info!("[STALLTRACE] dedup distributor about_to_send pair={} worker={}", i + 1, i % num_workers);
-                }
                 worker_tx
                     .send(ParseOutput::Fastq(r1))
                     .await
@@ -2659,11 +2656,7 @@ async fn dedup(
                     })?;
 
                 i += 1;
-                if i % 50_000 == 0 {
-                    info!("[STALLTRACE] dedup distributor sent pairs={}", i);
-                }
             }
-            info!("[STALLTRACE] dedup distributor input EOF pairs={}", i);
         } else {
             while let Some(item) = stream.next().await {
                 let worker_tx =
@@ -2680,15 +2673,10 @@ async fn dedup(
                     })?;
 
                 i += 1;
-                if i % 100_000 == 0 {
-                    info!("[STALLTRACE] dedup distributor sent records={}", i);
-                }
             }
-            info!("[STALLTRACE] dedup distributor input EOF records={}", i);
         }
 
         // Input is exhausted. Close every worker input channel.
-        info!("[STALLTRACE] dedup distributor closing worker inputs units={}", i);
         drop(worker_txs);
 
         // -------------------------------------------------------------
@@ -2698,7 +2686,6 @@ async fn dedup(
         // from dedup() and the caller has installed its consumer.
         // -------------------------------------------------------------
 
-        info!("[STALLTRACE] dedup distributor joining workers");
         for handle in worker_handles {
             handle
                 .await
@@ -2711,7 +2698,6 @@ async fn dedup(
                 .context("Dedup worker error")?;
         }
 
-        info!("[STALLTRACE] dedup workers all joined");
 
         // All worker-owned csv_tx clones are gone now. Drop the
         // coordinator's original sender so clusters.csv receives EOF.

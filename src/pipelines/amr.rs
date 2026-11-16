@@ -212,11 +212,7 @@ async fn run_redup(
 
             records_by_part[part_index].push(record);
             record_index += 1;
-            if record_index % 100_000 == 0 {
-                info!("[STALLTRACE] RunRedup pre_dedup consumed records={}", record_index);
-            }
         }
-        info!("[STALLTRACE] RunRedup pre_dedup EOF records={}", record_index);
 
         if paired && record_index % 2 != 0 {
             return Err(anyhow!(
@@ -255,9 +251,6 @@ async fn run_redup(
                 seq: record.seq(),
             };
 
-            if (record_index + 1) % 100_000 == 0 {
-                info!("[STALLTRACE] RunRedup subsampled about_to_send records={} part={}", record_index + 1, part_index + 1);
-            }
             output_txs[part_index]
                 .send(ParseOutput::Fasta(fasta))
                 .await
@@ -269,11 +262,7 @@ async fn run_redup(
                 })?;
 
             record_index += 1;
-            if record_index % 100_000 == 0 {
-                info!("[STALLTRACE] RunRedup subsampled sent records={}", record_index);
-            }
         }
-        info!("[STALLTRACE] RunRedup subsampled EOF records={}", record_index);
 
         if paired && record_index % 2 != 0 {
             return Err(anyhow!(
@@ -1352,14 +1341,7 @@ pub async fn run(
             let mut unused_non_host_r1 = non_host_r1;
 
             cleanup_tasks.push(tokio::spawn(async move {
-                let mut n = 0usize;
-                while unused_non_host_r1.next().await.is_some() {
-                    n += 1;
-                    if n % 100_000 == 0 {
-                        info!("[STALLTRACE] non_host_r1 drain records={}", n);
-                    }
-                }
-                info!("[STALLTRACE] non_host_r1 drain EOF records={}", n);
+                while unused_non_host_r1.next().await.is_some() {}
                 Ok::<(), anyhow::Error>(())
             }));
 
@@ -1367,14 +1349,7 @@ pub async fn run(
 
             if let Some(mut unused_non_host_r2) = non_host_r2 {
                 cleanup_tasks.push(tokio::spawn(async move {
-                    let mut n = 0usize;
-                    while unused_non_host_r2.next().await.is_some() {
-                        n += 1;
-                        if n % 100_000 == 0 {
-                            info!("[STALLTRACE] non_host_r2 drain records={}", n);
-                        }
-                    }
-                    info!("[STALLTRACE] non_host_r2 drain EOF records={}", n);
+                    while unused_non_host_r2.next().await.is_some() {}
                     Ok::<(), anyhow::Error>(())
                 }));
             }
