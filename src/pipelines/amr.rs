@@ -14,10 +14,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tokio::fs::File as TokioFile;
 
 use crate::config::defs::{ClusterInfo, PairingMode, PipelineError, RunConfig, StreamDataType,
-                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG, PIGZ_TAG,
+                          SPADES_TAG, KMA_TAG, SAMTOOLS_TAG, BAMTOOLS_TAG, BEDTOOLS_TAG,
                           BedtoolsSubcommand, SamtoolsSubcommand, BamtoolsSubcommand};
 use crate::pipelines::short_read_mngs::{
     kallisto_results,
@@ -28,13 +27,11 @@ use crate::utils::command::kma::KmaConfig;
 use crate::utils::command::samtools::SamtoolsConfig;
 use crate::utils::command::bamtools::BamtoolsConfig;
 use crate::utils::command::bedtools::BedtoolsConfig;
-use crate::utils::command::pigz::PigzConfig;
 use crate::utils::command::spades::SpadesConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{choose_temp_dir, resolve_existing_input_path, validate_file_inputs, write_count_file, write_byte_stream_to_file};
 use crate::utils::sambam::parse_sam_record;
-use crate::utils::sequence::translate_rgi_kma_consensus;
 use crate::utils::streams::{
     bytes_to_lines,
     fanout_to_channels,
@@ -42,7 +39,6 @@ use crate::utils::streams::{
     join_with_error_handling,
     parse_bytes,
     parse_child_output,
-    parse_fasta,
     spawn_cmd,
     stream_to_file,
     stream_to_cmd,
@@ -134,13 +130,6 @@ struct KmaSamResults {
     invalid_alignment_records: u64,
 }
 
-#[derive(Debug)]
-struct KmaSidecarResults {
-    mutations: HashMap<String, Vec<String>>,
-    read_depth: HashMap<String, String>,
-    consensus_sequences: HashMap<String, String>,
-}
-
 #[derive(Debug, Clone)]
 struct RgiReadCounts {
     reference_length: u64,
@@ -159,357 +148,7 @@ struct RgiAlignment {
     mrnm: String,
 }
 
-#[derive(Debug, Clone)]
-struct RgiCoverage {
-    reference_length: u64,
-    covered_bases: u64,
-    uncovered_bases: u64,
-}
-
-#[derive(Debug, Clone)]
-struct CardModel {
-    model_id: String,
-    aro_accession: String,
-    model_name: String,
-    model_type: String,
-
-    /// RGI:
-    ///
-    ///     category_aro_class_name -> [category_aro_name, ...]
-    ///
-    /// Examples of class names used downstream include:
-    ///
-    ///     AMR Gene Family
-    ///     Drug Class
-    ///     Resistance Mechanism
-    categories: HashMap<String, Vec<String>>,
-
-    /// Unique genus/species-level taxonomy labels.
-    ///
-    /// RGI reduces every NCBI_taxonomy_name to its first two
-    /// whitespace-separated components.
-    taxon: Vec<String>,
-}
-
-#[derive(Debug)]
-struct CardModels {
-    /// Equivalent to BWT.py `models`.
-    by_model_id: HashMap<String, CardModel>,
-
-    /// Equivalent to BWT.py `models_by_accession`.
-    by_aro_accession: HashMap<String, CardModel>,
-}
-
-#[derive(Debug, Clone)]
-struct RgiAlleleSummary {
-    id: String,
-    cvterm_name: String,
-    aro_accession: String,
-    model_type: String,
-    database: String,
-    reference_allele_source: String,
-    observed_in_genomes: String,
-    observed_in_plasmids: String,
-    observed_in_pathogens: Vec<String>,
-    range_of_reference_allele_source: f64,
-    reads: RgiReadCounts,
-    alignments: Vec<RgiAlignment>,
-    mapq_average: String,
-    mate_pair: Vec<String>,
-    percent_coverage_covered: String,
-    percent_coverage_uncovered: String,
-    length_coverage_covered: String,
-    length_coverage_uncovered: String,
-    reference_sequence_length: String,
-    resistomes: HashMap<String, Vec<String>>,
-    depth: String,
-    snps: String,
-    consensus_sequence_dna: String,
-    consensus_sequence_protein: String,
-}
-
-#[derive(Default)]
-struct RgiGeneMappingSummary {
-    cvterm_name: Vec<String>,
-    model_type: Vec<String>,
-    database: Vec<String>,
-    range_of_reference_allele_source: Vec<f64>,
-    observed_in_genomes: Vec<String>,
-    observed_in_plasmids: Vec<String>,
-    observed_in_pathogens: Vec<String>,
-    mapped: Vec<f64>,
-    unmapped: Vec<f64>,
-    all: Vec<f64>,
-    percent_coverage: Vec<f64>,
-    length_coverage: Vec<f64>,
-    mapq_average: Vec<f64>,
-    number_of_mapped_baits: Vec<String>,
-    number_of_mapped_baits_with_reads: Vec<String>,
-    average_bait_coverage: Vec<String>,
-    bait_coverage_coefficient_of_variation: Vec<String>,
-    mate_pair: Vec<String>,
-    reference_sequence_length: Vec<String>,
-    amr_gene_family: Vec<String>,
-    drug_class: Vec<String>,
-    resistance_mechanism: Vec<String>,
-    allele_count: usize,
-}
-
-/// Load the subset of CARD `card.json` required by RunRgiBwtKma.
-///
-/// This is the native equivalent of BWT.py `get_model_details()`.
-///
-/// RGI loads the complete JSON document, iterates only numeric top-level
-/// entries, and retains:
-///
-///     model_id
-///     ARO_accession
-///     model_name
-///     model_type
-///     ARO_category
-///     model_sequences.sequence[*].NCBI_taxonomy.NCBI_taxonomy_name
-///
-/// Taxonomy names are reduced to their first two whitespace-separated
-/// components and deduplicated.
-///
-/// `card.json` is small enough relative to the AMR pipeline workload that
-/// parsing the complete document with serde_json is preferable to adding
-/// another streaming JSON dependency.
-async fn load_card_models(
-    card_json_path: PathBuf,
-) -> anyhow::Result<CardModels> {
-    // File I/O is asynchronous. serde_json parsing itself is synchronous,
-    // but the CARD JSON is modest (~tens of MiB) and is loaded only once
-    // per AMR run.
-    let json_bytes = tokio::fs::read(&card_json_path)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to read CARD model database {}: {}",
-                card_json_path.display(),
-                e
-            )
-        })?;
-
-    let root: serde_json::Value =
-        serde_json::from_slice(&json_bytes)
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to parse CARD model database {}: {}",
-                    card_json_path.display(),
-                    e
-                )
-            })?;
-
-    let root_object = root
-        .as_object()
-        .ok_or_else(|| {
-            anyhow!(
-                "CARD model database {} has a non-object JSON root",
-                card_json_path.display()
-            )
-        })?;
-
-    let mut by_model_id =
-        HashMap::<String, CardModel>::new();
-
-    let mut by_aro_accession =
-        HashMap::<String, CardModel>::new();
-
-    for (top_level_key, model_value) in root_object {
-        // Match Python:
-        //
-        //     for i in data:
-        //         if i.isdigit():
-        //
-        // CARD also contains non-model top-level metadata, which RGI
-        // deliberately ignores.
-        if top_level_key.is_empty()
-            || !top_level_key.bytes().all(|b| b.is_ascii_digit())
-        {
-            continue;
-        }
-
-        let model = model_value
-            .as_object()
-            .ok_or_else(|| {
-                anyhow!(
-                    "CARD model entry '{}' in {} is not a JSON object",
-                    top_level_key,
-                    card_json_path.display()
-                )
-            })?;
-
-        let required_string =
-            |field: &str| -> anyhow::Result<String> {
-                model
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "CARD model entry '{}' in {} is missing \
-                             string field '{}'",
-                            top_level_key,
-                            card_json_path.display(),
-                            field
-                        )
-                    })
-            };
-
-        let model_id =
-            required_string("model_id")?;
-
-        let aro_accession =
-            required_string("ARO_accession")?;
-
-        let model_name =
-            required_string("model_name")?;
-
-        let model_type =
-            required_string("model_type")?;
-
-        // ------------------------------------------------------------
-        // ARO categories
-        //
-        // Python:
-        //
-        //   categories[class_name] = [category_name, ...]
-        //
-        // with duplicate category names suppressed within each class.
-        // ------------------------------------------------------------
-
-        let mut categories =
-            HashMap::<String, Vec<String>>::new();
-
-        if let Some(category_object) =
-            model
-                .get("ARO_category")
-                .and_then(serde_json::Value::as_object)
-        {
-            for category_value in category_object.values() {
-                let Some(category) =
-                    category_value.as_object()
-                else {
-                    continue;
-                };
-
-                let Some(class_name) = category
-                    .get("category_aro_class_name")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-
-                let Some(category_name) = category
-                    .get("category_aro_name")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-
-                let names =
-                    categories
-                        .entry(class_name.to_string())
-                        .or_default();
-
-                if !names.iter().any(|name| name == category_name) {
-                    names.push(category_name.to_string());
-                }
-            }
-        }
-
-        // ------------------------------------------------------------
-        // Model taxonomy
-        //
-        // Python:
-        //
-        //   for item in
-        //       data[i]["model_sequences"]["sequence"]:
-        //
-        //       taxonomy_name =
-        //           ...["NCBI_taxonomy"]["NCBI_taxonomy_name"]
-        //
-        //       taxa = " ".join(taxonomy_name.split()[:2])
-        //
-        // Preserve first-seen order while suppressing duplicates, just
-        // as the Python list implementation does.
-        // ------------------------------------------------------------
-
-        let mut taxon =
-            Vec::<String>::new();
-
-        if let Some(sequence_object) = model
-            .get("model_sequences")
-            .and_then(|value| value.get("sequence"))
-            .and_then(serde_json::Value::as_object)
-        {
-            for sequence_value in sequence_object.values() {
-                let Some(taxonomy_name) = sequence_value
-                    .get("NCBI_taxonomy")
-                    .and_then(|value| {
-                        value.get("NCBI_taxonomy_name")
-                    })
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-
-                let taxa = taxonomy_name
-                    .split_whitespace()
-                    .take(2)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                if !taxa.is_empty()
-                    && !taxon.iter().any(|existing| existing == &taxa)
-                {
-                    taxon.push(taxa);
-                }
-            }
-        }
-
-        let card_model = CardModel {
-            model_id: model_id.clone(),
-            aro_accession: aro_accession.clone(),
-            model_name,
-            model_type,
-            categories,
-            taxon,
-        };
-
-        // Match the two dictionaries produced by get_model_details().
-        //
-        // Clone here is intentional. CARD contains only a few thousand
-        // models and this keeps downstream lookups simple. If desired,
-        // these can later become Arc<CardModel> without changing parsing
-        // semantics.
-        by_model_id.insert(
-            model_id,
-            card_model.clone(),
-        );
-
-        by_aro_accession.insert(
-            aro_accession,
-            card_model,
-        );
-    }
-
-    info!(
-        "[AMR] CARD models loaded from {}: \
-         models={}, accessions={}",
-        card_json_path.display(),
-        by_model_id.len(),
-        by_aro_accession.len(),
-    );
-
-    Ok(CardModels {
-        by_model_id,
-        by_aro_accession,
-    })
-}
-
-/// Native equivalent of the WDL RunRedup task with a materialized pre-dedup replay boundary.
+/// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
 ///   1. `subsampled_reads` form the prefix of each `redups_N.fa`.
@@ -525,8 +164,7 @@ async fn load_card_models(
 /// reproduced here.
 async fn run_redup(
     config: Arc<RunConfig>,
-    pre_dedup_files: Vec<PathBuf>,
-    pre_dedup_materialization: Option<JoinHandle<Result<(), anyhow::Error>>>,
+    mut host_filtered_stream: ReceiverStream<ParseOutput>,
     mut subsampled_stream: ReceiverStream<ParseOutput>,
     paired: bool,
     duplicate_clusters_task: JoinHandle<
@@ -534,14 +172,6 @@ async fn run_redup(
     >,
 ) -> Result<RunRedupHandle, PipelineError> {
     let part_count = if paired { 2 } else { 1 };
-
-    if pre_dedup_files.len() != part_count {
-        return Err(PipelineError::InvalidConfig(format!(
-            "RunRedup expected {} pre-dedup FASTQ file(s), got {}",
-            part_count,
-            pre_dedup_files.len()
-        )));
-    }
 
     let mut output_streams = Vec::with_capacity(part_count);
     let mut output_txs = Vec::with_capacity(part_count);
@@ -553,6 +183,50 @@ async fn run_redup(
         output_txs.push(tx);
         output_streams.push(ReceiverStream::new(rx));
     }
+
+    // Drain the pre-dedup stream immediately. It is upstream of dedup and
+    // therefore cannot be left unread while dedup/subsampling finalize.
+    //
+    // Keep records separated by end so duplicate members can later be
+    // appended to the corresponding redups_N.fa output.
+    let host_buffer_task = tokio::spawn(async move {
+        let mut records_by_part =
+            (0..part_count)
+                .map(|_| Vec::<SequenceRecord>::new())
+                .collect::<Vec<_>>();
+
+        let mut record_index = 0usize;
+
+        while let Some(item) = host_filtered_stream.next().await {
+            let ParseOutput::Fastq(record) = item else {
+                return Err(anyhow!(
+                    "RunRedup expected FASTQ on interleaved host-filtered stream"
+                ));
+            };
+
+            let part_index = if paired {
+                record_index % 2
+            } else {
+                0
+            };
+
+            records_by_part[part_index].push(record);
+            record_index += 1;
+            if record_index % 100_000 == 0 {
+                info!("[STALLTRACE] RunRedup pre_dedup consumed records={}", record_index);
+            }
+        }
+        info!("[STALLTRACE] RunRedup pre_dedup EOF records={}", record_index);
+
+        if paired && record_index % 2 != 0 {
+            return Err(anyhow!(
+                "RunRedup received incomplete paired pre-dedup stream: {} records",
+                record_index
+            ));
+        }
+
+        Ok::<Vec<Vec<SequenceRecord>>, anyhow::Error>(records_by_part)
+    });
 
     // Forward the complete subsampled input immediately as FASTA while
     // recording which deduplicated representatives survived subsampling.
@@ -581,6 +255,9 @@ async fn run_redup(
                 seq: record.seq(),
             };
 
+            if (record_index + 1) % 100_000 == 0 {
+                info!("[STALLTRACE] RunRedup subsampled about_to_send records={} part={}", record_index + 1, part_index + 1);
+            }
             output_txs[part_index]
                 .send(ParseOutput::Fasta(fasta))
                 .await
@@ -592,7 +269,11 @@ async fn run_redup(
                 })?;
 
             record_index += 1;
+            if record_index % 100_000 == 0 {
+                info!("[STALLTRACE] RunRedup subsampled sent records={}", record_index);
+            }
         }
+        info!("[STALLTRACE] RunRedup subsampled EOF records={}", record_index);
 
         if paired && record_index % 2 != 0 {
             return Err(anyhow!(
@@ -601,19 +282,14 @@ async fn run_redup(
             ));
         }
 
-        Ok::<_, anyhow::Error>((passed_representatives, output_txs))
+        Ok::<_, anyhow::Error>((
+            passed_representatives,
+            output_txs,
+        ))
     });
 
-    let completion_config = config.clone();
     let completion_task = tokio::spawn(async move {
-        // The pre-dedup materializer is installed inside run_host_filter before
-        // this task is created, so it drains the retained fanout concurrently
-        // with dedup/subsampling. Wait for the hard file boundary before replay.
-        if let Some(task) = pre_dedup_materialization {
-            task.await
-                .map_err(|e| anyhow!("RunRedup pre-dedup materialization task panicked: {}", e))??;
-        }
-
+        // Both live inputs already have consumers installed above.
         let duplicate_clusters = duplicate_clusters_task
             .await
             .map_err(|e| {
@@ -625,9 +301,18 @@ async fn run_redup(
 
         let (passed_representatives, output_txs) = prefix_task
             .await
-            .map_err(|e| anyhow!("RunRedup prefix task panicked: {}", e))??;
+            .map_err(|e| {
+                anyhow!("RunRedup prefix task panicked: {}", e)
+            })??;
 
-        let mut duplicate_member_ids = HashSet::<String>::new();
+        let host_records_by_part = host_buffer_task
+            .await
+            .map_err(|e| {
+                anyhow!("RunRedup host-buffer task panicked: {}", e)
+            })??;
+
+        let mut duplicate_member_ids =
+            HashSet::<String>::new();
 
         for entry in duplicate_clusters.iter() {
             let rep_id = entry.key();
@@ -646,40 +331,13 @@ async fn run_redup(
             }
         }
 
-        // The cluster map is no longer needed once the selected member IDs are
-        // known. Drop it before the potentially large FASTQ replay.
-        drop(duplicate_clusters);
-        drop(passed_representatives);
-
-        info!(
-            "[AMR] RunRedup replaying {} materialized pre-dedup FASTQ file(s) for {} duplicate members",
-            pre_dedup_files.len(),
-            duplicate_member_ids.len()
-        );
-
-        for (part_index, path) in pre_dedup_files.into_iter().enumerate() {
-            let (mut host_stream, reader_task) = fastq_file_to_record_stream(
-                path.clone(),
-                completion_config.clone(),
-                &format!("amr_redup_pre_dedup_part_{}", part_index + 1),
-            )
-                .await
-                .map_err(|e| anyhow!("RunRedup failed opening {}: {}", path.display(), e))?;
-
+        for (part_index, host_records) in
+            host_records_by_part.into_iter().enumerate()
+        {
             let tx = &output_txs[part_index];
-            let mut scanned = 0u64;
-            let mut appended = 0u64;
 
-            while let Some(item) = host_stream.next().await {
-                let ParseOutput::Fastq(record) = item else {
-                    return Err(anyhow!(
-                        "RunRedup expected FASTQ while replaying {}",
-                        path.display()
-                    ));
-                };
-
-                scanned += 1;
-
+            // Preserve original pre-dedup order within each end.
+            for record in host_records {
                 if !duplicate_member_ids.contains(record.id()) {
                     continue;
                 }
@@ -698,24 +356,7 @@ async fn run_redup(
                             part_index + 1
                         )
                     })?;
-
-                appended += 1;
             }
-
-            reader_task
-                .await
-                .map_err(|e| anyhow!(
-                    "RunRedup FASTQ reader task panicked for {}: {}",
-                    path.display(), e
-                ))??;
-
-            info!(
-                "[AMR] RunRedup replay part {} complete: scanned={}, appended={}, path={}",
-                part_index + 1,
-                scanned,
-                appended,
-                path.display()
-            );
         }
 
         Ok::<(), anyhow::Error>(())
@@ -1386,287 +1027,6 @@ async fn run_kma_amr(
     })
 }
 
-async fn consume_kma_sidecars(
-    config: Arc<RunConfig>,
-    output_prefix: PathBuf,
-) -> anyhow::Result<KmaSidecarResults> {
-    let res_path =
-        PathBuf::from(format!("{}.res", output_prefix.display()));
-
-    let fsa_path =
-        PathBuf::from(format!("{}.fsa", output_prefix.display()));
-
-    let vcf_path =
-        PathBuf::from(format!("{}.vcf.gz", output_prefix.display()));
-
-    // ================================================================
-    // KMA .res
-    //
-    // RGI retains:
-    //
-    //   column 1 -> template/reference
-    //   column 9 -> depth
-    //
-    // Preserve depth as text because downstream RGI-compatible report
-    // generation consumes the textual value rather than performing
-    // arithmetic on it here.
-    // ================================================================
-
-    let res_text = tokio::fs::read_to_string(&res_path)
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "Failed to read KMA .res {}: {}",
-                res_path.display(),
-                e
-            )
-        })?;
-
-    let mut read_depth =
-        HashMap::<String, String>::new();
-
-    for (line_no, line) in res_text.lines().enumerate() {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let fields: Vec<&str> =
-            line.split('\t').collect();
-
-        if fields.len() < 9 {
-            return Err(anyhow!(
-                "Malformed KMA .res line {} in {}: \
-                 expected >=9 tab-separated fields, got {}",
-                line_no + 1,
-                res_path.display(),
-                fields.len()
-            ));
-        }
-
-        read_depth.insert(
-            fields[0].to_string(),
-            fields[8].to_string(),
-        );
-    }
-
-    // ================================================================
-    // KMA .fsa
-    //
-    // KMA writes its consensus sequences as FASTA. Open the completed
-    // sidecar asynchronously and feed it through the pipeline's structured
-    // FASTA parser.
-    //
-    // Retain:
-    //
-    //     reference -> consensus sequence
-    // ================================================================
-
-    let fsa_file = TokioFile::open(&fsa_path)
-        .await
-        .map_err(|e| {
-            anyhow!(
-            "Failed to open KMA .fsa {}: {}",
-            fsa_path.display(),
-            e
-        )
-        })?;
-
-    let fsa_rx = parse_fasta(
-        fsa_file,
-        &config,
-        StreamDataType::JustBytes,
-    )
-        .await
-        .map_err(|e| {
-            anyhow!(
-        "Failed to parse KMA .fsa {}: {}",
-        fsa_path.display(),
-        e
-    )
-        })?;
-
-    let mut fsa_stream = ReceiverStream::new(fsa_rx);
-
-    let mut consensus_sequences =
-        HashMap::<String, String>::new();
-
-    while let Some(item) = fsa_stream.next().await {
-        let ParseOutput::Fasta(record) = item else {
-            return Err(anyhow!(
-            "KMA .fsa parser produced unexpected output for {}: {:?}",
-            fsa_path.display(),
-            item
-        ));
-        };
-
-        let reference = record.id().to_string();
-
-        let sequence =
-            String::from_utf8(record.seq().to_vec())
-                .map_err(|e| {
-                    anyhow!(
-                    "KMA .fsa sequence for {} is not UTF-8: {}",
-                    reference,
-                    e
-                )
-                })?;
-
-        consensus_sequences.insert(
-            reference,
-            sequence,
-        );
-    }
-
-    // ================================================================
-    // KMA .vcf.gz
-    //
-    // Decompress exactly once:
-    //
-    //     .vcf.gz
-    //        |
-    //        v
-    //     pigz -d -c
-    //        |
-    //        v
-    //     ParseMode::Lines
-    //        |
-    //        v
-    //     ParseOutput::Bytes(one complete VCF line)
-    //
-    // parse_lines() already removes trailing LF and CR, so the Bytes
-    // variant received below contains the complete logical line without
-    // its line ending.
-    //
-    // RGI-compatible mutation representation:
-    //
-    //     REF + POS + ALT
-    //
-    // e.g.
-    //
-    //     A173G
-    // ================================================================
-
-    let pigz_config =
-        PigzConfig::decompress_stdout(vcf_path.clone());
-
-    let pigz_args = generate_cli(
-        PIGZ_TAG,
-        &config,
-        Some(&pigz_config),
-    )?;
-
-    let (
-        mut pigz_child,
-        pigz_stderr_task,
-    ) = spawn_cmd(
-        config.clone(),
-        PIGZ_TAG,
-        pigz_args,
-        config.args.verbose,
-        None,
-    )
-        .await?;
-
-    let mut vcf_rx = parse_child_output(
-        &mut pigz_child,
-        ChildStream::Stdout,
-        ParseMode::Lines,
-        &config,
-    )
-        .await?;
-
-    let mut mutations =
-        HashMap::<String, Vec<String>>::new();
-
-    while let Some(item) = vcf_rx.recv().await {
-        let ParseOutput::Bytes(line_bytes) = item else {
-            return Err(anyhow!(
-                "KMA VCF decompressor produced unexpected \
-                 non-byte ParseOutput"
-            ));
-        };
-
-        let line =
-            std::str::from_utf8(&line_bytes)
-                .map_err(|e| {
-                    anyhow!(
-                        "KMA VCF {} contains non-UTF8 data: {}",
-                        vcf_path.display(),
-                        e
-                    )
-                })?;
-
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let fields: Vec<&str> =
-            line.split('\t').collect();
-
-        if fields.len() < 5 {
-            return Err(anyhow!(
-                "Malformed KMA VCF record in {}: \
-                 expected >=5 tab-separated fields: {}",
-                vcf_path.display(),
-                line
-            ));
-        }
-
-        let chrom = fields[0];
-        let pos = fields[1];
-        let reference = fields[3];
-        let alternate = fields[4];
-
-        mutations
-            .entry(chrom.to_string())
-            .or_default()
-            .push(format!(
-                "{}{}{}",
-                reference,
-                pos,
-                alternate
-            ));
-    }
-
-    // parse_child_output() takes ownership of stdout, so reaching EOF on
-    // vcf_rx means pigz has closed stdout. Reap the process and stderr
-    // task explicitly and propagate any decompression failure.
-
-    let pigz_status =
-        pigz_child.wait().await?;
-
-    pigz_stderr_task
-        .await
-        .map_err(|e| {
-            anyhow!(
-                "KMA VCF pigz stderr task panicked: {}",
-                e
-            )
-        })??;
-
-    if !pigz_status.success() {
-        return Err(anyhow!(
-            "pigz failed decompressing {} with status {}",
-            vcf_path.display(),
-            pigz_status
-        ));
-    }
-
-    info!(
-        "[AMR] KMA sidecars parsed: \
-         depths={}, consensus={}, mutation_refs={}",
-        read_depth.len(),
-        consensus_sequences.len(),
-        mutations.len()
-    );
-
-    Ok(KmaSidecarResults {
-        mutations,
-        read_depth,
-        consensus_sequences,
-    })
-}
-
 fn parse_kma_sq_header(line: &str) -> anyhow::Result<Option<KmaReference>> {
     if !line.starts_with("@SQ\t") {
         return Ok(None);
@@ -1859,862 +1219,6 @@ fn parse_rgi_alignment(line: &str) -> anyhow::Result<RgiAlignment> {
     })
 }
 
-fn resolve_card_model<'a>(
-    card_models: &'a CardModels,
-    alignment_hit: &str,
-) -> anyhow::Result<&'a CardModel> {
-    let fields: Vec<&str> = alignment_hit.split('|').collect();
-
-    // Match BWT.py get_model_id():
-    //
-    //   if alignment_hit[0:22] == "Prevalence_Sequence_ID"
-    //      or alignment_hit[0:4] == "ARO:":
-    //
-    //       model_id = alignment_hit.split("|")[1].split(":")[1]
-    //
-    if alignment_hit.starts_with("Prevalence_Sequence_ID")
-        || alignment_hit.starts_with("ARO:")
-    {
-        let model_field = fields.get(1).ok_or_else(|| {
-            anyhow!(
-                "CARD reference '{}' is missing the model-id field",
-                alignment_hit
-            )
-        })?;
-
-        let model_id = model_field
-            .split_once(':')
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "CARD reference '{}' has malformed model-id field '{}'",
-                    alignment_hit,
-                    model_field
-                )
-            })?;
-
-        return card_models
-            .by_model_id
-            .get(model_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "CARD reference '{}' resolved model id '{}' \
-                     but that model is absent from card.json",
-                    alignment_hit,
-                    model_id
-                )
-            });
-    }
-
-    // Match BWT.py fallback:
-    //
-    //   accession =
-    //       alignment_hit.split("|")[4].split(":")[1]
-    //
-    //   model_id =
-    //       models_by_accession[accession]["model_id"]
-    //
-    let accession_field = fields.get(4).ok_or_else(|| {
-        anyhow!(
-            "CARD reference '{}' is missing the ARO accession field",
-            alignment_hit
-        )
-    })?;
-
-    let aro_accession = accession_field
-        .split_once(':')
-        .map(|(_, value)| value)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "CARD reference '{}' has malformed ARO accession field '{}'",
-                alignment_hit,
-                accession_field
-            )
-        })?;
-
-    card_models
-        .by_aro_accession
-        .get(aro_accession)
-        .ok_or_else(|| {
-            anyhow!(
-                "CARD reference '{}' resolved ARO accession '{}' \
-                 but that accession is absent from card.json",
-                alignment_hit,
-                aro_accession
-            )
-        })
-}
-
-fn build_rgi_allele_summaries(
-    card_models: &CardModels,
-    read_counts: &HashMap<String, RgiReadCounts>,
-    alignments: &HashMap<String, Vec<RgiAlignment>>,
-    coverage: &HashMap<String, RgiCoverage>,
-    sidecars: &KmaSidecarResults,
-) -> anyhow::Result<Vec<RgiAlleleSummary>> {
-    let mut summaries = Vec::with_capacity(read_counts.len());
-
-    for (alignment_hit, reads) in read_counts {
-        let model = resolve_card_model(card_models, alignment_hit)?;
-
-        let hit_alignments = alignments
-            .get(alignment_hit)
-            .cloned()
-            .unwrap_or_default();
-
-        let mapq_average = if hit_alignments.is_empty() {
-            0.0
-        } else {
-            hit_alignments
-                .iter()
-                .map(|alignment| alignment.mapq as f64)
-                .sum::<f64>()
-                / hit_alignments.len() as f64
-        };
-
-        // Match BWT.py summary(): retain unique RNEXT/MRNM values when the
-        // mate maps to a different reference, excluding linkage back to the
-        // current ARO accession.
-        let current_aro = format!("ARO:{}", model.aro_accession);
-        let mut mate_pair = Vec::<String>::new();
-        for alignment in &hit_alignments {
-            if alignment.mrnm != "="
-                && !alignment.mrnm.contains(&current_aro)
-                && !mate_pair.iter().any(|mate| mate == &alignment.mrnm)
-            {
-                mate_pair.push(alignment.mrnm.clone());
-            }
-        }
-
-        let hit_coverage = coverage.get(alignment_hit).ok_or_else(|| {
-            anyhow!(
-                "RunRgiBwtKma missing genomecov result for mapped reference '{}'",
-                alignment_hit
-            )
-        })?;
-
-        if hit_coverage.reference_length == 0 {
-            return Err(anyhow!(
-                "RunRgiBwtKma genomecov reported zero reference length for '{}'",
-                alignment_hit
-            ));
-        }
-
-        if reads.reference_length != hit_coverage.reference_length {
-            return Err(anyhow!(
-                "RunRgiBwtKma reference length mismatch for '{}': idxstats={}, genomecov={}",
-                alignment_hit,
-                reads.reference_length,
-                hit_coverage.reference_length
-            ));
-        }
-
-        let percent_covered =
-            hit_coverage.covered_bases as f64 / hit_coverage.reference_length as f64 * 100.0;
-        let percent_uncovered =
-            hit_coverage.uncovered_bases as f64 / hit_coverage.reference_length as f64 * 100.0;
-
-        let mut resistomes = model.categories.clone();
-        resistomes
-            .entry("AMR Gene Family".to_string())
-            .or_default();
-        resistomes
-            .entry("Drug Class".to_string())
-            .or_default();
-        resistomes
-            .entry("Resistance Mechanism".to_string())
-            .or_default();
-
-        // Canonical CARD branch of BWT.py summary(). The current WDL invokes
-        // `rgi bwt -a kma` without WildCARD or bait reporting.
-        let depth = sidecars
-            .read_depth
-            .get(alignment_hit)
-            .cloned()
-            .unwrap_or_default();
-
-        let mut snps = sidecars
-            .mutations
-            .get(alignment_hit)
-            .map(|items| items.join("; "))
-            .unwrap_or_default();
-
-        let mut consensus_sequence_dna = sidecars
-            .consensus_sequences
-            .get(alignment_hit)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "RunRgiBwtKma missing KMA consensus sequence for mapped reference '{}'",
-                    alignment_hit
-                )
-            })?;
-
-        // Match BWT.py: table 11, first with CDS validation and then with
-        // ordinary codon translation as the fallback. Terminal partial codons
-        // are padded with N only for translation and removed from the protein.
-        let mut consensus_sequence_protein =
-            translate_rgi_kma_consensus(&consensus_sequence_dna).map_err(|e| {
-                anyhow!(
-                    "RunRgiBwtKma failed translating KMA consensus for '{}': {}",
-                    alignment_hit,
-                    e
-                )
-            })?;
-
-        // Match BWT.py summary(): retain the allele and depth at any KMA depth,
-        // but suppress SNP and consensus reporting when depth is below 5.
-        // Python uses float(read_coverage_depth.strip() or 0), so an absent or
-        // whitespace-only depth is treated as 0.0.
-        let depth_value = if depth.trim().is_empty() {
-            0.0
-        } else {
-            depth.trim().parse::<f64>().map_err(|e| {
-                anyhow!(
-                    "RunRgiBwtKma invalid KMA depth {:?} for '{}': {}",
-                    depth,
-                    alignment_hit,
-                    e
-                )
-            })?
-        };
-
-        if depth_value < 5.0 {
-            snps.clear();
-            consensus_sequence_dna.clear();
-            consensus_sequence_protein.clear();
-        }
-
-        summaries.push(RgiAlleleSummary {
-            id: alignment_hit.clone(),
-            cvterm_name: model.model_name.clone(),
-            aro_accession: model.aro_accession.clone(),
-            model_type: model.model_type.clone(),
-            database: "CARD".to_string(),
-            reference_allele_source: "CARD curation".to_string(),
-            observed_in_genomes: "no data".to_string(),
-            observed_in_plasmids: "no data".to_string(),
-            observed_in_pathogens: model.taxon.clone(),
-            range_of_reference_allele_source: 100.0,
-            reads: reads.clone(),
-            alignments: hit_alignments,
-            mapq_average: format!("{:.2}", mapq_average),
-            mate_pair,
-            percent_coverage_covered: format!("{:.2}", percent_covered),
-            percent_coverage_uncovered: format!("{:.2}", percent_uncovered),
-            length_coverage_covered: hit_coverage.covered_bases.to_string(),
-            length_coverage_uncovered: hit_coverage.uncovered_bases.to_string(),
-            reference_sequence_length: hit_coverage.reference_length.to_string(),
-            resistomes,
-            depth,
-            snps,
-            consensus_sequence_dna,
-            consensus_sequence_protein,
-        });
-    }
-
-    Ok(summaries)
-}
-
-/// Serialize the native allele summaries in the exact object shape emitted by
-/// RGI BWT.py `summary()`, then write the same top-level JSON array produced by
-/// `json.dumps(summary, sort_keys=True)`.
-///
-/// serde_json::Map is a BTreeMap unless the `preserve_order` feature is enabled,
-/// so object keys serialize lexicographically, matching Python `sort_keys=True`.
-async fn write_rgi_allele_mapping_json(
-    out_dir: &std::path::Path,
-    summaries: &[RgiAlleleSummary],
-) -> anyhow::Result<PathBuf> {
-    let mut output = Vec::<serde_json::Value>::with_capacity(summaries.len());
-
-    for summary in summaries {
-        let alignments = summary
-            .alignments
-            .iter()
-            .map(|alignment| {
-                serde_json::json!({
-                    "qname": alignment.qname,
-                    "flag": alignment.flag.to_string(),
-                    "rname": alignment.rname,
-                    "pos": alignment.pos.to_string(),
-                    "mapq": alignment.mapq.to_string(),
-                    "mrnm": alignment.mrnm,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        // Match BWT.py summary() exactly. Values originating from idxstats and
-        // samtools-view preload files remain strings in RGI's JSON, while the
-        // CARD identity value remains numeric.
-        output.push(serde_json::json!({
-            "id": summary.id,
-            "cvterm_name": summary.cvterm_name,
-            "aro_accession": summary.aro_accession,
-            "model_type": summary.model_type,
-            "database": summary.database,
-            "reference_allele_source": summary.reference_allele_source,
-            "observed_in_genomes": summary.observed_in_genomes,
-            "observed_in_plasmids": summary.observed_in_plasmids,
-            "observed_in_pathogens": summary.observed_in_pathogens,
-            "range_of_reference_allele_source": summary.range_of_reference_allele_source,
-            "reads": {
-                "mapped": summary.reads.mapped.to_string(),
-                "unmapped": summary.reads.unmapped.to_string(),
-                "all": summary.reads.all.to_string(),
-            },
-            "alignments": alignments,
-            "mapq_average": summary.mapq_average,
-            "number_of_mapped_baits": 0,
-            "number_of_mapped_baits_with_reads": 0,
-            "average_bait_coverage": 0,
-            "bait_coverage_coefficient_of_variation": 0,
-            "mate_pair": summary.mate_pair,
-            "percent_coverage": {
-                "covered": summary.percent_coverage_covered,
-                "uncovered": summary.percent_coverage_uncovered,
-            },
-            "length_coverage": {
-                "covered": summary.length_coverage_covered,
-                "uncovered": summary.length_coverage_uncovered,
-            },
-            "reference": {
-                "sequence_length": summary.reference_sequence_length,
-            },
-            "mutation": "N/A",
-            "resistomes": summary.resistomes,
-            "predicted_pathogen": "N/A",
-            "depth": summary.depth,
-            "snps": summary.snps,
-            "consensus_sequence_dna": summary.consensus_sequence_dna,
-            "consensus_sequence_protein": summary.consensus_sequence_protein,
-        }));
-    }
-
-    let path = out_dir.join("sr_amr_report.allele_mapping_data.json");
-    let bytes = serde_json::to_vec(&output)?;
-
-    tokio::fs::write(&path, bytes)
-        .await
-        .map_err(|e| anyhow!("Failed to write RGI allele mapping JSON {}: {}", path.display(), e))?;
-
-    info!(
-        "[AMR] RunRgiBwtKma allele mapping JSON written: {} ({} summaries)",
-        path.display(),
-        summaries.len()
-    );
-
-    Ok(path)
-}
-
-/// Write the tab-delimited allele report emitted by RGI BWT.py `get_summary()`.
-///
-/// Python uses csv.writer(delimiter='\\t', dialect='excel'), which produces
-/// CRLF record terminators and quotes fields only when required. The values
-/// below mirror the exact column order and joining/sorting rules in BWT.py.
-async fn write_rgi_allele_mapping_tab(
-    out_dir: &std::path::Path,
-    summaries: &[RgiAlleleSummary],
-) -> anyhow::Result<PathBuf> {
-    fn csv_field(value: &str) -> String {
-        if value.contains(['\t', '\r', '\n', '"']) {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn sorted_join(values: &[String]) -> String {
-        let mut values = values.to_vec();
-        values.sort_by(|a, b| {
-            a.to_lowercase()
-                .cmp(&b.to_lowercase())
-                .then_with(|| a.cmp(b))
-        });
-        values.join("; ")
-    }
-
-    fn resistome_values<'a>(
-        summary: &'a RgiAlleleSummary,
-        key: &str,
-    ) -> &'a [String] {
-        summary
-            .resistomes
-            .get(key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-
-    const HEADER: [&str; 24] = [
-        "Reference Sequence",
-        "ARO Term",
-        "ARO Accession",
-        "Reference Model Type",
-        "Reference DB",
-        "Reference Allele Source",
-        "Resistomes & Variants: Observed in Genome(s)",
-        "Resistomes & Variants: Observed in Plasmid(s)",
-        "Resistomes & Variants: Observed Pathogen(s)",
-        "Completely Mapped Reads",
-        "Mapped Reads with Flanking Sequence",
-        "All Mapped Reads",
-        "Percent Coverage",
-        "Length Coverage (bp)",
-        "Average MAPQ (Completely Mapped Reads)",
-        "Mate Pair Linkage",
-        "Reference Length",
-        "AMR Gene Family",
-        "Drug Class",
-        "Resistance Mechanism",
-        "Depth",
-        "SNPs",
-        "Consensus Sequence DNA",
-        "Consensus Sequence Protein",
-    ];
-
-    let mut output = String::new();
-    output.push_str(&HEADER.join("\t"));
-    output.push_str("\r\n");
-
-    for summary in summaries {
-        let row = [
-            summary.id.clone(),
-            summary.cvterm_name.clone(),
-            summary.aro_accession.clone(),
-            summary.model_type.clone(),
-            summary.database.clone(),
-            summary.reference_allele_source.clone(),
-            summary.observed_in_genomes.clone(),
-            summary.observed_in_plasmids.clone(),
-            summary.observed_in_pathogens.join("; "),
-            summary.reads.mapped.to_string(),
-            summary.reads.unmapped.to_string(),
-            summary.reads.all.to_string(),
-            summary.percent_coverage_covered.clone(),
-            summary.length_coverage_covered.clone(),
-            summary.mapq_average.clone(),
-            summary.mate_pair.join("; "),
-            summary.reference_sequence_length.clone(),
-            sorted_join(resistome_values(summary, "AMR Gene Family")),
-            sorted_join(resistome_values(summary, "Drug Class")),
-            sorted_join(resistome_values(summary, "Resistance Mechanism")),
-            summary.depth.clone(),
-            summary.snps.clone(),
-            summary.consensus_sequence_dna.clone(),
-            summary.consensus_sequence_protein.clone(),
-        ];
-
-        output.push_str(
-            &row.iter()
-                .map(|value| csv_field(value))
-                .collect::<Vec<_>>()
-                .join("\t"),
-        );
-        output.push_str("\r\n");
-    }
-
-    let path = out_dir.join("sr_amr_report.allele_mapping_data.txt");
-    tokio::fs::write(&path, output.as_bytes())
-        .await
-        .map_err(|e| anyhow!(
-            "Failed to write RGI allele mapping tab report {}: {}",
-            path.display(),
-            e
-        ))?;
-
-    info!(
-        "[AMR] RunRgiBwtKma allele mapping tab report written: {} ({} summaries)",
-        path.display(),
-        summaries.len()
-    );
-
-    Ok(path)
-}
-
-
-/// Native equivalent of the gene-level half of BWT.py `get_summary()`.
-/// Groups allele summaries by ARO accession and emits the exact 26-column
-/// `sr_amr_report.gene_mapping_data.txt` report used by RGI.
-/// Write the two durable mapping-statistics artifacts required by the
-/// RunRgiBwtKma WDL output contract.
-///
-/// Match RGI BWT.py `get_stats()` directly against the already-materialized
-/// final BAM:
-///
-///   bamtools stats -in <bam> > sr_amr_report.overall_mapping_stats.txt
-///   samtools flagstat <bam>   >> sr_amr_report.artifacts_mapping_stats.txt
-///
-/// The artifacts report starts with the exact four-line RGI header. No RGI
-/// temporary BAMs or Python scratch files are recreated.
-async fn write_rgi_mapping_stats(
-    config: Arc<RunConfig>,
-    bam_path: &std::path::Path,
-) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let overall_path = config
-        .out_dir
-        .join("sr_amr_report.overall_mapping_stats.txt");
-    let artifacts_path = config
-        .out_dir
-        .join("sr_amr_report.artifacts_mapping_stats.txt");
-
-    // RGI: bamtools stats -in <final BAM> > overall_mapping_stats.txt
-    let bamtools_args = vec![
-        "stats".to_string(),
-        "-in".to_string(),
-        bam_path.to_string_lossy().to_string(),
-    ];
-
-    info!(
-        "[AMR] RunRgiBwtKma bamtools stats args: {:?}",
-        bamtools_args
-    );
-
-    let (mut bamtools_child, bamtools_stderr_task) = spawn_cmd(
-        config.clone(),
-        BAMTOOLS_TAG,
-        bamtools_args,
-        config.args.verbose,
-        None,
-    )
-        .await?;
-
-    let bamtools_stdout = parse_child_output(
-        &mut bamtools_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        &config,
-    )
-        .await?;
-
-    let overall_write_task = tokio::spawn(stream_to_file(
-        bamtools_stdout,
-        overall_path.clone(),
-    ));
-
-    let bamtools_status = bamtools_child.wait().await?;
-
-    overall_write_task
-        .await
-        .map_err(|e| anyhow!("bamtools stats output writer panicked: {}", e))??;
-
-    bamtools_stderr_task
-        .await
-        .map_err(|e| anyhow!("bamtools stats stderr task panicked: {}", e))??;
-
-    if !bamtools_status.success() {
-        return Err(anyhow!(
-            "bamtools stats failed with exit status {}",
-            bamtools_status
-        ));
-    }
-
-    // RGI writes this header before appending samtools flagstat stdout.
-    const ARTIFACTS_HEADER: &str =
-        "**********************************************\nStats for Artifacts: \n**********************************************\n\n";
-
-    tokio::fs::write(&artifacts_path, ARTIFACTS_HEADER.as_bytes())
-        .await
-        .map_err(|e| anyhow!(
-            "Failed to write RGI artifacts mapping stats header {}: {}",
-            artifacts_path.display(),
-            e
-        ))?;
-
-    // RGI: samtools flagstat <final BAM> >> artifacts_mapping_stats.txt
-    // SamtoolsSubcommand currently has no Flagstat variant, so invoke the
-    // command through the existing generic process runner rather than adding
-    // a fake translation through another subcommand.
-    let flagstat_args = vec![
-        "flagstat".to_string(),
-        bam_path.to_string_lossy().to_string(),
-    ];
-
-    info!(
-        "[AMR] RunRgiBwtKma samtools flagstat args: {:?}",
-        flagstat_args
-    );
-
-    let (mut flagstat_child, flagstat_stderr_task) = spawn_cmd(
-        config.clone(),
-        SAMTOOLS_TAG,
-        flagstat_args,
-        config.args.verbose,
-        None,
-    )
-        .await?;
-
-    let mut flagstat_stdout = parse_child_output(
-        &mut flagstat_child,
-        ChildStream::Stdout,
-        ParseMode::Bytes,
-        &config,
-    )
-        .await?;
-
-    let mut flagstat_bytes = Vec::<u8>::new();
-    while let Some(item) = flagstat_stdout.recv().await {
-        let ParseOutput::Bytes(bytes) = item else {
-            return Err(anyhow!(
-                "samtools flagstat produced unexpected non-byte output"
-            ));
-        };
-        flagstat_bytes.extend_from_slice(&bytes);
-    }
-
-    let flagstat_status = flagstat_child.wait().await?;
-
-    flagstat_stderr_task
-        .await
-        .map_err(|e| anyhow!("samtools flagstat stderr task panicked: {}", e))??;
-
-    if !flagstat_status.success() {
-        return Err(anyhow!(
-            "samtools flagstat failed with exit status {}",
-            flagstat_status
-        ));
-    }
-
-    use tokio::io::AsyncWriteExt;
-    let mut artifacts_file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(&artifacts_path)
-        .await?;
-    artifacts_file.write_all(&flagstat_bytes).await?;
-    artifacts_file.flush().await?;
-
-    info!(
-        "[AMR] RunRgiBwtKma mapping statistics ready: overall={}, artifacts={}",
-        overall_path.display(),
-        artifacts_path.display()
-    );
-
-    Ok((overall_path, artifacts_path))
-}
-
-
-async fn write_rgi_gene_mapping_tab(
-    out_dir: &std::path::Path,
-    summaries: &[RgiAlleleSummary],
-) -> anyhow::Result<PathBuf> {
-    fn csv_field(value: &str) -> String {
-        if value.contains(['\t', '\r', '\n', '"']) {
-            format!("\"{}\"", value.replace('"', "\"\""))
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn push_unique(values: &mut Vec<String>, value: &str) {
-        if !values.iter().any(|existing| existing == value) {
-            values.push(value.to_string());
-        }
-    }
-
-    fn sorted_join(values: &[String]) -> String {
-        let mut values = values.to_vec();
-        values.sort_by(|a, b| {
-            a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))
-        });
-        values.join("; ")
-    }
-
-    fn resistome_values<'a>(summary: &'a RgiAlleleSummary, key: &str) -> &'a [String] {
-        summary.resistomes.get(key).map(Vec::as_slice).unwrap_or(&[])
-    }
-
-    fn python_float_string(value: f64) -> String {
-        if value.fract() == 0.0 {
-            format!("{:.1}", value)
-        } else {
-            value.to_string()
-        }
-    }
-
-    fn mate_gene_name(mate: &str) -> Option<String> {
-        if mate == "*" {
-            return None;
-        }
-        let parts = mate.split('|').collect::<Vec<_>>();
-        match parts.len() {
-            4 => parts.get(2)
-                .and_then(|part| part.split_once(':').map(|(_, value)| value.to_string())),
-            7 => parts.get(5).map(|value| (*value).to_string()),
-            _ => None,
-        }
-    }
-
-    const HEADER: [&str; 26] = [
-        "ARO Term",
-        "ARO Accession",
-        "Reference Model Type",
-        "Reference DB",
-        "Alleles with Mapped Reads",
-        "Reference Allele(s) Identity to CARD Reference Protein (%)",
-        "Resistomes & Variants: Observed in Genome(s)",
-        "Resistomes & Variants: Observed in Plasmid(s)",
-        "Resistomes & Variants: Observed Pathogen(s)",
-        "Completely Mapped Reads",
-        "Mapped Reads with Flanking Sequence",
-        "All Mapped Reads",
-        "Average Percent Coverage",
-        "Average Length Coverage (bp)",
-        "Average MAPQ (Completely Mapped Reads)",
-        "Number of Mapped Baits",
-        "Number of Mapped Baits with Reads",
-        "Average Number of reads per Bait",
-        "Number of reads per Bait Coefficient of Variation (%)",
-        "Number of reads mapping to baits and mapping to complete gene",
-        "Number of reads mapping to baits and mapping to complete gene (%)",
-        "Mate Pair Linkage (# reads)",
-        "Reference Length",
-        "AMR Gene Family",
-        "Drug Class",
-        "Resistance Mechanism",
-    ];
-
-    let header = HEADER.to_vec();
-
-    let mut mapping = HashMap::<String, RgiGeneMappingSummary>::new();
-    let mut aro_order = Vec::<String>::new();
-
-    for summary in summaries {
-        let first = !mapping.contains_key(&summary.aro_accession);
-        if first {
-            aro_order.push(summary.aro_accession.clone());
-        }
-        let gene = mapping.entry(summary.aro_accession.clone()).or_default();
-        gene.allele_count += 1;
-
-        if first {
-            gene.cvterm_name.push(summary.cvterm_name.clone());
-            gene.model_type.push(summary.model_type.clone());
-            gene.database.push(summary.database.clone());
-            gene.observed_in_genomes.push(summary.observed_in_genomes.clone());
-            gene.observed_in_plasmids.push(summary.observed_in_plasmids.clone());
-            gene.observed_in_pathogens.extend(summary.observed_in_pathogens.iter().cloned());
-            gene.amr_gene_family.extend(resistome_values(summary, "AMR Gene Family").iter().cloned());
-            gene.drug_class.extend(resistome_values(summary, "Drug Class").iter().cloned());
-            gene.resistance_mechanism.extend(resistome_values(summary, "Resistance Mechanism").iter().cloned());
-        } else {
-            push_unique(&mut gene.model_type, &summary.model_type);
-            push_unique(&mut gene.database, &summary.database);
-            push_unique(&mut gene.observed_in_genomes, &summary.observed_in_genomes);
-            push_unique(&mut gene.observed_in_plasmids, &summary.observed_in_plasmids);
-            for value in &summary.observed_in_pathogens { push_unique(&mut gene.observed_in_pathogens, value); }
-            for value in resistome_values(summary, "AMR Gene Family") { push_unique(&mut gene.amr_gene_family, value); }
-            for value in resistome_values(summary, "Drug Class") { push_unique(&mut gene.drug_class, value); }
-            for value in resistome_values(summary, "Resistance Mechanism") { push_unique(&mut gene.resistance_mechanism, value); }
-        }
-
-        gene.range_of_reference_allele_source.push(summary.range_of_reference_allele_source);
-        gene.mapped.push(summary.reads.mapped as f64);
-        gene.unmapped.push(summary.reads.unmapped as f64);
-        gene.all.push(summary.reads.all as f64);
-        gene.percent_coverage.push(summary.percent_coverage_covered.parse::<f64>()?);
-        gene.length_coverage.push(summary.length_coverage_covered.parse::<f64>()?);
-        gene.mapq_average.push(summary.mapq_average.parse::<f64>()?);
-        gene.reference_sequence_length.push(summary.reference_sequence_length.clone());
-        gene.number_of_mapped_baits.push("0".to_string());
-        gene.number_of_mapped_baits_with_reads.push("0".to_string());
-        gene.average_bait_coverage.push("0".to_string());
-        gene.bait_coverage_coefficient_of_variation.push("0".to_string());
-        for mate in &summary.mate_pair {
-            if let Some(name) = mate_gene_name(mate) { gene.mate_pair.push(name); }
-        }
-    }
-
-    let mut output = String::new();
-    output.push_str(&header.join("\t"));
-    output.push_str("\r\n");
-
-    for aro in aro_order {
-        let gene = mapping.get(&aro).expect("ARO insertion order out of sync");
-        // Match include_other_models=False in the WDL/RGI invocation.
-        if !gene.model_type.iter().any(|value| value == "protein homolog model") {
-            continue;
-        }
-
-        let observed_in_genomes = if gene.observed_in_genomes.iter().any(|v| v == "YES") {
-            "YES"
-        } else if gene.observed_in_genomes.iter().any(|v| v == "no data") {
-            "no data"
-        } else { "NO" };
-        let observed_in_plasmids = if gene.observed_in_plasmids.iter().any(|v| v == "YES") {
-            "YES"
-        } else if gene.observed_in_plasmids.iter().any(|v| v == "no data") {
-            "no data"
-        } else { "NO" };
-
-        let avg = |values: &[f64]| -> f64 {
-            if values.is_empty() { 0.0 } else { values.iter().sum::<f64>() / values.len() as f64 }
-        };
-
-        let min_identity = gene.range_of_reference_allele_source.iter().copied().fold(f64::INFINITY, f64::min);
-        let max_identity = gene.range_of_reference_allele_source.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let identity_range = if min_identity == 0.0 && max_identity > 0.0 {
-            python_float_string(max_identity)
-        } else if min_identity > 0.0 && max_identity > min_identity {
-            format!("{} - {}", python_float_string(min_identity), python_float_string(max_identity))
-        } else if min_identity == max_identity && min_identity > 0.0 {
-            python_float_string(max_identity)
-        } else { String::new() };
-
-        let mut mate_counts = HashMap::<String, usize>::new();
-        let mut mate_order = Vec::<String>::new();
-        for mate in &gene.mate_pair {
-            if !mate_counts.contains_key(mate) { mate_order.push(mate.clone()); }
-            *mate_counts.entry(mate.clone()).or_insert(0) += 1;
-        }
-        let current_aro_underscored = aro.replace(' ', "_");
-        let mate_pairs = mate_order.into_iter()
-            .filter(|mate| mate != &current_aro_underscored && !gene.cvterm_name.iter().any(|name| name == mate))
-            .map(|mate| format!("{} ({})", mate, mate_counts[&mate]))
-            .collect::<Vec<_>>()
-            .join("; ");
-
-        let row = vec![
-            gene.cvterm_name.join("; "),
-            aro.clone(),
-            gene.model_type.join("; "),
-            gene.database.join("; "),
-            gene.allele_count.to_string(),
-            identity_range,
-            observed_in_genomes.to_string(),
-            observed_in_plasmids.to_string(),
-            gene.observed_in_pathogens.join("; "),
-            format!("{:.2}", gene.mapped.iter().sum::<f64>()),
-            format!("{:.2}", gene.unmapped.iter().sum::<f64>()),
-            format!("{:.2}", gene.all.iter().sum::<f64>()),
-            format!("{:.2}", avg(&gene.percent_coverage)),
-            format!("{:.2}", avg(&gene.length_coverage)),
-            format!("{:.2}", avg(&gene.mapq_average)),
-            gene.number_of_mapped_baits.last().cloned().unwrap_or_else(|| "0".to_string()),
-            gene.number_of_mapped_baits_with_reads.last().cloned().unwrap_or_else(|| "0".to_string()),
-            gene.average_bait_coverage.last().cloned().unwrap_or_else(|| "0".to_string()),
-            gene.bait_coverage_coefficient_of_variation.last().cloned().unwrap_or_else(|| "0".to_string()),
-            "N/A".to_string(),
-            "N/A".to_string(),
-            mate_pairs,
-            gene.reference_sequence_length.join("; "),
-            sorted_join(&gene.amr_gene_family),
-            sorted_join(&gene.drug_class),
-            sorted_join(&gene.resistance_mechanism),
-        ];
-
-        output.push_str(&row.iter().map(|v| csv_field(v)).collect::<Vec<_>>().join("\t"));
-        output.push_str("\r\n");
-    }
-
-    let path = out_dir.join("sr_amr_report.gene_mapping_data.txt");
-    tokio::fs::write(&path, output.as_bytes()).await.map_err(|e| anyhow!(
-        "Failed to write RGI gene mapping tab report {}: {}", path.display(), e
-    ))?;
-    info!("[AMR] RunRgiBwtKma gene mapping tab report written: {}", path.display());
-    Ok(path)
-}
-
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
@@ -2748,30 +1252,6 @@ pub async fn run(
                 .await?;
 
             let paired = file2_path.is_some();
-
-            // Resolve and load CARD model metadata for native RunRgiBwtKma reporting.
-            let card_json_arg = config
-                .args
-                .amr_card_json
-                .as_deref()
-                .ok_or_else(|| {
-                    PipelineError::InvalidConfig(
-                        "--amr-card-json is required for the AMR pipeline".to_string(),
-                    )
-                })?;
-
-            let card_json_path =
-                resolve_existing_input_path(card_json_arg, &cwd, true)?;
-
-            let card_models = load_card_models(card_json_path)
-                .await
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] CARD metadata ready: models={}, accessions={}",
-                card_models.by_model_id.len(),
-                card_models.by_aro_accession.len(),
-            );
 
             let mut final_temp_dirs: Vec<TempDir> = Vec::new();
 
@@ -2843,7 +1323,7 @@ pub async fn run(
             //
             // Raw AMR consumes:
             //
-            //   * pre_dedup_files + pre_dedup_materialization
+            //   * pre_dedup_interleaved
             //   * subsampled_interleaved
             //   * duplicate_clusters
             //
@@ -2859,8 +1339,7 @@ pub async fn run(
                 non_host_r2,
                 subsampled_interleaved,
                 duplicate_clusters,
-                pre_dedup_files,
-                pre_dedup_materialization,
+                pre_dedup_interleaved,
             } = outputs;
 
             // ------------------------------------------------------------
@@ -2873,8 +1352,14 @@ pub async fn run(
             let mut unused_non_host_r1 = non_host_r1;
 
             cleanup_tasks.push(tokio::spawn(async move {
-                while unused_non_host_r1.next().await.is_some() {}
-
+                let mut n = 0usize;
+                while unused_non_host_r1.next().await.is_some() {
+                    n += 1;
+                    if n % 100_000 == 0 {
+                        info!("[STALLTRACE] non_host_r1 drain records={}", n);
+                    }
+                }
+                info!("[STALLTRACE] non_host_r1 drain EOF records={}", n);
                 Ok::<(), anyhow::Error>(())
             }));
 
@@ -2882,8 +1367,14 @@ pub async fn run(
 
             if let Some(mut unused_non_host_r2) = non_host_r2 {
                 cleanup_tasks.push(tokio::spawn(async move {
-                    while unused_non_host_r2.next().await.is_some() {}
-
+                    let mut n = 0usize;
+                    while unused_non_host_r2.next().await.is_some() {
+                        n += 1;
+                        if n % 100_000 == 0 {
+                            info!("[STALLTRACE] non_host_r2 drain records={}", n);
+                        }
+                    }
+                    info!("[STALLTRACE] non_host_r2 drain EOF records={}", n);
                     Ok::<(), anyhow::Error>(())
                 }));
             }
@@ -2892,17 +1383,10 @@ pub async fn run(
             // Validate and take the AMR-specific retained streams.
             // ------------------------------------------------------------
 
-            let pre_dedup_files =
-                pre_dedup_files.ok_or_else(|| {
+            let pre_dedup_stream =
+                pre_dedup_interleaved.ok_or_else(|| {
                     PipelineError::Other(anyhow!(
-                        "AMR raw RunRedup missing materialized pre-dedup FASTQ paths"
-                    ))
-                })?;
-
-            let pre_dedup_materialization =
-                pre_dedup_materialization.ok_or_else(|| {
-                    PipelineError::Other(anyhow!(
-                        "AMR raw RunRedup missing pre-dedup materialization completion task"
+                        "AMR raw RunRedup missing retained interleaved pre-dedup stream"
                     ))
                 })?;
 
@@ -2915,27 +1399,32 @@ pub async fn run(
 
             info!(
                 "[AMR] host-filter streaming outputs ready: \
-                 pre_dedup_files={}, \
+                 pre_dedup_interleaved=true, \
                  subsampled_interleaved=true, \
                  non_host_r1=draining, non_host_r2={}, \
                  duplicate_clusters=pending",
-                pre_dedup_files.len(),
                 has_non_host_r2,
             );
 
             // ------------------------------------------------------------
             // Install RunRedup consumers immediately.
             //
-            // The subsampled representatives remain a live interleaved FASTQ
-            // stream. The exact pre-dedup reads are now replayable FASTQ files.
-            // run_redup() starts consuming the live subsampled stream immediately
-            // and awaits the pre-dedup materialization barrier before file replay.
+            // Both retained streams are structured interleaved FASTQ:
+            //
+            //   pre_dedup_stream
+            //       exact host-filtered records immediately before dedup
+            //
+            //   subsampled_stream
+            //       deduplicated + subsampled representatives
+            //
+            // duplicate_clusters completes only after dedup reaches EOF.
+            // run_redup() installs consumers for both live streams before
+            // awaiting that task.
             // ------------------------------------------------------------
 
             let redup = run_redup(
                 config.clone(),
-                pre_dedup_files,
-                Some(pre_dedup_materialization),
+                pre_dedup_stream,
                 subsampled_stream,
                 paired,
                 duplicate_clusters,
@@ -3021,17 +1510,6 @@ pub async fn run(
             let kma_sam_task = tokio::spawn(
                 consume_kma_sam(kma_sam_stream)
             );
-
-            // KMA sidecars are valid only after KMA exits. Own that synchronization
-            // in a dedicated task so BAM/SPAdes processing remains concurrent.
-            let kma_sidecar_config = config.clone();
-            let kma_sidecar_prefix = kma_output_prefix.clone();
-            let kma_sidecar_task = tokio::spawn(async move {
-                kma_completion_task
-                    .await
-                    .map_err(|e| anyhow!("RunKMA completion task panicked: {}", e))??;
-                consume_kma_sidecars(kma_sidecar_config, kma_sidecar_prefix).await
-            });
 
             // ------------------------------------------------------------
             // Stream raw KMA SAM directly through the same samtools fixmate
@@ -3842,27 +2320,6 @@ pub async fn run(
 );
 
             // ------------------------------------------------------------
-            // WDL-required RGI mapping statistics.
-            //
-            // The final BAM and BAI are complete at this boundary. Generate
-            // the two durable get_stats() artifacts directly from that BAM.
-            // ------------------------------------------------------------
-
-            let (overall_mapping_stats_path, artifacts_mapping_stats_path) =
-                write_rgi_mapping_stats(
-                    config.clone(),
-                    &sorted_bam_path,
-                )
-                    .await
-                    .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma WDL mapping stats ready: overall={}, artifacts={}",
-                overall_mapping_stats_path.display(),
-                artifacts_mapping_stats_path.display(),
-            );
-
-            // ------------------------------------------------------------
             // Pull per-reference alignment counts with samtools idxstats.
             //
             // RGI materializes this stdout as sr_amr_report.temp.txt and
@@ -4022,42 +2479,6 @@ pub async fn run(
                 rgi_read_counts.len()
             );
 
-            // ------------------------------------------------------------
-            // WDL-required RGI per-reference mapping statistics.
-            //
-            // BWT.py get_reads_count() writes this artifact from the same
-            // idxstats rows retained above (mapped > 0). Therefore the exact
-            // RGI count is simply the number of entries in rgi_read_counts;
-            // no temporary sr_amr_report.temp.txt boundary is required.
-            // ------------------------------------------------------------
-
-            let reference_mapping_stats_path =
-                out_dir.join("sr_amr_report.reference_mapping_stats.txt");
-
-            let reference_mapping_stats = format!(
-                "**********************************************\nStats for Reference: \n**********************************************\n\nhow many reference terms (or ARO terms): {}\n\n",
-                rgi_read_counts.len(),
-            );
-
-            tokio::fs::write(
-                &reference_mapping_stats_path,
-                reference_mapping_stats.as_bytes(),
-            )
-                .await
-                .map_err(|e| {
-                    PipelineError::IOError(format!(
-                        "Failed to write {}: {}",
-                        reference_mapping_stats_path.display(),
-                        e
-                    ))
-                })?;
-
-            info!(
-                "[AMR] RunRgiBwtKma reference mapping stats ready: {} ({} mapped references)",
-                reference_mapping_stats_path.display(),
-                rgi_read_counts.len(),
-            );
-
             for (reference, counts) in &rgi_read_counts {
                 info!(
                     "[AMR] RGI idxstats: reference={} length={} mapped={} unmapped={} all={}",
@@ -4069,22 +2490,6 @@ pub async fn run(
                 );
             }
 
-            for reference in rgi_read_counts.keys() {
-                let model =
-                    resolve_card_model(&card_models, reference)
-                        .map_err(PipelineError::Other)?;
-
-                info!(
-                    "[AMR] CARD reference resolved: \
-                     reference={} model_id={} aro_accession={} \
-                     model_name={} model_type={}",
-                    reference,
-                    model.model_id,
-                    model.aro_accession,
-                    model.model_name,
-                    model.model_type,
-                    );
-            }
 
 
             // ------------------------------------------------------------
@@ -4318,239 +2723,9 @@ pub async fn run(
                     .await
                     .map_err(PipelineError::Other)?;
 
-            // RGI reduces the default genomecov histogram with:
-            //
-            //   awk '$2 > 0' | cut -f1,3,4,5
-            //
-            // and get_coverage_details() sums column 3 (bases at each positive
-            // depth) per reference. Reproduce that reduction directly in memory.
-            // `genome` rows are whole-input aggregates, not reference reports.
-            let mut rgi_coverage = HashMap::<String, RgiCoverage>::new();
 
-            while let Some(item) = genomecov_rx.recv().await {
-                let ParseOutput::Bytes(line_bytes) = item else {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma bedtools genomecov expected line-oriented Bytes output"
-                    )));
-                };
 
-                let line = std::str::from_utf8(&line_bytes).map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma bedtools genomecov emitted non-UTF8 output: {}",
-                        e
-                    ))
-                })?;
 
-                if line.is_empty() {
-                    continue;
-                }
-
-                let fields: Vec<&str> = line.split('\t').collect();
-                if fields.len() != 5 {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma bedtools genomecov expected 5 tab-separated fields, got {}: {}",
-                        fields.len(),
-                        line
-                    )));
-                }
-
-                let reference = fields[0];
-                if reference == "genome" {
-                    continue;
-                }
-
-                let depth = fields[1].parse::<u64>().map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma invalid genomecov depth '{}' for reference '{}': {}",
-                        fields[1], reference, e
-                    ))
-                })?;
-
-                // Match RGI's `awk '$2 > 0'` exactly.
-                if depth == 0 {
-                    continue;
-                }
-
-                let bases_at_depth = fields[2].parse::<u64>().map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma invalid genomecov base count '{}' for reference '{}': {}",
-                        fields[2], reference, e
-                    ))
-                })?;
-
-                let reference_length = fields[3].parse::<u64>().map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma invalid genomecov reference length '{}' for reference '{}': {}",
-                        fields[3], reference, e
-                    ))
-                })?;
-
-                let coverage = rgi_coverage
-                    .entry(reference.to_string())
-                    .or_insert(RgiCoverage {
-                        reference_length,
-                        covered_bases: 0,
-                        uncovered_bases: 0,
-                    });
-
-                if coverage.reference_length != reference_length {
-                    return Err(PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma inconsistent genomecov reference length for '{}': {} then {}",
-                        reference, coverage.reference_length, reference_length
-                    )));
-                }
-
-                coverage.covered_bases = coverage
-                    .covered_bases
-                    .checked_add(bases_at_depth)
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma genomecov covered-base count overflow for '{}'",
-                            reference
-                        ))
-                    })?;
-            }
-
-            // stdout is drained, so bedtools can now be reaped safely.
-            let genomecov_status = genomecov_child.wait().await.map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma bedtools genomecov wait failed: {}",
-                    e
-                ))
-            })?;
-
-            genomecov_stderr_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunRgiBwtKma bedtools genomecov stderr task panicked: {}",
-                        e
-                    ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            if !genomecov_status.success() {
-                return Err(PipelineError::Other(anyhow!(
-                    "RunRgiBwtKma bedtools genomecov failed with exit status {}",
-                    genomecov_status
-                )));
-            }
-
-            for (reference, coverage) in rgi_coverage.iter_mut() {
-                coverage.uncovered_bases = coverage
-                    .reference_length
-                    .checked_sub(coverage.covered_bases)
-                    .ok_or_else(|| {
-                        PipelineError::Other(anyhow!(
-                            "RunRgiBwtKma genomecov covered bases exceed reference length for '{}': covered={}, length={}",
-                            reference, coverage.covered_bases, coverage.reference_length
-                        ))
-                    })?;
-            }
-
-            info!(
-                "[AMR] RunRgiBwtKma genomecov parsed: {} references with positive-depth coverage",
-                rgi_coverage.len()
-            );
-
-            for (reference, coverage) in &rgi_coverage {
-                info!(
-                    "[AMR] RGI coverage: reference={} length={} covered={} uncovered={}",
-                    reference,
-                    coverage.reference_length,
-                    coverage.covered_bases,
-                    coverage.uncovered_bases
-                );
-            }
-
-            // All inputs consumed by BWT.py summary() are now available. The
-            // sidecar task has been running concurrently since KMA launch; await it
-            // here at the report-integration boundary.
-            let kma_sidecars = kma_sidecar_task
-                .await
-                .map_err(|e| {
-                    PipelineError::Other(anyhow!(
-                        "RunKMA sidecar task panicked: {}", e
-                    ))
-                })?
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] KMA sidecar results ready: depths={}, consensus={}, mutation_refs={}",
-                kma_sidecars.read_depth.len(),
-                kma_sidecars.consensus_sequences.len(),
-                kma_sidecars.mutations.len(),
-            );
-
-            let rgi_allele_summaries = build_rgi_allele_summaries(
-                &card_models,
-                &rgi_read_counts,
-                &rgi_alignments,
-                &rgi_coverage,
-                &kma_sidecars,
-            )
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma allele summaries constructed: {}",
-                rgi_allele_summaries.len()
-            );
-
-            let allele_mapping_json_path = write_rgi_allele_mapping_json(
-                &out_dir,
-                &rgi_allele_summaries,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma allele mapping report ready: {}",
-                allele_mapping_json_path.display()
-            );
-
-            let allele_mapping_tab_path = write_rgi_allele_mapping_tab(
-                &out_dir,
-                &rgi_allele_summaries,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma allele mapping tab report ready: {}",
-                allele_mapping_tab_path.display()
-            );
-
-            let gene_mapping_tab_path = write_rgi_gene_mapping_tab(
-                &out_dir,
-                &rgi_allele_summaries,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-            info!(
-                "[AMR] RunRgiBwtKma gene mapping tab report ready: {}",
-                gene_mapping_tab_path.display()
-            );
-
-            for summary in &rgi_allele_summaries {
-                info!(
-                    "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} all={} coverage={}% ({}/{}) mapq={} mates={} depth={} snps_present={} consensus_bp={} protein_aa={}",
-                    summary.id,
-                    summary.cvterm_name,
-                    summary.aro_accession,
-                    summary.reads.mapped,
-                    summary.reads.all,
-                    summary.percent_coverage_covered,
-                    summary.length_coverage_covered,
-                    summary.reference_sequence_length,
-                    summary.mapq_average,
-                    summary.mate_pair.len(),
-                    summary.depth,
-                    !summary.snps.is_empty(),
-                    summary.consensus_sequence_dna.len(),
-                    summary.consensus_sequence_protein.len(),
-                );
-            }
 
             let (
                 validation_stats,
@@ -4742,6 +2917,16 @@ pub async fn run(
 
 
 
+            kma_completion_task
+                .await
+                .map_err(|e| {
+                    PipelineError::Other(anyhow!(
+            "RunKMA completion task panicked: {}",
+            e
+        ))
+                })?
+                .map_err(PipelineError::Other)?;
+
             spades.completion_task
                 .await
                 .map_err(|e| {
@@ -4883,15 +3068,45 @@ pub async fn run(
                 subsampled_r1
             };
 
-            let mut pre_dedup_files = vec![pre_dedup_r1];
-            if let Some(path) = pre_dedup_r2 {
-                pre_dedup_files.push(path);
-            }
+            let (pre_r1, task) =
+                fastq_file_to_record_stream(
+                    pre_dedup_r1,
+                    config.clone(),
+                    "amr_filtered_pre_dedup_r1",
+                )
+                    .await?;
+
+            input_tasks.push(task);
+
+            let pre_dedup_stream = if let Some(path) = pre_dedup_r2 {
+                let (pre_r2, task) =
+                    fastq_file_to_record_stream(
+                        path,
+                        config.clone(),
+                        "amr_filtered_pre_dedup_r2",
+                    )
+                        .await?;
+
+                input_tasks.push(task);
+
+                let (interleaved_rx, interleave_task) =
+                    interleave_fastq_streams(
+                        pre_r1.into_inner(),
+                        pre_r2.into_inner(),
+                        config.base_buffer_size * 4,
+                    )
+                        .await?;
+
+                input_tasks.push(interleave_task);
+
+                ReceiverStream::new(interleaved_rx)
+            } else {
+                pre_r1
+            };
 
             let redup = run_redup(
                 config.clone(),
-                pre_dedup_files,
-                None,
+                pre_dedup_stream,
                 subsampled_stream,
                 paired,
                 load_duplicate_clusters_csv(clusters_path),
