@@ -70,6 +70,8 @@ struct RunRedupHandle {
 
 #[derive(Debug)]
 struct RgiBwtKmaOutputs {
+    /// Owns all returned scratch paths; retain until downstream readers finish.
+    _work_dir: TempDir,
     output_kma: Vec<PathBuf>,
 
     kma_amr_results: PathBuf,
@@ -80,6 +82,153 @@ struct RgiBwtKmaOutputs {
     output_sorted_length_100: PathBuf,
     output_sorted_length_100_bai: PathBuf,
     kma_amr_results_json: PathBuf,
+}
+
+/// WDL RunRgiBwtKma: one RGI invocation, with file-backed scratch outputs.
+///
+/// Inputs are already materialized by RunRedup; do not copy them again.
+/// The returned owner must remain alive through every downstream file reader.
+/// Database installation/loading is deliberately outside this task.
+async fn run_rgi_bwt_kma(
+    config: Arc<RunConfig>,
+    non_host_reads_fa: &[PathBuf],
+) -> Result<RgiBwtKmaOutputs, PipelineError> {
+    if !(1..=2).contains(&non_host_reads_fa.len()) {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRgiBwtKma requires one or two FASTA files; got {}",
+            non_host_reads_fa.len(),
+        )));
+    }
+
+    let mut reads = Vec::with_capacity(non_host_reads_fa.len());
+    let mut input_bytes = 0u64;
+    for path in non_host_reads_fa {
+        let absolute = tokio::fs::canonicalize(path).await.map_err(|e| {
+            PipelineError::IOError(format!("RunRgiBwtKma input {}: {}", path.display(), e))
+        })?;
+        let metadata = tokio::fs::metadata(&absolute).await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        if !metadata.is_file() {
+            return Err(PipelineError::InvalidConfig(format!(
+                "RunRgiBwtKma input is not a regular file: {}", absolute.display(),
+            )));
+        }
+        input_bytes = input_bytes.saturating_add(metadata.len());
+        reads.push(absolute);
+    }
+
+    // SAM/BAM and KMA scratch can exceed the FASTA volume. This is a sizing
+    // estimate, not a disk quota. choose_temp_dir applies its own headroom
+    // check and RAM/NVMe/system-temp fallback policy.
+    let work_dir = crate::utils::file::choose_temp_dir(
+        input_bytes.saturating_mul(4).max(1),
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    ).await?;
+    let work_path = tokio::fs::canonicalize(work_dir.path()).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    let prefix = work_path.join("sr_amr_report");
+    let mut rgi_config = RgiConfig::new(RgiSubcommand::Bwt)
+        .option("-1", reads[0].to_string_lossy().into_owned());
+    if let Some(r2) = reads.get(1) {
+        rgi_config = rgi_config.option("-2", r2.to_string_lossy().into_owned());
+    }
+    // Preserve the WDL flags/defaults; do not silently change aligner or
+    // reference-selection options, or perform database loading here.
+    rgi_config = rgi_config
+        .option("-a", "kma")
+        .option("-o", prefix.to_string_lossy().into_owned())
+        .flag("--clean");
+    let args = generate_cli(RGI_TAG, &config, Some(&rgi_config))?;
+    info!("[RunRgiBwtKma] rgi {:?}; scratch={}", args, work_path.display());
+
+    let (mut child, stderr_task) = spawn_cmd(
+        config.clone(), RGI_TAG, args, config.args.verbose, None,
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: RGI_TAG.to_string(), error: e.to_string(),
+    })?;
+
+    // Drain stdout concurrently with wait and the launcher's stderr reader.
+    // Never wait on a child with an undrained piped stdout.
+    let stdout = child.stdout.take();
+    let drain_stdout = async move {
+        if let Some(mut stdout) = stdout {
+            tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await?;
+        }
+        Ok::<(), std::io::Error>(())
+    };
+    let (status, stdout_result, stderr_result) =
+        tokio::join!(child.wait(), drain_stdout, stderr_task);
+    let status = status.map_err(|e| PipelineError::ToolExecution {
+        tool: RGI_TAG.to_string(), error: format!("RunRgiBwtKma wait failed: {}", e),
+    })?;
+    if !status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!("RunRgiBwtKma exited with {}", status),
+        });
+    }
+    stdout_result.map_err(|e| PipelineError::IOError(e.to_string()))?;
+    stderr_result
+        .map_err(|e| PipelineError::Other(anyhow!("RGI stderr task failed: {}", e)))?
+        .map_err(PipelineError::Other)?;
+
+    let output = |suffix: &str| work_path.join(format!("sr_amr_report.{}", suffix));
+    let required = [
+        output("allele_mapping_data.txt"),
+        output("artifacts_mapping_stats.txt"),
+        output("gene_mapping_data.txt"),
+        output("overall_mapping_stats.txt"),
+        output("reference_mapping_stats.txt"),
+        output("sorted.length_100.bam"),
+        output("sorted.length_100.bam.bai"),
+        output("allele_mapping_data.json"),
+    ];
+    for path in &required {
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            PipelineError::IOError(format!(
+                "RunRgiBwtKma missing/unreadable required output {}: {}", path.display(), e,
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(PipelineError::IOError(format!(
+                "RunRgiBwtKma output is not a regular file: {}", path.display(),
+            )));
+        }
+        // Do not reject zero-length reports: no-hit output is legitimate.
+    }
+
+    // Equivalent to the WDL glob, scoped to this invocation's fresh directory.
+    let mut output_kma = Vec::new();
+    let mut entries = tokio::fs::read_dir(&work_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    while let Some(entry) = entries.next_entry().await
+        .map_err(|e| PipelineError::IOError(e.to_string()))? {
+        if entry.file_name().to_string_lossy().starts_with("sr_amr_report")
+            && entry.file_type().await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?.is_file()
+        {
+            output_kma.push(entry.path());
+        }
+    }
+    output_kma.sort();
+    let [kma_amr_results, artifacts_mapping_stats, gene_mapping_data,
+    overall_mapping_stats, reference_mapping_stats, output_sorted_length_100,
+    output_sorted_length_100_bai, kma_amr_results_json] = required;
+    Ok(RgiBwtKmaOutputs {
+        output_kma,
+        kma_amr_results,
+        artifacts_mapping_stats,
+        gene_mapping_data,
+        overall_mapping_stats,
+        reference_mapping_stats,
+        output_sorted_length_100,
+        output_sorted_length_100_bai,
+        kma_amr_results_json,
+        _work_dir: work_dir,
+    })
 }
 
 /// Native streaming equivalent of the WDL RunRedup task.
@@ -1416,6 +1565,20 @@ pub async fn run(
     prepared.non_host_reads_fa,
     prepared.contigs_fa.display(),
 );
+
+    // Keep this output owner in scope through all downstream RGI consumers.
+    let rgi_bwt_kma = run_rgi_bwt_kma(
+        config.clone(),
+        &prepared.non_host_reads_fa,
+    ).await?;
+    info!(
+        "[AMR] RunRgiBwtKma complete: {} artifacts, allele report={}",
+        rgi_bwt_kma.output_kma.len(),
+        rgi_bwt_kma.kma_amr_results.display(),
+    );
+    // Add downstream tasks above this explicit drop, and await their readers
+    // before releasing the scratch directory. No durable copy is made here.
+    drop(rgi_bwt_kma);
 
     Ok(())
 }
