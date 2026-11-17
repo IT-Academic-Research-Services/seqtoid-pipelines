@@ -303,4 +303,24 @@ pub struct Arguments {
     )]
     pub amr_filtered_contigs: Option<String>,
 
+    /// Root of a prepared local RGI database; must contain localDB/.
+    #[arg(
+        long = "amr-rgi-db",
+        help = "AMR: prepared RGI database root containing localDB/"
+    )]
+    pub amr_rgi_db: Option<String>,
+
+
+    #[arg(
+        long = "amr-kma-db",
+        help = "AMR: KMA CARD reference database prefix"
+    )]
+    pub amr_kma_db: Option<String>,
+
+    #[arg(
+        long = "amr-card-json",
+        help = "AMR: path to the CARD card.json model metadata database"
+    )]
+    pub amr_card_json: Option<String>,
+
 }

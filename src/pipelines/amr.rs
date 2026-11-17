@@ -68,6 +68,86 @@ struct RunRedupHandle {
     completion_task: JoinHandle<Result<(), anyhow::Error>>,
 }
 
+/// Resolve the prepared localDB from the existing native-KMA prefix argument.
+/// The prefix itself need not be a file (KMA appends index suffixes).
+async fn resolve_amr_rgi_root(config: &RunConfig) -> Result<PathBuf, PipelineError> {
+    let prefix = config.args.amr_kma_db.as_deref().ok_or_else(|| {
+        PipelineError::InvalidConfig(
+            "--amr-kma-db is required; expected <root>/localDB/bwt/card_reference/kma".into(),
+        )
+    })?;
+    let prefix = PathBuf::from(prefix);
+    let reference_dir = prefix.parent().ok_or_else(|| {
+        PipelineError::InvalidConfig("Invalid --amr-kma-db prefix".into())
+    })?;
+    let reference_dir = tokio::fs::canonicalize(reference_dir).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "Cannot resolve --amr-kma-db parent {}: {}", reference_dir.display(), e,
+        )))?;
+    let bwt_dir = reference_dir.parent();
+    let local_db = bwt_dir.and_then(|p| p.parent());
+    if prefix.file_name() != Some(std::ffi::OsStr::new("kma"))
+        || reference_dir.file_name() != Some(std::ffi::OsStr::new("card_reference"))
+        || bwt_dir.and_then(|p| p.file_name()) != Some(std::ffi::OsStr::new("bwt"))
+        || local_db.and_then(|p| p.file_name()) != Some(std::ffi::OsStr::new("localDB"))
+    {
+        return Err(PipelineError::InvalidConfig(
+            "--amr-kma-db must identify <root>/localDB/bwt/card_reference/kma; RGI selects that localDB, not an arbitrary KMA prefix".into(),
+        ));
+    }
+    let local_db = local_db.unwrap(); // checked above
+    for name in ["card.json", "card_reference.fasta", "loaded_databases.json",
+        "61mer_database.json", "amr_61mer.txt", "index-for-model-sequences.txt"] {
+        let path = local_db.join(name);
+        if !tokio::fs::metadata(&path).await
+            .map_err(|e| PipelineError::IOError(format!("RGI reference {}: {}", path.display(), e)))?
+            .is_file()
+        {
+            return Err(PipelineError::InvalidConfig(format!(
+                "RGI reference is not a regular file: {}", path.display(),
+            )));
+        }
+    }
+    // RGI reads installed localDB/card.json, not the original source path.
+    // If supplied, reject a different source rather than silently ignoring it.
+    if let Some(source) = config.args.amr_card_json.as_deref() {
+        let source_bytes = tokio::fs::read(source).await
+            .map_err(|e| PipelineError::IOError(format!("CARD source {}: {}", source, e)))?;
+        let installed_bytes = tokio::fs::read(local_db.join("card.json")).await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?;
+        let source_json: serde_json::Value = serde_json::from_slice(&source_bytes)
+            .map_err(|e| PipelineError::Other(anyhow!("Invalid source CARD JSON: {}", e)))?;
+        let installed_json: serde_json::Value = serde_json::from_slice(&installed_bytes)
+            .map_err(|e| PipelineError::Other(anyhow!("Invalid installed CARD JSON: {}", e)))?;
+        if source_json != installed_json {
+            return Err(PipelineError::InvalidConfig(format!(
+                "--amr-card-json differs from {}", local_db.join("card.json").display(),
+            )));
+        }
+    }
+    Ok(local_db.parent().unwrap().to_path_buf())
+}
+
+/// AMR-only launcher: 
+/// stderr goes directly to a durable file, so it cannot fill a pipe.
+/// The returned completed task preserves the callers' existing join contract.
+async fn spawn_amr_rgi(
+    root: &std::path::Path,
+    args: Vec<String>,
+    stderr_log: PathBuf,
+) -> anyhow::Result<(tokio::process::Child, JoinHandle<anyhow::Result<()>>)> {
+    let stderr_file = tokio::fs::File::create(&stderr_log).await?.into_std().await;
+    let child = tokio::process::Command::new(RGI_TAG)
+        .args(args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(stderr_file))
+        .kill_on_drop(true)
+        .spawn()?;
+    Ok((child, tokio::spawn(async { Ok(()) })))
+}
+
 #[derive(Debug)]
 struct RgiBwtKmaOutputs {
     /// Owns the returned scratch paths. Retain until all downstream
@@ -89,7 +169,7 @@ struct RgiBwtKmaOutputs {
 /// WDL RunRgiBwtKma: one RGI invocation with file-backed outputs.
 ///
 /// The output prefix is placed inside choose_temp_dir. This does not
-/// change the child's working directory or redirect every internal
+/// redirect every internal
 /// temporary file RGI or its subprocesses might create.
 ///
 /// Diagnostic logs are durable files in config.out_dir. Computational
@@ -97,6 +177,7 @@ struct RgiBwtKmaOutputs {
 async fn run_rgi_bwt_kma(
     config: Arc<RunConfig>,
     non_host_reads_fa: &[PathBuf],
+    rgi_db_root: &std::path::Path,
 ) -> Result<RgiBwtKmaOutputs, PipelineError> {
     if !(1..=2).contains(&non_host_reads_fa.len()) {
         return Err(PipelineError::InvalidConfig(format!(
@@ -185,6 +266,7 @@ async fn run_rgi_bwt_kma(
 
     // Preserve the WDL command and defaults.
     rgi_config = rgi_config
+        .flag("--local")
         .option("-a", "kma")
         .option("-o", prefix.to_string_lossy().into_owned())
         .flag("--clean");
@@ -200,12 +282,10 @@ async fn run_rgi_bwt_kma(
         stderr_log_path.display(),
     );
 
-    let (mut child, stderr_task) = spawn_cmd(
-        config.clone(),
-        RGI_TAG,
+    let (mut child, stderr_task) = spawn_amr_rgi(
+        rgi_db_root,
         args,
-        config.args.verbose,
-        Some(stderr_log_path.clone()),
+        stderr_log_path.clone(),
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -213,7 +293,7 @@ async fn run_rgi_bwt_kma(
             error: format!("RunRgiBwtKma spawn failed: {}", e),
         })?;
 
-    // spawn_cmd already drains stderr. Install a stdout consumer before
+    // stderr is redirected to its log. Install a stdout consumer before
     // waiting so neither pipe can backpressure the running process.
     let stdout_rx = match parse_child_output(
         &mut child,
@@ -445,6 +525,7 @@ struct RgiKmerBwtOutputs {
 async fn run_rgi_kmer_bwt(
     config: Arc<RunConfig>,
     bwt: &RgiBwtKmaOutputs,
+    rgi_db_root: &std::path::Path,
 ) -> Result<RgiKmerBwtOutputs, PipelineError> {
     let bam = tokio::fs::canonicalize(&bwt.output_sorted_length_100)
         .await
@@ -491,6 +572,7 @@ async fn run_rgi_kmer_bwt(
 
     let rgi_config = RgiConfig::new(RgiSubcommand::KmerQuery)
         .flag("--bwt")
+        .flag("--local")
         .option("-k", "61")
         .option("-i", bam.to_string_lossy().into_owned())
         .option("--output", prefix.to_string_lossy().into_owned());
@@ -506,12 +588,10 @@ async fn run_rgi_kmer_bwt(
         stderr_log_path.display(),
     );
 
-    let (mut child, stderr_task) = spawn_cmd(
-        config.clone(),
-        RGI_TAG,
+    let (mut child, stderr_task) = spawn_amr_rgi(
+        rgi_db_root,
         args,
-        config.args.verbose,
-        Some(stderr_log_path.clone()),
+        stderr_log_path.clone(),
     )
         .await
         .map_err(|e| PipelineError::ToolExecution {
@@ -519,7 +599,7 @@ async fn run_rgi_kmer_bwt(
             error: format!("RunRgiKmerBwt spawn failed: {}", e),
         })?;
 
-    // spawn_cmd already drains stderr. Install a stdout consumer before
+    // stderr is redirected to its log. Install a stdout consumer before
     // waiting so neither pipe can backpressure the running process.
     let stdout_rx = match parse_child_output(
         &mut child,
@@ -1190,6 +1270,8 @@ pub async fn run(
     let out_dir = config.out_dir.clone();
 
     info!("Starting AMR pipeline.");
+    let rgi_db_root = resolve_amr_rgi_root(&config).await?;
+    info!("[AMR] prepared RGI database: {}", rgi_db_root.display());
 
     let prepared = match AmrInputMode::from_config(&config)? {
         AmrInputMode::Raw => {
@@ -2029,13 +2111,14 @@ pub async fn run(
     let rgi_bwt_kma = run_rgi_bwt_kma(
         config.clone(),
         &prepared.non_host_reads_fa,
+        &rgi_db_root,
     ).await?;
     info!(
         "[AMR] RunRgiBwtKma complete: {} artifacts, allele report={}",
         rgi_bwt_kma.output_kma.len(),
         rgi_bwt_kma.kma_amr_results.display(),
     );
-    let rgi_kmer_bwt = run_rgi_kmer_bwt(config.clone(), &rgi_bwt_kma).await?;
+    let rgi_kmer_bwt = run_rgi_kmer_bwt(config.clone(), &rgi_bwt_kma, &rgi_db_root).await?;
     info!(
         "[AMR] RunRgiKmerBwt complete: {} artifacts, allele={}, gene={}",
         rgi_kmer_bwt.output_kmer_bwt.len(),
