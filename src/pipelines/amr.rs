@@ -136,11 +136,25 @@ struct KmaSamResults {
     invalid_alignment_records: u64,
 }
 
+// RGI retains numeric SAM/idxstats columns as strings in its JSON reports.
+// Keep native numeric types internally; change only their serialized form.
+fn serialize_rgi_number_as_string<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: std::fmt::Display,
+    S: Serializer,
+{
+    serializer.collect_str(value)
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct RgiReadCounts {
+    #[serde(skip_serializing)]
     reference_length: u64,
+    #[serde(serialize_with = "serialize_rgi_number_as_string")]
     mapped: u64,
+    #[serde(serialize_with = "serialize_rgi_number_as_string")]
     unmapped: u64,
+    #[serde(serialize_with = "serialize_rgi_number_as_string")]
     all: u64,
 }
 
@@ -157,9 +171,12 @@ struct RgiCoverage {
 #[derive(Debug, Clone, serde::Serialize)]
 struct RgiAlignment {
     qname: String,
+    #[serde(serialize_with = "serialize_rgi_number_as_string")]
     flag: u16,
     rname: String,
+    #[serde(serialize_with = "serialize_rgi_number_as_string")]
     pos: u64,
+    #[serde(serialize_with = "serialize_rgi_number_as_string")]
     mapq: u8,
     mrnm: String,
 }
@@ -4271,3 +4288,30 @@ mod kma_sidecar_tests {
     }
 }
 
+
+#[cfg(test)]
+mod rgi_json_schema_tests {
+    use super::*;
+
+    #[test]
+    fn read_counts_serialize_as_rgi_strings_without_internal_length() {
+        let counts = RgiReadCounts { reference_length: 1029, mapped: 6, unmapped: 0, all: 6 };
+        assert_eq!(serde_json::to_value(&counts).unwrap(), serde_json::json!({
+            "mapped": "6", "unmapped": "0", "all": "6"
+        }));
+        assert_eq!(counts.reference_length, 1029);
+        assert_eq!(counts.mapped + counts.unmapped, counts.all);
+    }
+
+    #[test]
+    fn alignment_numeric_columns_serialize_as_rgi_strings() {
+        let alignment = RgiAlignment {
+            qname: "read1".into(), flag: 163, rname: "ref1".into(),
+            pos: 1, mapq: 195, mrnm: "*".into(),
+        };
+        assert_eq!(serde_json::to_value(&alignment).unwrap(), serde_json::json!({
+            "qname": "read1", "flag": "163", "rname": "ref1",
+            "pos": "1", "mapq": "195", "mrnm": "*"
+        }));
+    }
+}
