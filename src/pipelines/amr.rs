@@ -433,6 +433,263 @@ async fn run_rgi_bwt_kma(
         kma_amr_results_json,
     })
 }
+#[derive(Debug)]
+struct RgiKmerBwtOutputs {
+    /// Owns returned scratch paths until downstream readers/packaging finish.
+    _work_dir: TempDir,
+    output_kmer_bwt: Vec<PathBuf>,
+    sr_species_allele: PathBuf,
+    kma_species_calling: PathBuf,
+}
+
+async fn run_rgi_kmer_bwt(
+    config: Arc<RunConfig>,
+    bwt: &RgiBwtKmaOutputs,
+) -> Result<RgiKmerBwtOutputs, PipelineError> {
+    let bam = tokio::fs::canonicalize(&bwt.output_sorted_length_100)
+        .await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiKmerBwt cannot resolve input {}: {}",
+            bwt.output_sorted_length_100.display(), e,
+        )))?;
+    let metadata = tokio::fs::metadata(&bam).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiKmerBwt cannot stat input {}: {}", bam.display(), e,
+        )))?;
+    if !metadata.is_file() {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRgiKmerBwt input is not a regular file: {}", bam.display(),
+        )));
+    }
+    // Heuristic, not a quota; choose_temp_dir applies headroom/fallback.
+    let work_dir = crate::utils::file::choose_temp_dir(
+        metadata.len().saturating_mul(4).max(1),
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    ).await?;
+    let work_path = tokio::fs::canonicalize(work_dir.path()).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiKmerBwt cannot resolve scratch directory {}: {}",
+            work_dir.path().display(), e,
+        )))?;
+
+    tokio::fs::create_dir_all(&config.out_dir)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "RunRgiKmerBwt cannot create log directory {}: {}",
+                config.out_dir.display(),
+                e,
+            ))
+        })?;
+
+    let stdout_log_path = config.out_dir.join("amr_rgi_kmer_bwt_stdout.log");
+    let stderr_log_path = config.out_dir.join("amr_rgi_kmer_bwt_stderr.log");
+    let prefix = work_path.join("sr_species_report");
+
+    let rgi_config = RgiConfig::new(RgiSubcommand::KmerQuery)
+        .flag("--bwt")
+        .option("-k", "61")
+        .option("-i", bam.to_string_lossy().into_owned())
+        .option("--output", prefix.to_string_lossy().into_owned());
+
+    let args = generate_cli(RGI_TAG, &config, Some(&rgi_config))?;
+
+    info!(
+        "[RunRgiKmerBwt] rgi {:?}; output directory={}; \
+         stdout={}; stderr={}",
+        args,
+        work_path.display(),
+        stdout_log_path.display(),
+        stderr_log_path.display(),
+    );
+
+    let (mut child, stderr_task) = spawn_cmd(
+        config.clone(),
+        RGI_TAG,
+        args,
+        config.args.verbose,
+        Some(stderr_log_path.clone()),
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!("RunRgiKmerBwt spawn failed: {}", e),
+        })?;
+
+    // spawn_cmd already drains stderr. Install a stdout consumer before
+    // waiting so neither pipe can backpressure the running process.
+    let stdout_rx = match parse_child_output(
+        &mut child,
+        ChildStream::Stdout,
+        ParseMode::Lines,
+        &config,
+    )
+        .await
+    {
+        Ok(rx) => rx,
+        Err(e) => {
+            // Do not leave the process running while work_dir is dropped.
+            let kill_result = child.kill().await;
+            let wait_result = child.wait().await;
+            let stderr_result = stderr_task.await;
+
+            if let Err(kill_error) = kill_result {
+                warn!(
+                    "[RunRgiKmerBwt] cleanup kill failed: {}",
+                    kill_error,
+                );
+            }
+            if let Err(wait_error) = wait_result {
+                warn!(
+                    "[RunRgiKmerBwt] cleanup wait failed: {}",
+                    wait_error,
+                );
+            }
+            if !matches!(&stderr_result, Ok(Ok(()))) {
+                warn!(
+                    "[RunRgiKmerBwt] stderr capture during cleanup: {:?}",
+                    stderr_result,
+                );
+            }
+
+            return Err(PipelineError::ToolExecution {
+                tool: RGI_TAG.to_string(),
+                error: format!(
+                    "RunRgiKmerBwt stdout capture setup failed: {}; \
+                     stderr log: {}",
+                    e,
+                    stderr_log_path.display(),
+                ),
+            });
+        }
+    };
+
+    let stdout_task = tokio::spawn(stream_to_file(
+        stdout_rx,
+        stdout_log_path.clone(),
+    ));
+
+    // Join all three, rather than returning early and detaching a writer.
+    let (status_result, stdout_result, stderr_result) =
+        tokio::join!(child.wait(), stdout_task, stderr_task);
+
+    // Report secondary capture failures even when the process itself
+    // failed. The process error remains the primary failure.
+    if !matches!(&stdout_result, Ok(Ok(()))) {
+        warn!(
+            "[RunRgiKmerBwt] stdout capture failed: {:?}; log={}",
+            stdout_result,
+            stdout_log_path.display(),
+        );
+    }
+
+    if !matches!(&stderr_result, Ok(Ok(()))) {
+        warn!(
+            "[RunRgiKmerBwt] stderr capture failed: {:?}; log={}",
+            stderr_result,
+            stderr_log_path.display(),
+        );
+    }
+
+    let status =
+        status_result.map_err(|e| PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!(
+                "RunRgiKmerBwt wait failed: {}; stdout={}; stderr={}",
+                e,
+                stdout_log_path.display(),
+                stderr_log_path.display(),
+            ),
+        })?;
+
+    if !status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!(
+                "RunRgiKmerBwt exited with {}; stdout={}; stderr={}",
+                status,
+                stdout_log_path.display(),
+                stderr_log_path.display(),
+            ),
+        });
+    }
+
+    stdout_result
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerBwt stdout writer task failed: {}; log={}",
+                e,
+                stdout_log_path.display(),
+            ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerBwt stdout write failed: {}; log={}",
+                e,
+                stdout_log_path.display(),
+            ))
+        })?;
+
+    stderr_result
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerBwt stderr task failed: {}; log={}",
+                e,
+                stderr_log_path.display(),
+            ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerBwt stderr capture failed: {}; log={}",
+                e,
+                stderr_log_path.display(),
+            ))
+        })?;
+
+    let sr_species_allele =
+        work_path.join("sr_species_report_61mer_analysis.allele.txt");
+    let kma_species_calling =
+        work_path.join("sr_species_report_61mer_analysis.gene.txt");
+    for path in [&sr_species_allele, &kma_species_calling] {
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            PipelineError::IOError(format!(
+                "RunRgiKmerBwt missing/unreadable required output {}: {}; stderr={}",
+                path.display(), e, stderr_log_path.display(),
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(PipelineError::IOError(format!(
+                "RunRgiKmerBwt output is not a regular file: {}", path.display(),
+            )));
+        }
+        // Do not impose a blanket nonempty-file requirement on reports.
+    }
+
+    // WDL glob("sr_species_report*"), scoped to this invocation.
+    let mut output_kmer_bwt = Vec::new();
+    let mut entries = tokio::fs::read_dir(&work_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    while let Some(entry) = entries.next_entry().await
+        .map_err(|e| PipelineError::IOError(e.to_string()))? {
+        if entry.file_name().to_string_lossy().starts_with("sr_species_report")
+            && entry.file_type().await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?.is_file()
+        {
+            output_kmer_bwt.push(entry.path());
+        }
+    }
+    output_kmer_bwt.sort();
+    Ok(RgiKmerBwtOutputs {
+        _work_dir: work_dir,
+        output_kmer_bwt,
+        sr_species_allele,
+        kma_species_calling,
+    })
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -1778,6 +2035,16 @@ pub async fn run(
         rgi_bwt_kma.output_kma.len(),
         rgi_bwt_kma.kma_amr_results.display(),
     );
+    let rgi_kmer_bwt = run_rgi_kmer_bwt(config.clone(), &rgi_bwt_kma).await?;
+    info!(
+        "[AMR] RunRgiKmerBwt complete: {} artifacts, allele={}, gene={}",
+        rgi_kmer_bwt.output_kmer_bwt.len(),
+        rgi_kmer_bwt.sr_species_allele.display(),
+        rgi_kmer_bwt.kma_species_calling.display(),
+    );
+    // Add downstream report merging/packaging above these drops and await
+    // every reader before releasing either task's scratch directory.
+    drop(rgi_kmer_bwt);
     // Add downstream tasks above this explicit drop, and await their readers
     // before releasing the scratch directory. No durable copy is made here.
     drop(rgi_bwt_kma);
