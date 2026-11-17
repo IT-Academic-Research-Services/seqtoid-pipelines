@@ -51,6 +51,8 @@ use crate::utils::streams::{
 };
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
+const RGI_MIN_CONSENSUS_DEPTH: f64 = 5.0;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AmrInputMode {
@@ -258,7 +260,7 @@ fn build_rgi_allele_summaries(
             continue;
         };
 
-        let consensus_sequence_protein =
+        let mut consensus_sequence_protein =
             match translate_rgi_kma_consensus(consensus_sequence_dna) {
                 Ok(protein) => protein,
 
@@ -317,9 +319,35 @@ fn build_rgi_allele_summaries(
         resistomes.entry("Resistance Mechanism".to_string()).or_default();
 
         let depth = sidecars.read_depth.get(alignment_hit).cloned().unwrap_or_default();
-        let snps = sidecars.mutations.get(alignment_hit)
+        let mut snps = sidecars.mutations.get(alignment_hit)
             .map(|items| items.join("; "))
             .unwrap_or_default();
+        let mut consensus_sequence_dna = consensus_sequence_dna.clone();
+
+        // Match BWT.py summary(): suppress consensus-derived evidence below
+        // the configured KMA depth threshold, while retaining depth itself.
+        let parsed_depth = if depth.trim().is_empty() {
+            0.0
+        } else {
+            match depth.trim().parse::<f64>() {
+                Ok(value) => value,
+                Err(e) => {
+                    // BWT.py would raise inside summary() and skip this allele;
+                    // preserve that non-fatal behavior rather than failing the pipeline.
+                    warn!(
+                        "[AMR] RGI summary skipping model with id: {} due to invalid KMA depth {:?} for {}: {}",
+                        model.model_id, depth, alignment_hit, e
+                    );
+                    continue;
+                }
+            }
+        };
+
+        if parsed_depth < RGI_MIN_CONSENSUS_DEPTH {
+            snps.clear();
+            consensus_sequence_dna.clear();
+            consensus_sequence_protein.clear();
+        }
 
         summaries.push(RgiAlleleSummary {
             id: alignment_hit.clone(),
@@ -351,7 +379,7 @@ fn build_rgi_allele_summaries(
             predicted_pathogen: "N/A".to_string(),
             depth,
             snps,
-            consensus_sequence_dna: consensus_sequence_dna.clone(),
+            consensus_sequence_dna,
             consensus_sequence_protein,
         });
     }
@@ -3765,7 +3793,7 @@ pub async fn run(
         rgi_read_counts.len(), missing_depth, missing_consensus, kma_sidecars.mutations.len()
     );
     // Missing per-reference evidence is not fatal here: BWT.py handles it
-    // during summary construction. No depth suppression is applied yet.
+    // during summary construction.
 
     let card_json = config
         .args
@@ -3811,8 +3839,7 @@ pub async fn run(
     }
 
     // Reproduce BWT.py summary() for the canonical CARD/KMA evidence available
-    // at this checkpoint. Protein translation and depth<5 suppression are the
-    // following stages and are deliberately not applied here.
+    // at this checkpoint, including consensus translation and depth suppression.
     let rgi_allele_summaries = build_rgi_allele_summaries(
         &rgi_read_counts,
         &rgi_coverage,
