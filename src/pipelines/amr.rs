@@ -186,6 +186,23 @@ struct CardModels {
 
 
 #[derive(Debug, Clone)]
+struct RgiPercentCoverage {
+    covered: String,
+    uncovered: String,
+}
+
+#[derive(Debug, Clone)]
+struct RgiLengthCoverage {
+    covered: String,
+    uncovered: String,
+}
+
+#[derive(Debug, Clone)]
+struct RgiReference {
+    sequence_length: String,
+}
+
+#[derive(Debug, Clone)]
 struct RgiAlleleSummary {
     id: String,
     cvterm_name: String,
@@ -205,19 +222,26 @@ struct RgiAlleleSummary {
     average_bait_coverage: u64,
     bait_coverage_coefficient_of_variation: u64,
     mate_pair: Vec<String>,
-    percent_coverage_covered: String,
-    percent_coverage_uncovered: String,
-    length_coverage_covered: String,
-    length_coverage_uncovered: String,
-    reference_sequence_length: String,
+    percent_coverage: RgiPercentCoverage,
+    length_coverage: RgiLengthCoverage,
+    reference: RgiReference,
     mutation: String,
     resistomes: HashMap<String, Vec<String>>,
     predicted_pathogen: String,
     depth: String,
     snps: String,
     consensus_sequence_dna: String,
-    // Filled by the next translation step; BWT.py translates before depth suppression.
     consensus_sequence_protein: String,
+}
+
+/// One result from BWT.py summary(). Python has three observable outcomes:
+/// a populated dict, `{}` for KMA consensus-block failures, or implicit None
+/// for failures caught by the outer summary() exception handler.
+#[derive(Debug, Clone)]
+enum RgiAlleleSummaryResult {
+    Summary(RgiAlleleSummary),
+    Empty,
+    Null,
 }
 
 fn build_rgi_allele_summaries(
@@ -226,62 +250,49 @@ fn build_rgi_allele_summaries(
     alignments: &HashMap<String, Vec<RgiAlignment>>,
     sidecars: &KmaSidecars,
     models: &CardModels,
-) -> anyhow::Result<Vec<RgiAlleleSummary>> {
+) -> Vec<RgiAlleleSummaryResult> {
+    // BWT.py's ThreadPoolExecutor makes final JSON array order scheduling-
+    // dependent. Keep Rust deterministic; parity comparisons should compare
+    // contents rather than array position.
     let mut references: Vec<&String> = reads.keys().collect();
     references.sort();
 
-    let mut summaries = Vec::new();
+    let mut results = Vec::with_capacity(references.len());
+    let mut summaries = 0usize;
+    let mut empty_results = 0usize;
+    let mut null_results = 0usize;
     let mut skipped_no_consensus = 0usize;
     let mut skipped_translation_error = 0usize;
 
     for alignment_hit in references {
         let Some(model) = resolve_card_model(alignment_hit, models) else {
-            // Match BWT.py's outer summary() exception behavior: unresolved models
-            // do not produce an allele summary row.
-            warn!("[AMR] RGI summary skipping unresolved CARD model: {}", alignment_hit);
-            continue;
-        };
-
-        let Some(consensus_sequence_dna) =
-            sidecars.consensus_dna.get(alignment_hit)
-        else {
-            // Match BWT.py:
-            // consensus_sequence[alignment_hit] raises inside the outer KMA try,
-            // which warns and returns {} for this allele.
-            skipped_no_consensus += 1;
-
+            // get_model_id() can yield an empty model_id; models[model_id]
+            // then raises inside summary()'s outer try and Python returns None.
             warn!(
-        "[AMR] model with id: {}, has few mapped reads to make consensus \
-         sequence skipping: missing consensus for {}",
-        model.model_id,
-        alignment_hit
-    );
-
+                "[AMR] missing model for alignment {}; preserving RGI null summary result",
+                alignment_hit
+            );
+            results.push(RgiAlleleSummaryResult::Null);
+            null_results += 1;
             continue;
         };
 
-        let mut consensus_sequence_protein =
-            match translate_rgi_kma_consensus(consensus_sequence_dna) {
-                Ok(protein) => protein,
-
-                Err(e) => {
-                    // Match BWT.py's outer KMA exception handler:
-                    // warn + return {} for this allele, NOT pipeline failure.
-                    warn!(
-                "[AMR] model with id: {}, has few mapped reads to make consensus \
-                 sequence skipping: {}",
-                model.model_id,
-                e
+        // Everything below corresponds to BWT.py's outer summary() try.
+        // Missing coverage/model-derived evidence therefore becomes Python
+        // None rather than a fatal pipeline error.
+        let Some(cov) = coverage.get(alignment_hit) else {
+            warn!(
+                "[AMR] missing genomecov evidence for {}; preserving RGI null summary result",
+                alignment_hit
             );
-                    skipped_translation_error += 1;
-                    continue;
-                }
-            };
+            results.push(RgiAlleleSummaryResult::Null);
+            null_results += 1;
+            continue;
+        };
 
-        let counts = reads.get(alignment_hit).expect("reference came from reads keys");
-        let cov = coverage.get(alignment_hit).ok_or_else(|| anyhow!(
-            "RGI summary missing genomecov evidence for {}", alignment_hit
-        ))?;
+        let counts = reads
+            .get(alignment_hit)
+            .expect("reference came from reads keys");
         let hit_alignments = alignments.get(alignment_hit).cloned().unwrap_or_default();
 
         let mapq_average = if hit_alignments.is_empty() {
@@ -318,26 +329,66 @@ fn build_rgi_allele_summaries(
         resistomes.entry("Drug Class".to_string()).or_default();
         resistomes.entry("Resistance Mechanism".to_string()).or_default();
 
-        let depth = sidecars.read_depth.get(alignment_hit).cloned().unwrap_or_default();
-        let mut snps = sidecars.mutations.get(alignment_hit)
+        // BWT.py's KMA block is its own inner try/except. Any exception here
+        // returns {}, which is observably different from the outer None path.
+        let Some(consensus_sequence_dna) = sidecars.consensus_dna.get(alignment_hit) else {
+            skipped_no_consensus += 1;
+            empty_results += 1;
+            warn!(
+                "[AMR] model with id: {}, has few mapped reads to make consensus sequence skipping: missing consensus for {}",
+                model.model_id,
+                alignment_hit
+            );
+            results.push(RgiAlleleSummaryResult::Empty);
+            continue;
+        };
+
+        let mut consensus_sequence_protein =
+            match translate_rgi_kma_consensus(consensus_sequence_dna) {
+                Ok(protein) => protein,
+                Err(e) => {
+                    skipped_translation_error += 1;
+                    empty_results += 1;
+                    warn!(
+                        "[AMR] model with id: {}, has few mapped reads to make consensus sequence skipping: {}",
+                        model.model_id,
+                        e
+                    );
+                    results.push(RgiAlleleSummaryResult::Empty);
+                    continue;
+                }
+            };
+
+        let depth = sidecars
+            .read_depth
+            .get(alignment_hit)
+            .cloned()
+            .unwrap_or_default();
+        let mut snps = sidecars
+            .mutations
+            .get(alignment_hit)
             .map(|items| items.join("; "))
             .unwrap_or_default();
         let mut consensus_sequence_dna = consensus_sequence_dna.clone();
 
-        // Match BWT.py summary(): suppress consensus-derived evidence below
-        // the configured KMA depth threshold, while retaining depth itself.
+        // BWT.py performs float(read_coverage_depth.strip() or 0) outside the
+        // inner KMA try but inside the outer summary() try. A malformed nonempty
+        // depth therefore yields Python None, not {} and not a pipeline failure.
         let parsed_depth = if depth.trim().is_empty() {
             0.0
         } else {
             match depth.trim().parse::<f64>() {
                 Ok(value) => value,
                 Err(e) => {
-                    // BWT.py would raise inside summary() and skip this allele;
-                    // preserve that non-fatal behavior rather than failing the pipeline.
                     warn!(
-                        "[AMR] RGI summary skipping model with id: {} due to invalid KMA depth {:?} for {}: {}",
-                        model.model_id, depth, alignment_hit, e
+                        "[AMR] invalid KMA depth {:?} for model {} / {}; preserving RGI null summary result: {}",
+                        depth,
+                        model.model_id,
+                        alignment_hit,
+                        e
                     );
+                    results.push(RgiAlleleSummaryResult::Null);
+                    null_results += 1;
                     continue;
                 }
             }
@@ -349,7 +400,7 @@ fn build_rgi_allele_summaries(
             consensus_sequence_protein.clear();
         }
 
-        summaries.push(RgiAlleleSummary {
+        results.push(RgiAlleleSummaryResult::Summary(RgiAlleleSummary {
             id: alignment_hit.clone(),
             cvterm_name: model.model_name.clone(),
             aro_accession: model.aro_accession.clone(),
@@ -369,11 +420,17 @@ fn build_rgi_allele_summaries(
             average_bait_coverage: 0,
             bait_coverage_coefficient_of_variation: 0,
             mate_pair,
-            percent_coverage_covered: format!("{:.2}", cov.percent_coverage),
-            percent_coverage_uncovered: format!("{:.2}", 100.0 - cov.percent_coverage),
-            length_coverage_covered: cov.covered_bases.to_string(),
-            length_coverage_uncovered: cov.uncovered_bases.to_string(),
-            reference_sequence_length: cov.reference_length.to_string(),
+            percent_coverage: RgiPercentCoverage {
+                covered: format!("{:.2}", cov.percent_coverage),
+                uncovered: format!("{:.2}", 100.0 - cov.percent_coverage),
+            },
+            length_coverage: RgiLengthCoverage {
+                covered: cov.covered_bases.to_string(),
+                uncovered: cov.uncovered_bases.to_string(),
+            },
+            reference: RgiReference {
+                sequence_length: cov.reference_length.to_string(),
+            },
             mutation: "N/A".to_string(),
             resistomes,
             predicted_pathogen: "N/A".to_string(),
@@ -381,20 +438,22 @@ fn build_rgi_allele_summaries(
             snps,
             consensus_sequence_dna,
             consensus_sequence_protein,
-        });
+        }));
+        summaries += 1;
     }
 
     info!(
-    "[AMR] RGI allele summaries built: \
-     reportable_references={} summaries={} \
-     skipped_no_consensus={} skipped_translation_error={}",
-    reads.len(),
-    summaries.len(),
-    skipped_no_consensus,
-    skipped_translation_error
-);
+        "[AMR] RGI allele summaries built: reportable_references={} results={} summaries={} empty_results={} null_results={} skipped_no_consensus={} skipped_translation_error={}",
+        reads.len(),
+        results.len(),
+        summaries,
+        empty_results,
+        null_results,
+        skipped_no_consensus,
+        skipped_translation_error
+    );
 
-    Ok(summaries)
+    results
 }
 
 /// Native streaming equivalent of the WDL RunRedup task.
@@ -3846,16 +3905,20 @@ pub async fn run(
         &rgi_alignments,
         &kma_sidecars,
         &card_models,
-    ).map_err(PipelineError::Other)?;
+    );
 
-    for summary in &rgi_allele_summaries {
+    for result in &rgi_allele_summaries {
+        let RgiAlleleSummaryResult::Summary(summary) = result else {
+            continue;
+        };
+
         info!(
             "[AMR] RGI allele summary: reference={} model={} aro={} mapped={} coverage={} mapq={} depth={} snps={} consensus_bp={} mate_pairs={}",
             summary.id,
             summary.cvterm_name,
             summary.aro_accession,
             summary.reads.mapped,
-            summary.percent_coverage_covered,
+            summary.percent_coverage.covered,
             summary.mapq_average,
             summary.depth,
             if summary.snps.is_empty() { 0 } else { summary.snps.split("; ").count() },
