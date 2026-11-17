@@ -4,6 +4,7 @@ use crate::pipelines::short_read_mngs::HostFilterOutputs;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 
 use anyhow::anyhow;
 use log::{error, info, warn};
@@ -135,7 +136,7 @@ struct KmaSamResults {
     invalid_alignment_records: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RgiReadCounts {
     reference_length: u64,
     mapped: u64,
@@ -153,7 +154,7 @@ struct RgiCoverage {
     percent_coverage: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RgiAlignment {
     qname: String,
     flag: u16,
@@ -185,24 +186,24 @@ struct CardModels {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RgiPercentCoverage {
     covered: String,
     uncovered: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RgiLengthCoverage {
     covered: String,
     uncovered: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RgiReference {
     sequence_length: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct RgiAlleleSummary {
     id: String,
     cvterm_name: String,
@@ -242,6 +243,37 @@ enum RgiAlleleSummaryResult {
     Summary(RgiAlleleSummary),
     Empty,
     Null,
+}
+
+impl Serialize for RgiAlleleSummaryResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Summary(summary) => summary.serialize(serializer),
+            Self::Empty => {
+                let map = serializer.serialize_map(Some(0))?;
+                map.end()
+            }
+            Self::Null => serializer.serialize_none(),
+        }
+    }
+}
+
+async fn write_rgi_allele_json(
+    results: &[RgiAlleleSummaryResult],
+    out_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let path = out_dir.join("sr_amr_report.allele_mapping_data.json");
+    let json = serde_json::to_vec(results)?;
+    tokio::fs::write(&path, json).await?;
+    info!(
+        "[AMR] RGI allele JSON written: results={} path={}",
+        results.len(),
+        path.display()
+    );
+    Ok(path)
 }
 
 fn build_rgi_allele_summaries(
@@ -3906,6 +3938,13 @@ pub async fn run(
         &kma_sidecars,
         &card_models,
     );
+
+    let _allele_json_path = write_rgi_allele_json(
+        &rgi_allele_summaries,
+        &out_dir,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
 
     for result in &rgi_allele_summaries {
         let RgiAlleleSummaryResult::Summary(summary) = result else {
