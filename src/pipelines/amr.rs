@@ -276,6 +276,249 @@ async fn write_rgi_allele_json(
     Ok(path)
 }
 
+
+fn rgi_tsv_field(value: &str) -> String {
+    if value.chars().any(|c| matches!(c, '\t' | '\r' | '\n' | '"')) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn push_rgi_tsv_row(out: &mut Vec<u8>, fields: &[String]) -> anyhow::Result<()> {
+    for (idx, field) in fields.iter().enumerate() {
+        if idx != 0 { out.push(b'\t'); }
+        out.extend_from_slice(rgi_tsv_field(field).as_bytes());
+    }
+    // Python csv.writer(..., dialect="excel") uses CRLF line endings.
+    out.extend_from_slice(b"\r\n");
+    Ok(())
+}
+
+fn sorted_case_insensitive(values: &[String]) -> Vec<String> {
+    let mut values = values.to_vec();
+    values.sort_by_key(|s| s.to_lowercase());
+    values
+}
+
+fn python_float_string(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{:.1}", value)
+    } else {
+        value.to_string()
+    }
+}
+
+async fn write_rgi_allele_tsv(
+    results: &[RgiAlleleSummaryResult],
+    out_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let path = out_dir.join("sr_amr_report.allele_mapping_data.txt");
+    let mut out = Vec::<u8>::new();
+    push_rgi_tsv_row(&mut out, &[
+        "Reference Sequence", "ARO Term", "ARO Accession", "Reference Model Type",
+        "Reference DB", "Reference Allele Source", "Resistomes & Variants: Observed in Genome(s)",
+        "Resistomes & Variants: Observed in Plasmid(s)", "Resistomes & Variants: Observed Pathogen(s)",
+        "Completely Mapped Reads", "Mapped Reads with Flanking Sequence", "All Mapped Reads",
+        "Percent Coverage", "Length Coverage (bp)", "Average MAPQ (Completely Mapped Reads)",
+        "Mate Pair Linkage", "Reference Length", "AMR Gene Family", "Drug Class", "Resistance Mechanism",
+        "Depth", "SNPs", "Consensus Sequence DNA", "Consensus Sequence Protein",
+    ].into_iter().map(str::to_string).collect::<Vec<_>>())?;
+
+    let mut rows = 0usize;
+    for result in results {
+        let RgiAlleleSummaryResult::Summary(r) = result else { continue; };
+        let gene_family = sorted_case_insensitive(r.resistomes.get("AMR Gene Family").map(Vec::as_slice).unwrap_or(&[]));
+        let drug_class = sorted_case_insensitive(r.resistomes.get("Drug Class").map(Vec::as_slice).unwrap_or(&[]));
+        let mechanism = sorted_case_insensitive(r.resistomes.get("Resistance Mechanism").map(Vec::as_slice).unwrap_or(&[]));
+        push_rgi_tsv_row(&mut out, &vec![
+            r.id.clone(), r.cvterm_name.clone(), r.aro_accession.clone(), r.model_type.clone(),
+            r.database.clone(), r.reference_allele_source.clone(), r.observed_in_genomes.clone(),
+            r.observed_in_plasmids.clone(), r.observed_in_pathogens.join("; "), r.reads.mapped.to_string(),
+            r.reads.unmapped.to_string(), r.reads.all.to_string(), r.percent_coverage.covered.clone(),
+            r.length_coverage.covered.clone(), r.mapq_average.clone(), r.mate_pair.join("; "),
+            r.reference.sequence_length.clone(), gene_family.join("; "), drug_class.join("; "),
+            mechanism.join("; "), r.depth.clone(), r.snps.clone(), r.consensus_sequence_dna.clone(),
+            r.consensus_sequence_protein.clone(),
+        ])?;
+        rows += 1;
+    }
+    tokio::fs::write(&path, out).await?;
+    info!("[AMR] RGI allele TSV written: rows={} path={}", rows, path.display());
+    Ok(path)
+}
+
+#[derive(Default)]
+struct RgiGeneAggregate {
+    cvterm_name: Vec<String>,
+    model_type: Vec<String>,
+    database: Vec<String>,
+    observed_in_genomes: Vec<String>,
+    observed_in_plasmids: Vec<String>,
+    observed_in_pathogens: Vec<String>,
+    mapped: Vec<u64>,
+    unmapped: Vec<u64>,
+    all: Vec<u64>,
+    identity: Vec<f64>,
+    percent_coverage: Vec<f64>,
+    length_coverage: Vec<f64>,
+    mapq_average: Vec<f64>,
+    mapped_baits: Vec<u64>,
+    mapped_baits_with_reads: Vec<u64>,
+    average_bait_coverage: Vec<u64>,
+    bait_cv: Vec<u64>,
+    mate_pair: Vec<String>,
+    reference_sequence_length: Vec<String>,
+    gene_family: Vec<String>,
+    drug_class: Vec<String>,
+    resistance_mechanism: Vec<String>,
+    allele_count: usize,
+}
+
+fn push_unique(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|v| v == value) { values.push(value.to_string()); }
+}
+
+fn rgi_gene_mate_name(m: &str) -> Option<String> {
+    if m == "*" { return None; }
+    let parts: Vec<&str> = m.split('|').collect();
+    match parts.len() {
+        4 => parts.get(2).and_then(|v| v.split_once(':').map(|(_, x)| x.to_string())),
+        7 => parts.get(5).map(|v| (*v).to_string()),
+        _ => None,
+    }
+}
+
+async fn write_rgi_gene_tsv(
+    results: &[RgiAlleleSummaryResult],
+    out_dir: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    let path = out_dir.join("sr_amr_report.gene_mapping_data.txt");
+    let mut groups = std::collections::BTreeMap::<String, RgiGeneAggregate>::new();
+
+    for result in results {
+        let RgiAlleleSummaryResult::Summary(r) = result else { continue; };
+        let is_new = !groups.contains_key(&r.aro_accession);
+        let g = groups.entry(r.aro_accession.clone()).or_default();
+        g.allele_count += 1;
+        if is_new {
+            g.cvterm_name.push(r.cvterm_name.clone());
+            g.model_type.push(r.model_type.clone());
+            g.database.push(r.database.clone());
+            g.observed_in_genomes.push(r.observed_in_genomes.clone());
+            g.observed_in_plasmids.push(r.observed_in_plasmids.clone());
+            g.observed_in_pathogens.extend(r.observed_in_pathogens.iter().cloned());
+            g.gene_family.extend(r.resistomes.get("AMR Gene Family").cloned().unwrap_or_default());
+            g.drug_class.extend(r.resistomes.get("Drug Class").cloned().unwrap_or_default());
+            g.resistance_mechanism.extend(r.resistomes.get("Resistance Mechanism").cloned().unwrap_or_default());
+        } else {
+            push_unique(&mut g.model_type, &r.model_type);
+            push_unique(&mut g.database, &r.database);
+            push_unique(&mut g.observed_in_genomes, &r.observed_in_genomes);
+            push_unique(&mut g.observed_in_plasmids, &r.observed_in_plasmids);
+            for v in &r.observed_in_pathogens { push_unique(&mut g.observed_in_pathogens, v); }
+            for v in r.resistomes.get("AMR Gene Family").map(Vec::as_slice).unwrap_or(&[]) { push_unique(&mut g.gene_family, v); }
+            for v in r.resistomes.get("Drug Class").map(Vec::as_slice).unwrap_or(&[]) { push_unique(&mut g.drug_class, v); }
+            for v in r.resistomes.get("Resistance Mechanism").map(Vec::as_slice).unwrap_or(&[]) { push_unique(&mut g.resistance_mechanism, v); }
+        }
+        g.mapped.push(r.reads.mapped); g.unmapped.push(r.reads.unmapped); g.all.push(r.reads.all);
+        g.identity.push(r.range_of_reference_allele_source);
+        g.percent_coverage.push(r.percent_coverage.covered.parse::<f64>()?);
+        g.length_coverage.push(r.length_coverage.covered.parse::<f64>()?);
+        g.mapq_average.push(r.mapq_average.parse::<f64>()?);
+        g.mapped_baits.push(r.number_of_mapped_baits);
+        g.mapped_baits_with_reads.push(r.number_of_mapped_baits_with_reads);
+        g.average_bait_coverage.push(r.average_bait_coverage);
+        g.bait_cv.push(r.bait_coverage_coefficient_of_variation);
+        g.reference_sequence_length.push(r.reference.sequence_length.clone());
+        for m in &r.mate_pair { if let Some(name) = rgi_gene_mate_name(m) { g.mate_pair.push(name); } }
+    }
+
+    let mut out = Vec::<u8>::new();
+    push_rgi_tsv_row(&mut out, &[
+        "ARO Term", "ARO Accession", "Reference Model Type", "Reference DB", "Alleles with Mapped Reads",
+        "Reference Allele(s) Identity to CARD Reference Protein (%)", "Resistomes & Variants: Observed in Genome(s)",
+        "Resistomes & Variants: Observed in Plasmid(s)", "Resistomes & Variants: Observed Pathogen(s)",
+        "Completely Mapped Reads", "Mapped Reads with Flanking Sequence", "All Mapped Reads", "Average Percent Coverage",
+        "Average Length Coverage (bp)", "Average MAPQ (Completely Mapped Reads)", "Number of Mapped Baits",
+        "Number of Mapped Baits with Reads", "Average Number of reads per Bait",
+        "Number of reads per Bait Coefficient of Variation (%)", "Number of reads mapping to baits and mapping to complete gene",
+        "Number of reads mapping to baits and mapping to complete gene (%)", "Mate Pair Linkage (# reads)", "Reference Length",
+        "AMR Gene Family", "Drug Class", "Resistance Mechanism",
+    ].into_iter().map(str::to_string).collect::<Vec<_>>())?;
+
+    let mut rows = 0usize;
+    for (aro, g) in groups {
+        // WDL invokes plain `rgi bwt`, so include_other_models is false: homolog models only.
+        if !g.model_type.iter().any(|v| v == "protein homolog model") { continue; }
+        let observed_genomes = if g.observed_in_genomes.iter().any(|v| v == "YES") { "YES" } else if g.observed_in_genomes.iter().any(|v| v == "no data") { "no data" } else { "NO" };
+        let observed_plasmids = if g.observed_in_plasmids.iter().any(|v| v == "YES") { "YES" } else if g.observed_in_plasmids.iter().any(|v| v == "no data") { "no data" } else { "NO" };
+        let avg = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+        let min_id = g.identity.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_id = g.identity.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let identity_range = if min_id == 0.0 && max_id > 0.0 { python_float_string(max_id) }
+        else if min_id > 0.0 && max_id > min_id { format!("{} - {}", python_float_string(min_id), python_float_string(max_id)) }
+        else if min_id == max_id && min_id > 0.0 { python_float_string(max_id) } else { String::new() };
+        let mut mate_counts = std::collections::BTreeMap::<String, usize>::new();
+        for m in &g.mate_pair { *mate_counts.entry(m.clone()).or_default() += 1; }
+        let mate_pairs = mate_counts.into_iter().filter(|(m, _)| m != &aro.replace(' ', "_") && !g.cvterm_name.iter().any(|n| n == m))
+            .map(|(m, n)| format!("{} ({})", m, n)).collect::<Vec<_>>().join("; ");
+        let mut gf = g.gene_family.clone(); gf.sort_by_key(|s| s.to_lowercase());
+        let mut dc = g.drug_class.clone(); dc.sort_by_key(|s| s.to_lowercase());
+        let mut rm = g.resistance_mechanism.clone(); rm.sort_by_key(|s| s.to_lowercase());
+        push_rgi_tsv_row(&mut out, &vec![
+            g.cvterm_name.join("; "), aro, g.model_type.join("; "), g.database.join("; "), g.allele_count.to_string(),
+            identity_range, observed_genomes.to_string(), observed_plasmids.to_string(), g.observed_in_pathogens.join("; "),
+            format!("{:.2}", g.mapped.iter().sum::<u64>() as f64), format!("{:.2}", g.unmapped.iter().sum::<u64>() as f64),
+            format!("{:.2}", g.all.iter().sum::<u64>() as f64), format!("{:.2}", avg(&g.percent_coverage)),
+            format!("{:.2}", avg(&g.length_coverage)), format!("{:.2}", avg(&g.mapq_average)),
+            g.mapped_baits.last().copied().unwrap_or(0).to_string(), g.mapped_baits_with_reads.last().copied().unwrap_or(0).to_string(),
+            g.average_bait_coverage.last().copied().unwrap_or(0).to_string(), g.bait_cv.last().copied().unwrap_or(0).to_string(),
+            "N/A".to_string(), "N/A".to_string(), mate_pairs, g.reference_sequence_length.join("; "), gf.join("; "), dc.join("; "), rm.join("; "),
+        ])?;
+        rows += 1;
+    }
+    tokio::fs::write(&path, out).await?;
+    info!("[AMR] RGI gene TSV written: rows={} path={}", rows, path.display());
+    Ok(path)
+}
+
+async fn capture_command_stdout(
+    config: Arc<RunConfig>, tag: &str, args: Vec<String>, path: &std::path::Path,
+    prefix: &[u8], label: &str,
+) -> anyhow::Result<()> {
+    let (mut child, stderr_task) = spawn_cmd(config.clone(), tag, args, config.args.verbose, None).await?;
+    let mut stdout = parse_child_output(&mut child, ChildStream::Stdout, ParseMode::Bytes, &config).await?;
+    let mut out = Vec::<u8>::from(prefix);
+    while let Some(item) = stdout.recv().await {
+        match item { ParseOutput::Bytes(bytes) => out.extend_from_slice(&bytes), other => return Err(anyhow!("{} unexpected stdout item: {:?}", label, other)) }
+    }
+    let status = child.wait().await?;
+    stderr_task.await.map_err(|e| anyhow!("{} stderr task panicked: {}", label, e))??;
+    if !status.success() { return Err(anyhow!("{} failed with exit status {}", label, status)); }
+    tokio::fs::write(path, &out).await?;
+    info!("[AMR] {} written: bytes={} path={}", label, out.len(), path.display());
+    Ok(())
+}
+
+async fn write_rgi_mapping_stats(
+    config: Arc<RunConfig>, bam: &std::path::Path, reads: &HashMap<String, RgiReadCounts>, out_dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let reference_path = out_dir.join("sr_amr_report.reference_mapping_stats.txt");
+    let reference = format!("**********************************************\nStats for Reference: \n**********************************************\n\nhow many reference terms (or ARO terms): {}\n\n", reads.len());
+    tokio::fs::write(&reference_path, reference).await?;
+    info!("[AMR] RGI reference mapping stats written: references={} path={}", reads.len(), reference_path.display());
+
+    let bam_s = bam.to_string_lossy().to_string();
+    let overall_path = out_dir.join("sr_amr_report.overall_mapping_stats.txt");
+    capture_command_stdout(config.clone(), BAMTOOLS_TAG, vec!["stats".into(), "-in".into(), bam_s.clone()], &overall_path, b"", "RGI overall mapping stats").await?;
+
+    let artifacts_path = out_dir.join("sr_amr_report.artifacts_mapping_stats.txt");
+    let header = b"**********************************************\nStats for Artifacts: \n**********************************************\n\n";
+    capture_command_stdout(config, SAMTOOLS_TAG, vec!["flagstat".into(), bam_s], &artifacts_path, header, "RGI artifacts mapping stats").await?;
+    Ok(())
+}
+
 fn build_rgi_allele_summaries(
     reads: &HashMap<String, RgiReadCounts>,
     coverage: &HashMap<String, RgiCoverage>,
@@ -3943,6 +4186,16 @@ pub async fn run(
         &rgi_allele_summaries,
         &out_dir,
     )
+        .await
+        .map_err(PipelineError::Other)?;
+
+    write_rgi_allele_tsv(&rgi_allele_summaries, &out_dir)
+        .await
+        .map_err(PipelineError::Other)?;
+    write_rgi_gene_tsv(&rgi_allele_summaries, &out_dir)
+        .await
+        .map_err(PipelineError::Other)?;
+    write_rgi_mapping_stats(config.clone(), &sorted_bam_path, &rgi_read_counts, &out_dir)
         .await
         .map_err(PipelineError::Other)?;
 
