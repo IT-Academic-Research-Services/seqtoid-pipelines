@@ -27,7 +27,7 @@ use crate::utils::command::rgi::RgiConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{resolve_existing_input_path, validate_file_inputs, write_count_file};
-use crate::utils::streams::{interleave_fastq_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
+use crate::utils::streams::{interleave_fastx_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
@@ -3291,7 +3291,7 @@ pub async fn run(
                     fastq_file_to_record_stream(path, config.clone(), "amr_filtered_subsampled_r2").await?;
                 input_tasks.push(task);
 
-                let (interleaved_rx, interleave_task) = interleave_fastq_streams(
+                let (interleaved_rx, interleave_task) = interleave_fastx_streams(
                     subsampled_r1.into_inner(),
                     subsampled_r2.into_inner(),
                     config.base_buffer_size * 4,
@@ -3325,7 +3325,7 @@ pub async fn run(
                 input_tasks.push(task);
 
                 let (interleaved_rx, interleave_task) =
-                    interleave_fastq_streams(
+                    interleave_fastx_streams(
                         pre_r1.into_inner(),
                         pre_r2.into_inner(),
                         config.base_buffer_size * 4,
