@@ -514,6 +514,207 @@ async fn run_rgi_bwt_kma(
     })
 }
 #[derive(Debug)]
+struct RgiMainOutputs {
+    /// Owns returned scratch paths until downstream readers/packaging finish.
+    _work_dir: TempDir,
+    output_main: Vec<PathBuf>,
+    output_json: PathBuf,
+    main_amr_results: PathBuf,
+}
+
+/// WDL RunRgiMain: run RGI main on assembled contigs, or synthesize the
+/// WDL-compatible empty outputs when SPAdes emitted its failure marker.
+async fn run_rgi_main(
+    config: Arc<RunConfig>,
+    contigs_fa: &PathBuf,
+    rgi_db_root: &std::path::Path,
+) -> Result<RgiMainOutputs, PipelineError> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let contigs = tokio::fs::canonicalize(contigs_fa).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiMain cannot resolve input {}: {}", contigs_fa.display(), e,
+        )))?;
+    let metadata = tokio::fs::metadata(&contigs).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiMain cannot stat input {}: {}", contigs.display(), e,
+        )))?;
+    if !metadata.is_file() {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRgiMain input is not a regular file: {}", contigs.display(),
+        )));
+    }
+
+    let work_dir = crate::utils::file::choose_temp_dir(
+        metadata.len().saturating_mul(4).max(1),
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    ).await?;
+    let work_path = tokio::fs::canonicalize(work_dir.path()).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiMain cannot resolve scratch directory {}: {}",
+            work_dir.path().display(), e,
+        )))?;
+
+    tokio::fs::create_dir_all(&config.out_dir).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiMain cannot create log directory {}: {}",
+            config.out_dir.display(), e,
+        )))?;
+
+    let prefix = work_path.join("contig_amr_report");
+    let output_json = work_path.join("contig_amr_report.json");
+    let main_amr_results = work_path.join("contig_amr_report.txt");
+
+    let first_line = {
+        let file = tokio::fs::File::open(&contigs).await
+            .map_err(|e| PipelineError::IOError(format!(
+                "RunRgiMain cannot open input {}: {}", contigs.display(), e,
+            )))?;
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        reader.read_line(&mut line).await
+            .map_err(|e| PipelineError::IOError(format!(
+                "RunRgiMain cannot read input {}: {}", contigs.display(), e,
+            )))?;
+        line.trim_end_matches(['\r', '\n']).to_owned()
+    };
+
+    if first_line == ";ASSEMBLY FAILED" {
+        // WDL copies /tmp/empty-main-header.txt. This is the RGI main 6.x
+        // tabular schema, including the fields consumed by MakeGeneCoverage.
+        const EMPTY_MAIN_HEADER: &str = concat!(
+        "ORF_ID\tContig\tStart\tStop\tOrientation\tCut_Off\tPass_Bitscore\t",
+        "Best_Hit_Bitscore\tBest_Hit_ARO\tBest_Identities\tARO\tModel_type\t",
+        "SNPs_in_Best_Hit_ARO\tOther_SNPs\tDrug Class\tResistance Mechanism\t",
+        "AMR Gene Family\tPredicted_DNA\tPredicted_Protein\tCARD_Protein_Sequence\t",
+        "Percentage Length of Reference Sequence\tID\tModel_ID\tNudged\tNote\t",
+        "Hit_Start\tHit_End\tAntibiotic\tAST_Source\n"
+        );
+        tokio::try_join!(
+            tokio::fs::write(&output_json, b"{}\n"),
+            tokio::fs::write(&main_amr_results, EMPTY_MAIN_HEADER.as_bytes()),
+        ).map_err(|e| PipelineError::IOError(format!(
+            "RunRgiMain failed writing assembly-failure outputs: {}", e,
+        )))?;
+    } else {
+        let stdout_log_path = config.out_dir.join("amr_rgi_main_stdout.log");
+        let stderr_log_path = config.out_dir.join("amr_rgi_main_stderr.log");
+
+        let rgi_config = RgiConfig::new(RgiSubcommand::Main)
+            .flag("--local")
+            .option("-i", contigs.to_string_lossy().into_owned())
+            .option("-o", prefix.to_string_lossy().into_owned())
+            .option("-t", "contig")
+            .option("-a", "BLAST")
+            .flag("--include_nudge")
+            .flag("--clean");
+        let args = generate_cli(RGI_TAG, &config, Some(&rgi_config))?;
+
+        info!(
+            "[RunRgiMain] rgi {:?}; output directory={}; stdout={}; stderr={}",
+            args, work_path.display(), stdout_log_path.display(), stderr_log_path.display(),
+        );
+
+        let (mut child, stderr_task) = spawn_amr_rgi(
+            rgi_db_root, args, stderr_log_path.clone(),
+        ).await.map_err(|e| PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!("RunRgiMain spawn failed: {}", e),
+        })?;
+
+        let stdout_rx = match parse_child_output(
+            &mut child, ChildStream::Stdout, ParseMode::Lines, &config,
+        ).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = stderr_task.await;
+                return Err(PipelineError::ToolExecution {
+                    tool: RGI_TAG.to_string(),
+                    error: format!(
+                        "RunRgiMain stdout capture setup failed: {}; stderr log: {}",
+                        e, stderr_log_path.display(),
+                    ),
+                });
+            }
+        };
+        let stdout_task = tokio::spawn(stream_to_file(stdout_rx, stdout_log_path.clone()));
+        let (status_result, stdout_result, stderr_result) =
+            tokio::join!(child.wait(), stdout_task, stderr_task);
+
+        let status = status_result.map_err(|e| PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!(
+                "RunRgiMain wait failed: {}; stdout={}; stderr={}",
+                e, stdout_log_path.display(), stderr_log_path.display(),
+            ),
+        })?;
+        if !status.success() {
+            return Err(PipelineError::ToolExecution {
+                tool: RGI_TAG.to_string(),
+                error: format!(
+                    "RunRgiMain exited with {}; stdout={}; stderr={}",
+                    status, stdout_log_path.display(), stderr_log_path.display(),
+                ),
+            });
+        }
+        stdout_result
+            .map_err(|e| PipelineError::Other(anyhow!(
+                "RunRgiMain stdout writer task failed: {}; log={}", e, stdout_log_path.display(),
+            )))?
+            .map_err(|e| PipelineError::Other(anyhow!(
+                "RunRgiMain stdout write failed: {}; log={}", e, stdout_log_path.display(),
+            )))?;
+        stderr_result
+            .map_err(|e| PipelineError::Other(anyhow!(
+                "RunRgiMain stderr task failed: {}; log={}", e, stderr_log_path.display(),
+            )))?
+            .map_err(|e| PipelineError::Other(anyhow!(
+                "RunRgiMain stderr capture failed: {}; log={}", e, stderr_log_path.display(),
+            )))?;
+    }
+
+    for path in [&output_json, &main_amr_results] {
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            PipelineError::IOError(format!(
+                "RunRgiMain missing/unreadable required output {}: {}", path.display(), e,
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(PipelineError::IOError(format!(
+                "RunRgiMain output is not a regular file: {}", path.display(),
+            )));
+        }
+    }
+
+    // WDL glob("contig_amr_report*"), scoped to this fresh output directory.
+    let mut output_main = Vec::new();
+    let mut entries = tokio::fs::read_dir(&work_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    while let Some(entry) = entries.next_entry().await
+        .map_err(|e| PipelineError::IOError(e.to_string()))? {
+        if entry.file_name().to_string_lossy().starts_with("contig_amr_report")
+            && entry.file_type().await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?.is_file()
+        {
+            output_main.push(entry.path());
+        }
+    }
+    output_main.sort();
+
+    Ok(RgiMainOutputs {
+        _work_dir: work_dir,
+        output_main,
+        output_json,
+        main_amr_results,
+    })
+}
+
+#[derive(Debug)]
 struct RgiKmerBwtOutputs {
     /// Owns returned scratch paths until downstream readers/packaging finish.
     _work_dir: TempDir,
@@ -2166,6 +2367,24 @@ pub async fn run(
         );
     }
 
+    // RunRgiMain is independent of the BWT k-mer result. Preserve that work
+    // even if the k-mer query failed, and defer error propagation until after
+    // all independently scheduled artifact writers have been drained.
+    let main_result = run_rgi_main(
+        config.clone(), &prepared.contigs_fa, &rgi_db_root,
+    ).await;
+    if let Ok(rgi_main) = &main_result {
+        info!(
+            "[AMR] RunRgiMain complete: {} artifacts, main={}, json={}",
+            rgi_main.output_main.len(),
+            rgi_main.main_amr_results.display(),
+            rgi_main.output_json.display(),
+        );
+        schedule_rgi_artifact_copies(
+            config.clone(), &rgi_main.output_main, &mut cleanup_tasks,
+        );
+    }
+
     // Future downstream analysis belongs ABOVE final cleanup. It reads the
     // scratch paths, never waits for publication copies, and must retain owners.
 
@@ -2183,11 +2402,13 @@ pub async fn run(
         }
     }
 
-    // Propagate analysis failure only after its independent writers finish.
+    // Propagate analysis failures only after their independent writers finish.
     let rgi_kmer_bwt = kmer_result?;
+    let rgi_main = main_result?;
     if let Some(e) = publication_error {
         return Err(PipelineError::Other(e));
     }
+    drop(rgi_main);
     drop(rgi_kmer_bwt);
     drop(rgi_bwt_kma);
 
