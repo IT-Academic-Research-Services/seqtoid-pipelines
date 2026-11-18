@@ -298,7 +298,7 @@ async fn run_rgi_bwt_kma(
     let stdout_rx = match parse_child_output(
         &mut child,
         ChildStream::Stdout,
-        ParseMode::Lines,
+        ParseMode::Bytes,
         &config,
     )
         .await
@@ -626,7 +626,7 @@ async fn run_rgi_main(
         })?;
 
         let stdout_rx = match parse_child_output(
-            &mut child, ChildStream::Stdout, ParseMode::Lines, &config,
+            &mut child, ChildStream::Stdout, ParseMode::Bytes, &config,
         ).await {
             Ok(rx) => rx,
             Err(e) => {
@@ -805,7 +805,7 @@ async fn run_rgi_kmer_bwt(
     let stdout_rx = match parse_child_output(
         &mut child,
         ChildStream::Stdout,
-        ParseMode::Lines,
+        ParseMode::Bytes,
         &config,
     )
         .await
@@ -1285,7 +1285,7 @@ async fn run_spades_amr(
         let stdout_task = match parse_child_output(
             &mut child,
             ChildStream::Stdout,
-            ParseMode::Lines,
+            ParseMode::Bytes,
             &completion_config,
         )
             .await
