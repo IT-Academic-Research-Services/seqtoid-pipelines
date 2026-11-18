@@ -1887,6 +1887,137 @@ async fn tsv_to_sam(
     Ok(TsvToSamOutputs { _work_dir: work_dir, output_sorted, output_sorted_bai })
 }
 
+#[derive(Debug)]
+struct PackagedAmrOutputs {
+    _work_dir: TempDir,
+    artifacts: Vec<PathBuf>,
+}
+
+// Use the shared launcher and copy stdout as raw bytes (including pigz output).
+async fn amr_package_command(
+    config: &Arc<RunConfig>, tool: &str, args: Vec<std::ffi::OsString>,
+    stdout: &std::path::Path, label: &str,
+) -> Result<(), PipelineError> {
+    use tokio::io::AsyncWriteExt;
+    let stderr_path = config.out_dir.join(format!("amr_package_{}_stderr.log", label));
+    // spawn_cmd accepts String arguments. Reject non-UTF-8 rather than silently
+    // changing a path with to_string_lossy.
+    let args = args.into_iter().map(|arg| arg.into_string().map_err(|arg|
+        PipelineError::InvalidConfig(format!("AMR packaging {}: non-UTF-8 argument {:?}", label, arg))
+    )).collect::<Result<Vec<String>, PipelineError>>()?;
+    let mut output = tokio::fs::File::create(stdout).await?;
+    let (mut child, stderr_task) = spawn_cmd(
+        config.clone(), tool, args, config.args.verbose, Some(stderr_path.clone()),
+    ).await.map_err(|e| PipelineError::ToolExecution {
+        tool: tool.to_owned(), error: format!("AMR packaging {} spawn: {}", label, e),
+    })?;
+    let Some(mut pipe) = child.stdout.take() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        let _ = stderr_task.await;
+        return Err(PipelineError::ToolExecution { tool: tool.to_owned(),
+            error: format!("AMR packaging {}: missing stdout", label) });
+    };
+    // On a copy failure, dropping the read end closes the pipe, then kill/reap
+    // the child before returning. Always join stderr capture as well.
+    let copy_result = tokio::io::copy(&mut pipe, &mut output).await;
+    drop(pipe);
+    if copy_result.is_err() {
+        let _ = child.kill().await;
+    }
+    let (status_result, stderr_result) = tokio::join!(child.wait(), stderr_task);
+    let flush_result = output.flush().await;
+    let mut failures = Vec::new();
+    if let Err(e) = copy_result { failures.push(format!("stdout copy: {}", e)); }
+    if let Err(e) = flush_result { failures.push(format!("stdout flush: {}", e)); }
+    match status_result {
+        Ok(status) if status.success() => {}
+        Ok(status) => failures.push(format!("exited with {}", status)),
+        Err(e) => failures.push(format!("wait: {}", e)),
+    }
+    match stderr_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => failures.push(format!("stderr capture: {}", e)),
+        Err(e) => failures.push(format!("stderr task: {}", e)),
+    }
+    if !failures.is_empty() {
+        return Err(PipelineError::ToolExecution { tool: tool.to_owned(),
+            error: format!("AMR packaging {}: {}; stderr={}", label,
+                           failures.join("; "), stderr_path.display()) });
+    }
+    Ok(())
+}
+
+/// WDL ZipOutputs membership, with the requested tar.gz/pigz substitution.
+/// FASTA outputs are separate from the archive, exactly as in the WDL.
+async fn package_amr_outputs(
+    config: Arc<RunConfig>, prepared: &AmrPreparedInputs,
+    main: &RgiMainOutputs, main_species: &RgiKmerMainOutputs,
+    kma: &RgiBwtKmaOutputs, read_species: &RgiKmerBwtOutputs,
+    reports: &ResultsPerSampleOutputs,
+) -> Result<PackagedAmrOutputs, PipelineError> {
+    use std::ffi::OsString;
+    let groups = [
+        ("final_reports", vec![&reports.final_summary, &reports.synthesized_report]),
+        ("raw_reports", vec![&read_species.kma_species_calling, &read_species.sr_species_allele,
+                             &main_species.species_calling, &main.main_amr_results, &kma.kma_amr_results, &kma.gene_mapping_data]),
+        ("intermediate_files", vec![&kma.artifacts_mapping_stats, &kma.overall_mapping_stats,
+                                    &kma.reference_mapping_stats, &kma.output_sorted_length_100,
+                                    &kma.output_sorted_length_100_bai, &main.output_json, &kma.kma_amr_results_json]),
+    ];
+    let mut size = 0u64;
+    for path in groups.iter().flat_map(|(_, paths)| paths.iter().copied())
+        .chain(std::iter::once(&prepared.contigs_fa)).chain(prepared.non_host_reads_fa.iter()) {
+        size = size.saturating_add(tokio::fs::metadata(path).await?.len());
+    }
+    let work_dir = crate::utils::file::choose_temp_dir(size.saturating_mul(3).max(1),
+                                                       &config.ram_temp_dir, &config.args.nvme_scratch, 4, false).await?;
+    let root = tokio::fs::canonicalize(work_dir.path()).await?;
+    let stage = root.join("outputs");
+    for (directory, paths) in &groups {
+        let target = stage.join(directory);
+        tokio::fs::create_dir_all(&target).await?;
+        for path in paths {
+            let name = path.file_name().ok_or_else(|| PipelineError::InvalidConfig("Missing package basename".into()))?;
+            let source = tokio::fs::canonicalize(path).await?;
+            let dest = target.join(name);
+            // Dereferenced by tar: avoid copying large intermediate BAMs.
+            tokio::fs::symlink(&source, &dest).await?;
+        }
+    }
+    let contigs = root.join("contigs.fasta");
+    tokio::fs::copy(&prepared.contigs_fa, &contigs).await?;
+    let reads = root.join("non_host_reads.fasta");
+    match prepared.non_host_reads_fa.as_slice() {
+        [single] => { tokio::fs::copy(single, &reads).await?; }
+        [first, second] => {
+            let interleaved = root.join("non_host_reads_fa_ilv.fasta");
+            amr_package_command(&config, "seqfu", vec!["ilv".into(), "-1".into(),
+                                                       first.as_os_str().to_owned(), "-2".into(), second.as_os_str().to_owned()],
+                                &interleaved, "interleave").await?;
+            // Preserve the WDL's exact duplicate-name renaming semantics.
+            amr_package_command(&config, crate::config::defs::SEQKIT_TAG,
+                                vec!["rename".into(), "-1".into(), "-s".into(), "/".into(),
+                                     interleaved.as_os_str().to_owned(), "-o".into(), reads.as_os_str().to_owned()],
+                                &root.join("rename.stdout.log"), "rename").await?;
+            tokio::fs::remove_file(interleaved).await?;
+        }
+        _ => return Err(PipelineError::InvalidConfig("AMR packaging requires one or two FASTA inputs".into())),
+    }
+    let tar = root.join("outputs.tar");
+    amr_package_command(&config, "tar", vec!["-h".into(), "-cf".into(), tar.as_os_str().to_owned(),
+                                             "-C".into(), stage.as_os_str().to_owned(), "final_reports".into(), "raw_reports".into(),
+                                             "intermediate_files".into()], &root.join("tar.stdout.log"), "tar").await?;
+    let archive = root.join("outputs.tar.gz");
+    let mut args: Vec<OsString> = generate_cli(crate::config::defs::PIGZ_TAG, &config, None)?
+        .into_iter().map(OsString::from).collect();
+    args.push("--".into());
+    args.push(tar.as_os_str().to_owned());
+    amr_package_command(&config, crate::config::defs::PIGZ_TAG, args, &archive, "pigz").await?;
+    tokio::fs::remove_file(tar).await?;
+    Ok(PackagedAmrOutputs { _work_dir: work_dir, artifacts: vec![archive, contigs, reads] })
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -3360,6 +3491,17 @@ pub async fn run(
         schedule_rgi_artifact_copies(config.clone(), &[sam.output_sorted.clone(), sam.output_sorted_bai.clone()], &mut cleanup_tasks);
     }
 
+    let package_result = match (&main_result, &main_kmer_result, &kmer_result, &results_result) {
+        (Ok(main), Some(Ok(main_species)), Ok(read_species), Some(Ok(reports))) =>
+            Some(package_amr_outputs(config.clone(), &prepared, main, main_species,
+                                     &rgi_bwt_kma, read_species, reports).await),
+        _ => None,
+    };
+    if let Some(Ok(package)) = &package_result {
+        info!("[AMR] ZipOutputs complete: outputs.tar.gz, contigs.fasta, non_host_reads.fasta");
+        schedule_rgi_artifact_copies(config.clone(), &package.artifacts, &mut cleanup_tasks);
+    }
+
     // Future downstream analysis belongs ABOVE final cleanup. It reads the
     // scratch paths, never waits for publication copies, and must retain owners.
 
@@ -3387,9 +3529,11 @@ pub async fn run(
     let results = results_result
         .ok_or_else(|| PipelineError::Other(anyhow!("RunResultsPerSample was not scheduled")))??;
     let sam = sam_result.ok_or_else(|| PipelineError::Other(anyhow!("tsvToSam was not scheduled")))??;
+    let package = package_result.ok_or_else(|| PipelineError::Other(anyhow!("ZipOutputs was not scheduled")))??;
     if let Some(e) = publication_error {
         return Err(PipelineError::Other(e));
     }
+    drop(package);
     drop(sam);
     drop(results);
     drop(rgi_kmer_main);
