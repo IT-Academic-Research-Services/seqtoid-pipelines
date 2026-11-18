@@ -1261,12 +1261,39 @@ async fn fastq_file_to_record_stream(
     Ok((ReceiverStream::new(record_rx), completion_task))
 }
 
+/// Schedule durable artifact writers without blocking downstream analysis.
+/// The caller retains the source TempDir owners until cleanup_tasks are joined.
+fn schedule_rgi_artifact_copies(
+    config: Arc<RunConfig>,
+    artifacts: &[PathBuf],
+    cleanup_tasks: &mut Vec<JoinHandle<anyhow::Result<()>>>,
+) {
+    for source in artifacts {
+        let source = source.clone();
+        let config = config.clone();
+        cleanup_tasks.push(tokio::spawn(async move {
+            let name = source.file_name().ok_or_else(|| anyhow!(
+                "RGI artifact has no filename: {}", source.display(),
+            ))?;
+            let destination = config.out_dir.join(name);
+            let writer = crate::utils::file::copy_file_streaming(
+                &source, &destination, Some(config), None,
+            ).await?;
+            writer.await.map_err(|e| anyhow!(
+                "RGI artifact writer panicked for {}: {}", source.display(), e,
+            ))??;
+            info!("[AMR] preserved RGI artifact: {}", destination.display());
+            Ok(())
+        }));
+    }
+}
+
 pub async fn run(
     config: Arc<RunConfig>,
 ) -> anyhow::Result<(), PipelineError> {
     let cwd = std::env::current_dir()
         .map_err(|e| PipelineError::Other(e.into()))?;
-
+    let mut cleanup_tasks: Vec<JoinHandle<anyhow::Result<()>>> = Vec::new();
     let out_dir = config.out_dir.clone();
 
     info!("Starting AMR pipeline.");
@@ -2118,18 +2145,50 @@ pub async fn run(
         rgi_bwt_kma.output_kma.len(),
         rgi_bwt_kma.kma_amr_results.display(),
     );
-    let rgi_kmer_bwt = run_rgi_kmer_bwt(config.clone(), &rgi_bwt_kma, &rgi_db_root).await?;
-    info!(
-        "[AMR] RunRgiKmerBwt complete: {} artifacts, allele={}, gene={}",
-        rgi_kmer_bwt.output_kmer_bwt.len(),
-        rgi_kmer_bwt.sr_species_allele.display(),
-        rgi_kmer_bwt.kma_species_calling.display(),
+    schedule_rgi_artifact_copies(
+        config.clone(), &rgi_bwt_kma.output_kma, &mut cleanup_tasks,
     );
-    // Add downstream report merging/packaging above these drops and await
-    // every reader before releasing either task's scratch directory.
+
+    // Do not return early on query failure: first finish the BWT writers
+    // while their source directory owner is still alive.
+    let kmer_result = run_rgi_kmer_bwt(
+        config.clone(), &rgi_bwt_kma, &rgi_db_root,
+    ).await;
+    if let Ok(rgi_kmer_bwt) = &kmer_result {
+        info!(
+            "[AMR] RunRgiKmerBwt complete: {} artifacts, allele={}, gene={}",
+            rgi_kmer_bwt.output_kmer_bwt.len(),
+            rgi_kmer_bwt.sr_species_allele.display(),
+            rgi_kmer_bwt.kma_species_calling.display(),
+        );
+        schedule_rgi_artifact_copies(
+            config.clone(), &rgi_kmer_bwt.output_kmer_bwt, &mut cleanup_tasks,
+        );
+    }
+
+    // Future downstream analysis belongs ABOVE final cleanup. It reads the
+    // scratch paths, never waits for publication copies, and must retain owners.
+
+    let mut publication_error = None;
+    for task in cleanup_tasks {
+        let result = match task.await {
+            Ok(result) => result,
+            Err(e) => Err(anyhow!("RGI artifact cleanup task panicked: {}", e)),
+        };
+        if let Err(e) = result {
+            error!("[AMR] RGI artifact publication failed: {}", e);
+            if publication_error.is_none() {
+                publication_error = Some(e);
+            }
+        }
+    }
+
+    // Propagate analysis failure only after its independent writers finish.
+    let rgi_kmer_bwt = kmer_result?;
+    if let Some(e) = publication_error {
+        return Err(PipelineError::Other(e));
+    }
     drop(rgi_kmer_bwt);
-    // Add downstream tasks above this explicit drop, and await their readers
-    // before releasing the scratch directory. No durable copy is made here.
     drop(rgi_bwt_kma);
 
     Ok(())
