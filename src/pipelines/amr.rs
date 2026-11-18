@@ -583,16 +583,8 @@ async fn run_rgi_main(
     };
 
     if first_line == ";ASSEMBLY FAILED" {
-        // WDL copies /tmp/empty-main-header.txt. This is the RGI main 6.x
-        // tabular schema, including the fields consumed by MakeGeneCoverage.
-        const EMPTY_MAIN_HEADER: &str = concat!(
-        "ORF_ID\tContig\tStart\tStop\tOrientation\tCut_Off\tPass_Bitscore\t",
-        "Best_Hit_Bitscore\tBest_Hit_ARO\tBest_Identities\tARO\tModel_type\t",
-        "SNPs_in_Best_Hit_ARO\tOther_SNPs\tDrug Class\tResistance Mechanism\t",
-        "AMR Gene Family\tPredicted_DNA\tPredicted_Protein\tCARD_Protein_Sequence\t",
-        "Percentage Length of Reference Sequence\tID\tModel_ID\tNudged\tNote\t",
-        "Hit_Start\tHit_End\tAntibiotic\tAST_Source\n"
-        );
+        // Exact bytes of the supplied WDL /tmp/empty-main-header.txt.
+        const EMPTY_MAIN_HEADER: &str = "ORF_ID\tContig\tStart\tStop\tOrientation\tCut_Off\tPass_Bitscore\tBest_Hit_Bitscore\tBest_Hit_ARO\tBest_Identities\tARO\tModel_type\tSNPs_in_Best_Hit_ARO\tOther_SNPs\tDrug Class\tResistance Mechanism\tAMR Gene Family\tPredicted_DNA\tPredicted_Protein\tCARD_Protein_Sequence\tPercentage Length of Reference Sequence\tID\tModel_ID\tHit_Start\tHit_End\tNudged\tNote\r\n";
         tokio::try_join!(
             tokio::fs::write(&output_json, b"{}\n"),
             tokio::fs::write(&main_amr_results, EMPTY_MAIN_HEADER.as_bytes()),
