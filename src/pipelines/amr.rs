@@ -27,7 +27,7 @@ use crate::utils::command::rgi::RgiConfig;
 use crate::utils::command::generate_cli;
 use crate::utils::fastx::{parse_byte_stream_to_fastq, read_fasta, read_fastq, write_fasta_stream_to_file, SequenceRecord};
 use crate::utils::file::{resolve_existing_input_path, validate_file_inputs, write_count_file};
-use crate::utils::streams::{interleave_fastx_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
+use crate::utils::streams::{ChannelReader, parse_fasta, interleave_fastx_streams, join_with_error_handling, parse_child_output, spawn_cmd, stream_to_file, ChildStream, ParseMode, ParseOutput};
 use crate::utils::subsample::load_duplicate_clusters_csv;
 
 
@@ -1994,6 +1994,12 @@ async fn package_amr_outputs(
                 .map_err(PipelineError::Other)?;
             let r2 = read_fasta(second.clone(), u64::MAX, None, None, &config)
                 .map_err(PipelineError::Other)?;
+            // read_fasta emits serialized byte batches; decode records using
+            // the existing shared parser before record-wise interleaving.
+            let r1 = parse_fasta(ChannelReader::new(r1), &config, StreamDataType::JustBytes)
+                .await.map_err(PipelineError::Other)?;
+            let r2 = parse_fasta(ChannelReader::new(r2), &config, StreamDataType::JustBytes)
+                .await.map_err(PipelineError::Other)?;
             let (rx, interleave_task) = interleave_fastx_streams(r1, r2, config.base_buffer_size).await?;
             let rename = crate::utils::command::seqkit::SeqkitConfig::new(
                 crate::config::defs::SeqkitSubcommand::Rename)
