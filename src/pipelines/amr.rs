@@ -1744,6 +1744,127 @@ async fn run_results_per_sample(
         synthesized_report: directory.join("primary_AMR_report.tsv") })
 }
 
+#[derive(Debug)]
+struct TsvToSamOutputs {
+    _work_dir: TempDir,
+    output_sorted: PathBuf,
+    output_sorted_bai: PathBuf,
+}
+
+/// WDL re.sub(r'_\d*$', '', name), including removal of a trailing underscore.
+fn amr_bam_contig_name(name: &str) -> &str {
+    match name.rsplit_once('_') {
+        Some((prefix, suffix)) if suffix.bytes().all(|b| b.is_ascii_digit()) => prefix,
+        _ => name,
+    }
+}
+
+/// Write the WDL's synthetic alignments as SAM. samtools performs only encoding
+/// and indexing, not alignment or sorting. Duplicate summary rows are retained.
+fn amr_write_contig_sam(
+    contigs: &std::path::Path, summary: &std::path::Path, sam: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, Write};
+    let mut fasta = std::io::BufReader::new(std::fs::File::open(contigs)?);
+    let mut first = String::new();
+    fasta.read_line(&mut first)?;
+    let failed = first == ";ASSEMBLY FAILED\n";
+    let mut rows = Vec::<(String, String)>::new();
+    let mut references = Vec::<String>::new();
+    let mut seen = HashSet::new();
+    if !failed {
+        let table = AmrResultTable::read(summary)?;
+        table.require(&["ARO_contig_amr", "Contig_contig_amr"])?;
+        for row in &table.rows {
+            let Some(name) = amr_cell(row, "Contig_contig_amr") else { continue; };
+            let accession = amr_cell(row, "ARO_contig_amr")
+                .ok_or_else(|| anyhow!("tsvToSam: contig {:?} has no ARO", name))?;
+            let n: f64 = accession.parse()?;
+            if !n.is_finite() { return Err(anyhow!("tsvToSam: invalid ARO {:?}", accession)); }
+            let aro = format!("ARO:{:.0}", n.trunc());
+            if seen.insert(aro.clone()) { references.push(aro.clone()); }
+            rows.push((aro, amr_bam_contig_name(name).to_owned()));
+        }
+    }
+    let wanted: HashSet<&str> = rows.iter().map(|(_, n)| n.as_str()).collect();
+    let mut sequences = HashMap::<String, String>::new();
+    if !failed && !wanted.is_empty() {
+        // Fetch equivalent: FASTA IDs end at the first whitespace. Keep only
+        // requested contigs, and retain the first occurrence of duplicate IDs.
+        let mut name = String::new();
+        let mut sequence = String::new();
+        let mut keep = false;
+        for line in std::iter::once(Ok(first)).chain(fasta.lines()) {
+            let line = line?;
+            if let Some(header) = line.strip_prefix('>') {
+                if keep { sequences.entry(name.clone()).or_insert(std::mem::take(&mut sequence)); }
+                sequence.clear();
+                name = header.split_whitespace().next().unwrap_or("").to_owned();
+                keep = wanted.contains(name.as_str());
+            } else if keep {
+                sequence.extend(line.chars().filter(|c| !c.is_whitespace()));
+            }
+        }
+        if keep { sequences.entry(name).or_insert(sequence); }
+    }
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(sam)?);
+    if references.is_empty() { references.push("NoGenes".to_owned()); }
+    for reference in &references { writeln!(writer, "@SQ\tSN:{}\tLN:100", reference)?; }
+    for (aro, name) in rows {
+        let sequence = sequences.get(&name)
+            .ok_or_else(|| anyhow!("tsvToSam: contig {:?} not found in {}", name, contigs.display()))?;
+        // pysam defaults: flag=0, MAPQ=0, no CIGAR/mate/qualities. Its
+        // reference_start=1 is zero-based, hence SAM POS=2, not POS=1.
+        writeln!(writer, "{}\t0\t{}\t2\t0\t*\t*\t0\t0\t{}\t*",
+                 name, aro, if sequence.is_empty() { "*" } else { sequence })?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+async fn tsv_to_sam(
+    config: Arc<RunConfig>, contigs: &std::path::Path, results: &ResultsPerSampleOutputs,
+) -> Result<TsvToSamOutputs, PipelineError> {
+    let bytes = tokio::fs::metadata(contigs).await
+        .map_err(|e| PipelineError::IOError(format!("tsvToSam input: {}", e)))?.len();
+    let work_dir = crate::utils::file::choose_temp_dir(bytes.saturating_mul(4).max(1),
+                                                       &config.ram_temp_dir, &config.args.nvme_scratch, 4, false).await?;
+    let sam = work_dir.path().join("contig_amr_report.sam");
+    let output_sorted = work_dir.path().join("contig_amr_report.sorted.bam");
+    let output_sorted_bai = work_dir.path().join("contig_amr_report.sorted.bam.bai");
+    let input = contigs.to_path_buf();
+    let summary = results.final_summary.clone();
+    let worker_sam = sam.clone();
+    tokio::task::spawn_blocking(move || amr_write_contig_sam(&input, &summary, &worker_sam))
+        .await.map_err(|e| PipelineError::Other(anyhow!("tsvToSam worker: {}", e)))?
+        .map_err(PipelineError::Other)?;
+    // Match WDL: despite the filename, it does not sort records. Do not silently
+    // reorder them here; index failure is an error, just as with pysam.index.
+    for (stage, args) in [
+        ("encode", vec![std::ffi::OsString::from("view"), "--no-PG".into(), "-b".into(), "-o".into(),
+                        output_sorted.as_os_str().to_owned(), sam.as_os_str().to_owned()]),
+        ("index", vec![std::ffi::OsString::from("index"), output_sorted.as_os_str().to_owned(),
+                       output_sorted_bai.as_os_str().to_owned()]),
+    ] {
+        let stdout = config.out_dir.join(format!("amr_tsv_to_sam_{}_stdout.log", stage));
+        let stderr = config.out_dir.join(format!("amr_tsv_to_sam_{}_stderr.log", stage));
+        let out_file = tokio::fs::File::create(&stdout).await.map_err(|e| PipelineError::IOError(e.to_string()))?.into_std().await;
+        let err_file = tokio::fs::File::create(&stderr).await.map_err(|e| PipelineError::IOError(e.to_string()))?.into_std().await;
+        let status = tokio::process::Command::new("samtools").args(args)
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::from(out_file))
+            .stderr(std::process::Stdio::from(err_file)).kill_on_drop(true).status().await
+            .map_err(|e| PipelineError::Other(anyhow!("tsvToSam samtools {}: {}", stage, e)))?;
+        if !status.success() { return Err(PipelineError::Other(anyhow!(
+            "tsvToSam samtools {} exited {}; stderr={}", stage, status, stderr.display()))); }
+    }
+    for path in [&output_sorted, &output_sorted_bai] {
+        if !tokio::fs::metadata(path).await.map_err(|e| PipelineError::IOError(e.to_string()))?.is_file() {
+            return Err(PipelineError::Other(anyhow!("tsvToSam missing {}", path.display())));
+        }
+    }
+    Ok(TsvToSamOutputs { _work_dir: work_dir, output_sorted, output_sorted_bai })
+}
+
 /// Native streaming equivalent of the WDL RunRedup task.
 ///
 /// WDL semantics:
@@ -3208,6 +3329,15 @@ pub async fn run(
         schedule_rgi_artifact_copies(config.clone(), &results.artifacts, &mut cleanup_tasks);
     }
 
+    let sam_result = match &results_result {
+        Some(Ok(results)) => Some(tsv_to_sam(config.clone(), &prepared.contigs_fa, results).await),
+        _ => None,
+    };
+    if let Some(Ok(sam)) = &sam_result {
+        info!("[AMR] tsvToSam complete: bam={}, bai={}", sam.output_sorted.display(), sam.output_sorted_bai.display());
+        schedule_rgi_artifact_copies(config.clone(), &[sam.output_sorted.clone(), sam.output_sorted_bai.clone()], &mut cleanup_tasks);
+    }
+
     // Future downstream analysis belongs ABOVE final cleanup. It reads the
     // scratch paths, never waits for publication copies, and must retain owners.
 
@@ -3234,9 +3364,11 @@ pub async fn run(
         .ok_or_else(|| PipelineError::Other(anyhow!("RunRgiKmerMain was not scheduled")))??;
     let results = results_result
         .ok_or_else(|| PipelineError::Other(anyhow!("RunResultsPerSample was not scheduled")))??;
+    let sam = sam_result.ok_or_else(|| PipelineError::Other(anyhow!("tsvToSam was not scheduled")))??;
     if let Some(e) = publication_error {
         return Err(PipelineError::Other(e));
     }
+    drop(sam);
     drop(results);
     drop(rgi_kmer_main);
     drop(gene_coverage);
@@ -3388,5 +3520,38 @@ mod gene_coverage_tests {
     fn missing_json_hit_is_an_error() {
         let tsv = format!("{}a\th\t10\t20\t0\t5\t0\n", HEADER);
         assert!(gene_coverage_table(&tsv, &serde_json::json!({})).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tsv_to_sam_tests {
+    use super::*;
+    #[test]
+    fn strips_only_terminal_underscore_digits() {
+        assert_eq!(amr_bam_contig_name("NODE_cov_1.23_4"), "NODE_cov_1.23");
+        assert_eq!(amr_bam_contig_name("NODE_cov_1.23"), "NODE_cov_1.23");
+        assert_eq!(amr_bam_contig_name("NODE_"), "NODE");
+    }
+    #[test]
+    fn assembly_failure_has_dummy_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let fa = dir.path().join("contigs.fa");
+        let sam = dir.path().join("out.sam");
+        std::fs::write(&fa, ";ASSEMBLY FAILED\n").unwrap();
+        amr_write_contig_sam(&fa, &dir.path().join("absent.tsv"), &sam).unwrap();
+        assert_eq!(std::fs::read_to_string(sam).unwrap(), "@SQ\tSN:NoGenes\tLN:100\n");
+    }
+    #[test]
+    fn preserves_duplicates_and_pysam_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let fa = dir.path().join("contigs.fa");
+        let summary = dir.path().join("summary.tsv");
+        let sam = dir.path().join("out.sam");
+        std::fs::write(&fa, ">NODE_cov_1.2 description\nACGT\n").unwrap();
+        std::fs::write(&summary, "ARO_contig_amr\tContig_contig_amr\n3001.0\tNODE_cov_1.2_1\n3001.0\tNODE_cov_1.2_1\n\t\n").unwrap();
+        amr_write_contig_sam(&fa, &summary, &sam).unwrap();
+        let text = std::fs::read_to_string(sam).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.contains("NODE_cov_1.2\t0\tARO:3001\t2\t0\t*\t*\t0\t0\tACGT\t*"));
     }
 }
