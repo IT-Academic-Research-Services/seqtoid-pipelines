@@ -258,7 +258,7 @@ mod pigz {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -301,7 +301,7 @@ mod h5dump {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 }
@@ -1332,7 +1332,7 @@ pub mod ivar {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -1398,7 +1398,7 @@ pub mod muscle {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 }
@@ -1428,7 +1428,7 @@ pub mod mafft {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -1484,7 +1484,7 @@ pub mod quast {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -1553,7 +1553,7 @@ pub mod nucmer {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -1709,6 +1709,7 @@ pub mod seqkit {
                 match config.subcommand {
                     SeqkitSubcommand::Stats => "stats",
                     SeqkitSubcommand::Rmdup => "rmdup",
+                    SeqkitSubcommand::Rename => "rename",
                 }
                     .to_string(),
             );
@@ -2568,7 +2569,7 @@ pub mod star {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -2787,7 +2788,7 @@ pub mod czid_dedup {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -3343,7 +3344,7 @@ pub mod spades {
             version_file,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -3386,7 +3387,7 @@ pub mod spades {
                 129..=512 => available_gb / 2,
                 _ => 1000,
             }
-            .max(8); // minimum 8 GB to avoid SPAdes complaining
+                .max(8); // minimum 8 GB to avoid SPAdes complaining
 
             info!(
                 "SPAdes memory allocation: {} GB (available: {} GB, capped for safety)",
@@ -3724,7 +3725,7 @@ pub mod sort {
             None,
             &config,
         )
-        .await?;
+            .await?;
         Ok(version)
     }
 
@@ -4969,6 +4970,25 @@ pub mod rgi {
 /// # Returns
 ///
 /// Result<Vec<String>>: the generated command-line arguments
+pub mod tar {
+    use super::{ArgGenerator, RunConfig};
+    #[derive(Debug)]
+    pub struct TarConfig {
+        pub directory: String,
+        pub members: Vec<String>,
+    }
+    pub struct TarArgGenerator;
+    impl ArgGenerator for TarArgGenerator {
+        fn generate_args(&self, _: &RunConfig, extra: Option<&dyn std::any::Any>) -> anyhow::Result<Vec<String>> {
+            let config = extra.and_then(|v| v.downcast_ref::<TarConfig>())
+                .ok_or_else(|| anyhow::anyhow!("tar requires TarConfig"))?;
+            let mut args = vec!["-h".into(), "-cf".into(), "-".into(), "-C".into(), config.directory.clone(), "--".into()];
+            args.extend(config.members.iter().cloned());
+            Ok(args)
+        }
+    }
+}
+
 pub fn generate_cli(
     tool: &str,
     run_config: &RunConfig,
@@ -4977,6 +4997,7 @@ pub fn generate_cli(
     let generator: Box<dyn ArgGenerator> = match tool {
         FASTP_TAG => Box::new(fastp::FastpArgGenerator),
         PIGZ_TAG => Box::new(pigz::PigzArgGenerator),
+        "tar" => Box::new(tar::TarArgGenerator),
         MINIMAP2_TAG => Box::new(minimap2::Minimap2ArgGenerator),
         SAMTOOLS_TAG => Box::new(samtools::SamtoolsArgGenerator),
         KRAKEN2_TAG => Box::new(kraken2::Kraken2ArgGenerator),
