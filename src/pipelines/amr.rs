@@ -850,6 +850,35 @@ async fn make_gene_coverage(
     Ok(GeneCoverageOutputs { _work_dir: work_dir, output_gene_coverage })
 }
 
+#[cfg(test)]
+mod gene_coverage_tests {
+    use super::*;
+    const HEADER: &str = "ORF_ID\tID\tARO\tModel_ID\tHit_Start\tHit_End\tPercentage Length of Reference Sequence\n";
+
+    #[test]
+    fn empty_report() {
+        assert_eq!(gene_coverage_table(HEADER, &serde_json::json!({})).unwrap(),
+                   "ID\tgene_coverage_bps\tdb_seq_length\tgene_coverage_perc\n");
+    }
+
+    #[test]
+    fn overlapping_forward_and_reverse_ranges() {
+        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\nb\th\t10\t20\t7\t3\t0\n", HEADER);
+        let json = serde_json::json!({
+            "a": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}},
+            "b": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}}
+        });
+        // range(0,5) U range(7,3,-1) = {0,1,2,3,4,5,6,7}.
+        assert!(gene_coverage_table(&tsv, &json).unwrap().ends_with("10\t8\t10\t80.0\n"));
+    }
+
+    #[test]
+    fn missing_json_hit_is_an_error() {
+        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\n", HEADER);
+        assert!(gene_coverage_table(&tsv, &serde_json::json!({})).is_err());
+    }
+}
+
 #[derive(Debug)]
 struct RgiKmerBwtOutputs {
     /// Owns returned scratch paths until downstream readers/packaging finish.
@@ -1104,6 +1133,259 @@ async fn run_rgi_kmer_bwt(
         output_kmer_bwt,
         sr_species_allele,
         kma_species_calling,
+    })
+}
+
+#[derive(Debug)]
+struct RgiKmerMainOutputs {
+    /// Owns returned scratch paths until downstream readers/packaging finish.
+    _work_dir: TempDir,
+    output_kmer_main: Vec<PathBuf>,
+    species_calling: PathBuf,
+}
+
+async fn run_rgi_kmer_main(
+    config: Arc<RunConfig>,
+    main: &RgiMainOutputs,
+    rgi_db_root: &std::path::Path,
+) -> Result<RgiKmerMainOutputs, PipelineError> {
+    let input_json = tokio::fs::canonicalize(&main.output_json)
+        .await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiKmerMain cannot resolve input {}: {}",
+            main.output_json.display(), e,
+        )))?;
+    let metadata = tokio::fs::metadata(&input_json).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiKmerMain cannot stat input {}: {}", input_json.display(), e,
+        )))?;
+    if !metadata.is_file() {
+        return Err(PipelineError::InvalidConfig(format!(
+            "RunRgiKmerMain input is not a regular file: {}", input_json.display(),
+        )));
+    }
+    // Heuristic, not a quota; choose_temp_dir applies headroom/fallback.
+    let work_dir = crate::utils::file::choose_temp_dir(
+        metadata.len().saturating_mul(4).max(1),
+        &config.ram_temp_dir,
+        &config.args.nvme_scratch,
+        4,
+        false,
+    ).await?;
+    let work_path = tokio::fs::canonicalize(work_dir.path()).await
+        .map_err(|e| PipelineError::IOError(format!(
+            "RunRgiKmerMain cannot resolve scratch directory {}: {}",
+            work_dir.path().display(), e,
+        )))?;
+
+    tokio::fs::create_dir_all(&config.out_dir)
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "RunRgiKmerMain cannot create log directory {}: {}",
+                config.out_dir.display(),
+                e,
+            ))
+        })?;
+
+    let stdout_log_path = config.out_dir.join("amr_rgi_kmer_main_stdout.log");
+    let stderr_log_path = config.out_dir.join("amr_rgi_kmer_main_stderr.log");
+    let prefix = work_path.join("contig_species_report");
+
+    let rgi_config = RgiConfig::new(RgiSubcommand::KmerQuery)
+        .flag("--rgi")
+        .flag("--local")
+        .option("-k", "61")
+        .option("-i", input_json.to_string_lossy().into_owned())
+        .option("--output", prefix.to_string_lossy().into_owned());
+
+    let args = generate_cli(RGI_TAG, &config, Some(&rgi_config))?;
+
+    info!(
+        "[RunRgiKmerMain] rgi {:?}; output directory={}; \
+         stdout={}; stderr={}",
+        args,
+        work_path.display(),
+        stdout_log_path.display(),
+        stderr_log_path.display(),
+    );
+
+    let (mut child, stderr_task) = spawn_amr_rgi(
+        rgi_db_root,
+        args,
+        stderr_log_path.clone(),
+    )
+        .await
+        .map_err(|e| PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!("RunRgiKmerMain spawn failed: {}", e),
+        })?;
+
+    // stderr is redirected to its log. Install a stdout consumer before
+    // waiting so neither pipe can backpressure the running process.
+    let stdout_rx = match parse_child_output(
+        &mut child,
+        ChildStream::Stdout,
+        ParseMode::Bytes,
+        &config,
+    )
+        .await
+    {
+        Ok(rx) => rx,
+        Err(e) => {
+            // Do not leave the process running while work_dir is dropped.
+            let kill_result = child.kill().await;
+            let wait_result = child.wait().await;
+            let stderr_result = stderr_task.await;
+
+            if let Err(kill_error) = kill_result {
+                warn!(
+                    "[RunRgiKmerMain] cleanup kill failed: {}",
+                    kill_error,
+                );
+            }
+            if let Err(wait_error) = wait_result {
+                warn!(
+                    "[RunRgiKmerMain] cleanup wait failed: {}",
+                    wait_error,
+                );
+            }
+            if !matches!(&stderr_result, Ok(Ok(()))) {
+                warn!(
+                    "[RunRgiKmerMain] stderr capture during cleanup: {:?}",
+                    stderr_result,
+                );
+            }
+
+            return Err(PipelineError::ToolExecution {
+                tool: RGI_TAG.to_string(),
+                error: format!(
+                    "RunRgiKmerMain stdout capture setup failed: {}; \
+                     stderr log: {}",
+                    e,
+                    stderr_log_path.display(),
+                ),
+            });
+        }
+    };
+
+    let stdout_task = tokio::spawn(stream_to_file(
+        stdout_rx,
+        stdout_log_path.clone(),
+    ));
+
+    // Join all three, rather than returning early and detaching a writer.
+    let (status_result, stdout_result, stderr_result) =
+        tokio::join!(child.wait(), stdout_task, stderr_task);
+
+    // Report secondary capture failures even when the process itself
+    // failed. The process error remains the primary failure.
+    if !matches!(&stdout_result, Ok(Ok(()))) {
+        warn!(
+            "[RunRgiKmerMain] stdout capture failed: {:?}; log={}",
+            stdout_result,
+            stdout_log_path.display(),
+        );
+    }
+
+    if !matches!(&stderr_result, Ok(Ok(()))) {
+        warn!(
+            "[RunRgiKmerMain] stderr capture failed: {:?}; log={}",
+            stderr_result,
+            stderr_log_path.display(),
+        );
+    }
+
+    let status =
+        status_result.map_err(|e| PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!(
+                "RunRgiKmerMain wait failed: {}; stdout={}; stderr={}",
+                e,
+                stdout_log_path.display(),
+                stderr_log_path.display(),
+            ),
+        })?;
+
+    if !status.success() {
+        return Err(PipelineError::ToolExecution {
+            tool: RGI_TAG.to_string(),
+            error: format!(
+                "RunRgiKmerMain exited with {}; stdout={}; stderr={}",
+                status,
+                stdout_log_path.display(),
+                stderr_log_path.display(),
+            ),
+        });
+    }
+
+    stdout_result
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerMain stdout writer task failed: {}; log={}",
+                e,
+                stdout_log_path.display(),
+            ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerMain stdout write failed: {}; log={}",
+                e,
+                stdout_log_path.display(),
+            ))
+        })?;
+
+    stderr_result
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerMain stderr task failed: {}; log={}",
+                e,
+                stderr_log_path.display(),
+            ))
+        })?
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "RunRgiKmerMain stderr capture failed: {}; log={}",
+                e,
+                stderr_log_path.display(),
+            ))
+        })?;
+
+    let species_calling =
+        work_path.join("contig_species_report_61mer_analysis_rgi_summary.txt");
+    for path in [&species_calling] {
+        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
+            PipelineError::IOError(format!(
+                "RunRgiKmerMain missing/unreadable required output {}: {}; stderr={}",
+                path.display(), e, stderr_log_path.display(),
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(PipelineError::IOError(format!(
+                "RunRgiKmerMain output is not a regular file: {}", path.display(),
+            )));
+        }
+        // Do not impose a blanket nonempty-file requirement on reports.
+    }
+
+    // WDL glob("contig_species_report*"), scoped to this invocation.
+    let mut output_kmer_main = Vec::new();
+    let mut entries = tokio::fs::read_dir(&work_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?;
+    while let Some(entry) = entries.next_entry().await
+        .map_err(|e| PipelineError::IOError(e.to_string()))? {
+        if entry.file_name().to_string_lossy().starts_with("contig_species_report")
+            && entry.file_type().await
+            .map_err(|e| PipelineError::IOError(e.to_string()))?.is_file()
+        {
+            output_kmer_main.push(entry.path());
+        }
+    }
+    output_kmer_main.sort();
+    Ok(RgiKmerMainOutputs {
+        _work_dir: work_dir,
+        output_kmer_main,
+        species_calling,
     })
 }
 
@@ -2535,6 +2817,23 @@ pub async fn run(
         );
     }
 
+    // Run against the main JSON directly, reusing the prepared local database.
+    // Keep the owner alive until publication and downstream consumers finish.
+    let main_kmer_result = match &main_result {
+        Ok(main) => Some(run_rgi_kmer_main(config.clone(), main, &rgi_db_root).await),
+        Err(_) => None,
+    };
+    if let Some(Ok(main_kmer)) = &main_kmer_result {
+        info!(
+            "[AMR] RunRgiKmerMain complete: {} artifacts, species={}",
+            main_kmer.output_kmer_main.len(),
+            main_kmer.species_calling.display(),
+        );
+        schedule_rgi_artifact_copies(
+            config.clone(), &main_kmer.output_kmer_main, &mut cleanup_tasks,
+        );
+    }
+
     // Future downstream analysis belongs ABOVE final cleanup. It reads the
     // scratch paths, never waits for publication copies, and must retain owners.
 
@@ -2557,44 +2856,16 @@ pub async fn run(
     let rgi_main = main_result?;
     let gene_coverage = coverage_result
         .ok_or_else(|| PipelineError::Other(anyhow!("MakeGeneCoverage was not scheduled")))??;
+    let rgi_kmer_main = main_kmer_result
+        .ok_or_else(|| PipelineError::Other(anyhow!("RunRgiKmerMain was not scheduled")))??;
     if let Some(e) = publication_error {
         return Err(PipelineError::Other(e));
     }
+    drop(rgi_kmer_main);
     drop(gene_coverage);
     drop(rgi_main);
     drop(rgi_kmer_bwt);
     drop(rgi_bwt_kma);
 
     Ok(())
-}
-
-
-
-#[cfg(test)]
-mod gene_coverage_tests {
-    use super::*;
-    const HEADER: &str = "ORF_ID\tID\tARO\tModel_ID\tHit_Start\tHit_End\tPercentage Length of Reference Sequence\n";
-
-    #[test]
-    fn empty_report() {
-        assert_eq!(gene_coverage_table(HEADER, &serde_json::json!({})).unwrap(),
-                   "ID\tgene_coverage_bps\tdb_seq_length\tgene_coverage_perc\n");
-    }
-
-    #[test]
-    fn overlapping_forward_and_reverse_ranges() {
-        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\nb\th\t10\t20\t7\t3\t0\n", HEADER);
-        let json = serde_json::json!({
-            "a": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}},
-            "b": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}}
-        });
-        // range(0,5) U range(7,3,-1) = {0,1,2,3,4,5,6,7}.
-        assert!(gene_coverage_table(&tsv, &json).unwrap().ends_with("10\t8\t10\t80.0\n"));
-    }
-
-    #[test]
-    fn missing_json_hit_is_an_error() {
-        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\n", HEADER);
-        assert!(gene_coverage_table(&tsv, &serde_json::json!({})).is_err());
-    }
 }
