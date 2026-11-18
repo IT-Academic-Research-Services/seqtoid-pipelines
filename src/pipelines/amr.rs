@@ -1759,10 +1759,84 @@ fn amr_bam_contig_name(name: &str) -> &str {
     }
 }
 
-/// Write the WDL's synthetic alignments as SAM. samtools performs only encoding
-/// and indexing, not alignment or sorting. Duplicate summary rows are retained.
-fn amr_write_contig_sam(
-    contigs: &std::path::Path, summary: &std::path::Path, sam: &std::path::Path,
+// BGZF framing around gzip's DEFLATE payload and CRC/ISIZE trailer. A 32 KiB
+// input block stays below BGZF's 64 KiB limit even for incompressible data.
+struct AmrBgzfWriter {
+    output: std::fs::File,
+    pending: Vec<u8>,
+}
+impl AmrBgzfWriter {
+    fn new(output: std::fs::File) -> Self { Self { output, pending: Vec::new() } }
+    fn block(&mut self, input: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(input)?;
+        let gzip = gzip.finish()?;
+        // GzEncoder's default header is ten bytes; replace it with BGZF's header.
+        let total = 18 + gzip.len() - 10;
+        let size = u16::try_from(total - 1).map_err(|_| std::io::Error::new(
+            std::io::ErrorKind::InvalidData, "BGZF block too large"))?;
+        self.output.write_all(&[31, 139, 8, 4, 0, 0, 0, 0, 0, 255, 6, 0, 66, 67, 2, 0])?;
+        self.output.write_all(&size.to_le_bytes())?;
+        self.output.write_all(&gzip[10..])
+    }
+    fn finish(mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        let tail = std::mem::take(&mut self.pending);
+        if !tail.is_empty() { self.block(&tail)?; }
+        self.block(&[])?; // canonical empty BGZF EOF block
+        self.output.flush()
+    }
+}
+impl std::io::Write for AmrBgzfWriter {
+    fn write(&mut self, mut input: &[u8]) -> std::io::Result<usize> {
+        let count = input.len();
+        while !input.is_empty() {
+            let n = input.len().min(32768 - self.pending.len());
+            self.pending.extend_from_slice(&input[..n]);
+            input = &input[n..];
+            if self.pending.len() == 32768 {
+                let block = std::mem::take(&mut self.pending);
+                self.block(&block)?;
+            }
+        }
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { std::io::Write::flush(&mut self.output) }
+}
+
+fn amr_contig_bam_record(reference: usize, name: &str, sequence: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // pysam AlignedSegment defaults: flag=0, MAPQ=0, empty CIGAR,
+    // mate reference/position=-1, template length=0, missing qualities.
+    let name_len = u8::try_from(name.len() + 1)?;
+    if name.as_bytes().contains(&0) { return Err(anyhow!("NUL in BAM query name")); }
+    let mut record = Vec::new();
+    record.extend_from_slice(&i32::try_from(reference)?.to_le_bytes());
+    record.extend_from_slice(&1i32.to_le_bytes()); // zero-based reference_start
+    // Empty CIGAR has an effective reference span of one base for binning.
+    record.extend_from_slice(&((4681u32 << 16) | u32::from(name_len)).to_le_bytes());
+    record.extend_from_slice(&0u32.to_le_bytes()); // flag and n_cigar_op
+    record.extend_from_slice(&i32::try_from(sequence.len())?.to_le_bytes());
+    record.extend_from_slice(&(-1i32).to_le_bytes());
+    record.extend_from_slice(&(-1i32).to_le_bytes());
+    record.extend_from_slice(&0i32.to_le_bytes());
+    record.extend_from_slice(name.as_bytes());
+    record.push(0);
+    let encode = |b: u8| -> u8 {
+        b"=ACMGRSVTWYHKDBN".iter().position(|&v| v == b.to_ascii_uppercase())
+            .unwrap_or(15) as u8
+    };
+    for pair in sequence.chunks(2) {
+        record.push((encode(pair[0]) << 4) | pair.get(1).map(|&b| encode(b)).unwrap_or(0));
+    }
+    record.extend(std::iter::repeat(255u8).take(sequence.len()));
+    Ok(record)
+}
+
+/// Direct BAM serialization preserves the WDL's synthetic records, including
+/// flag=0 and an empty CIGAR. No SAM parser, alignment, or sorting is involved.
+fn amr_write_contig_bam(
+    contigs: &std::path::Path, summary: &std::path::Path, bam: &std::path::Path,
 ) -> anyhow::Result<()> {
     use std::io::{BufRead, Write};
     let mut fasta = std::io::BufReader::new(std::fs::File::open(contigs)?);
@@ -1807,18 +1881,28 @@ fn amr_write_contig_sam(
         }
         if keep { sequences.entry(name).or_insert(sequence); }
     }
-    let mut writer = std::io::BufWriter::new(std::fs::File::create(sam)?);
+    let mut writer = AmrBgzfWriter::new(std::fs::File::create(bam)?);
     if references.is_empty() { references.push("NoGenes".to_owned()); }
-    for reference in &references { writeln!(writer, "@SQ\tSN:{}\tLN:100", reference)?; }
+    let header: String = references.iter().map(|r| format!("@SQ\tSN:{}\tLN:100\n", r)).collect();
+    writer.write_all(b"BAM\x01")?;
+    writer.write_all(&i32::try_from(header.len())?.to_le_bytes())?;
+    writer.write_all(header.as_bytes())?;
+    writer.write_all(&i32::try_from(references.len())?.to_le_bytes())?;
+    for reference in &references {
+        writer.write_all(&i32::try_from(reference.len() + 1)?.to_le_bytes())?;
+        writer.write_all(reference.as_bytes())?;
+        writer.write_all(&[0])?;
+        writer.write_all(&100i32.to_le_bytes())?;
+    }
     for (aro, name) in rows {
         let sequence = sequences.get(&name)
             .ok_or_else(|| anyhow!("tsvToSam: contig {:?} not found in {}", name, contigs.display()))?;
-        // pysam defaults: flag=0, MAPQ=0, no CIGAR/mate/qualities. Its
-        // reference_start=1 is zero-based, hence SAM POS=2, not POS=1.
-        writeln!(writer, "{}\t0\t{}\t2\t0\t*\t*\t0\t0\t{}\t*",
-                 name, aro, if sequence.is_empty() { "*" } else { sequence })?;
+        let reference_id = references.iter().position(|r| r == &aro).unwrap();
+        let record = amr_contig_bam_record(reference_id, &name, sequence.as_bytes())?;
+        writer.write_all(&i32::try_from(record.len())?.to_le_bytes())?;
+        writer.write_all(&record)?;
     }
-    writer.flush()?;
+    writer.finish()?;
     Ok(())
 }
 
@@ -1829,20 +1913,17 @@ async fn tsv_to_sam(
         .map_err(|e| PipelineError::IOError(format!("tsvToSam input: {}", e)))?.len();
     let work_dir = crate::utils::file::choose_temp_dir(bytes.saturating_mul(4).max(1),
                                                        &config.ram_temp_dir, &config.args.nvme_scratch, 4, false).await?;
-    let sam = work_dir.path().join("contig_amr_report.sam");
     let output_sorted = work_dir.path().join("contig_amr_report.sorted.bam");
     let output_sorted_bai = work_dir.path().join("contig_amr_report.sorted.bam.bai");
     let input = contigs.to_path_buf();
     let summary = results.final_summary.clone();
-    let worker_sam = sam.clone();
-    tokio::task::spawn_blocking(move || amr_write_contig_sam(&input, &summary, &worker_sam))
+    let worker_bam = output_sorted.clone();
+    tokio::task::spawn_blocking(move || amr_write_contig_bam(&input, &summary, &worker_bam))
         .await.map_err(|e| PipelineError::Other(anyhow!("tsvToSam worker: {}", e)))?
         .map_err(PipelineError::Other)?;
     // Match WDL: despite the filename, it does not sort records. Do not silently
     // reorder them here; index failure is an error, just as with pysam.index.
     for (stage, args) in [
-        ("encode", vec![std::ffi::OsString::from("view"), "--no-PG".into(), "-b".into(), "-o".into(),
-                        output_sorted.as_os_str().to_owned(), sam.as_os_str().to_owned()]),
         ("index", vec![std::ffi::OsString::from("index"), output_sorted.as_os_str().to_owned(),
                        output_sorted_bai.as_os_str().to_owned()]),
     ] {
@@ -3526,6 +3607,13 @@ mod gene_coverage_tests {
 #[cfg(test)]
 mod tsv_to_sam_tests {
     use super::*;
+    fn decoded(path: &std::path::Path) -> Vec<u8> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        flate2::read::MultiGzDecoder::new(std::fs::File::open(path).unwrap())
+            .read_to_end(&mut bytes).unwrap();
+        bytes
+    }
     #[test]
     fn strips_only_terminal_underscore_digits() {
         assert_eq!(amr_bam_contig_name("NODE_cov_1.23_4"), "NODE_cov_1.23");
@@ -3536,22 +3624,37 @@ mod tsv_to_sam_tests {
     fn assembly_failure_has_dummy_reference() {
         let dir = tempfile::tempdir().unwrap();
         let fa = dir.path().join("contigs.fa");
-        let sam = dir.path().join("out.sam");
+        let sam = dir.path().join("out.bam");
         std::fs::write(&fa, ";ASSEMBLY FAILED\n").unwrap();
-        amr_write_contig_sam(&fa, &dir.path().join("absent.tsv"), &sam).unwrap();
-        assert_eq!(std::fs::read_to_string(sam).unwrap(), "@SQ\tSN:NoGenes\tLN:100\n");
+        amr_write_contig_bam(&fa, &dir.path().join("absent.tsv"), &sam).unwrap();
+        let bytes = decoded(&sam);
+        assert_eq!(&bytes[..4], b"BAM\x01");
+        assert!(bytes.windows(7).any(|w| w == b"NoGenes"));
     }
     #[test]
     fn preserves_duplicates_and_pysam_position() {
         let dir = tempfile::tempdir().unwrap();
         let fa = dir.path().join("contigs.fa");
         let summary = dir.path().join("summary.tsv");
-        let sam = dir.path().join("out.sam");
+        let sam = dir.path().join("out.bam");
         std::fs::write(&fa, ">NODE_cov_1.2 description\nACGT\n").unwrap();
         std::fs::write(&summary, "ARO_contig_amr\tContig_contig_amr\n3001.0\tNODE_cov_1.2_1\n3001.0\tNODE_cov_1.2_1\n\t\n").unwrap();
-        amr_write_contig_sam(&fa, &summary, &sam).unwrap();
-        let text = std::fs::read_to_string(sam).unwrap();
-        assert_eq!(text.lines().count(), 3);
-        assert!(text.contains("NODE_cov_1.2\t0\tARO:3001\t2\t0\t*\t*\t0\t0\tACGT\t*"));
+        amr_write_contig_bam(&fa, &summary, &sam).unwrap();
+        let bytes = decoded(&sam);
+        let text_len = i32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let mut offset = 8 + text_len;
+        assert_eq!(i32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap()), 1);
+        offset += 4;
+        let ref_len = i32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4 + ref_len + 4;
+        for _ in 0..2 {
+            let len = i32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap()) as usize;
+            let record = &bytes[offset+4..offset+4+len];
+            assert_eq!(i32::from_le_bytes(record[4..8].try_into().unwrap()), 1);
+            assert_eq!(&record[12..16], &[0, 0, 0, 0]); // mapped flag, no CIGAR
+            assert_eq!(&record[32..45], b"NODE_cov_1.2\0");
+            offset += 4 + len;
+        }
+        assert_eq!(offset, bytes.len());
     }
 }
