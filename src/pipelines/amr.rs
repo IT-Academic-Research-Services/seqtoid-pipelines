@@ -707,6 +707,150 @@ async fn run_rgi_main(
 }
 
 #[derive(Debug)]
+struct GeneCoverageOutputs {
+    _work_dir: TempDir,
+    output_gene_coverage: PathBuf,
+}
+
+// Read quoted TSV fields without adding a new crate dependency. RGI ORF IDs
+// and hit IDs are kept verbatim for the JSON lookup.
+fn gene_coverage_tsv_records(input: &str) -> anyhow::Result<Vec<Vec<String>>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' if quoted => {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            }
+            '"' if field.is_empty() => quoted = true,
+            '\t' if !quoted => record.push(std::mem::take(&mut field)),
+            '\n' | '\r' if !quoted => {
+                if c == '\r' && chars.peek() == Some(&'\n') { chars.next(); }
+                record.push(std::mem::take(&mut field));
+                if record.len() != 1 || !record[0].is_empty() {
+                    records.push(std::mem::take(&mut record));
+                } else { record.clear(); }
+            }
+            _ => field.push(c),
+        }
+    }
+    if quoted { return Err(anyhow!("MakeGeneCoverage: unterminated quoted TSV field")); }
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// WDL MakeGeneCoverage: union reference coordinates per (ARO, Model_ID).
+/// Reverse Python ranges include start and exclude end, hence [end+1,start+1).
+fn gene_coverage_table(tsv: &str, json: &serde_json::Value) -> anyhow::Result<String> {
+    use std::collections::BTreeMap;
+    let records = gene_coverage_tsv_records(tsv)?;
+    let header = records.first().ok_or_else(|| anyhow!("MakeGeneCoverage: missing TSV header"))?;
+    let required = ["ORF_ID", "ID", "ARO", "Model_ID", "Hit_Start", "Hit_End",
+        "Percentage Length of Reference Sequence"];
+    let columns: Vec<usize> = required.iter().map(|name| {
+        header.iter().position(|s| s == name)
+            .ok_or_else(|| anyhow!("MakeGeneCoverage: missing column {}", name))
+    }).collect::<anyhow::Result<_>>()?;
+    let mut groups: BTreeMap<(i64, i64), Vec<(i64, i64)>> = BTreeMap::new();
+    let mut lengths = HashMap::new();
+    for (index, row) in records.iter().enumerate().skip(1) {
+        let get = |col: usize| -> anyhow::Result<&str> {
+            row.get(columns[col]).map(String::as_str)
+                .ok_or_else(|| anyhow!("MakeGeneCoverage: short TSV row {}", index + 1))
+        };
+        let number = |col: usize| -> anyhow::Result<i64> {
+            get(col)?.parse::<i64>().map_err(|e| anyhow!(
+                "MakeGeneCoverage: row {}, invalid {}: {}", index + 1, required[col], e))
+        };
+        let aro = number(2)?;
+        let model = number(3)?;
+        let orf = get(0)?;
+        let hit = get(1)?;
+        let sequence = json.get(orf).and_then(|v| v.get(hit))
+            .and_then(|v| v.get("dna_sequence_from_broadstreet"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!(
+                "MakeGeneCoverage: missing DNA sequence for ORF {:?}, hit {:?}", orf, hit))?;
+        // Preserve WDL's last-row-wins length map, keyed only by Model_ID.
+        lengths.insert(model, sequence.chars().count());
+        let start = number(4)?;
+        let end = number(5)?;
+        if start == end {
+            return Err(anyhow!("MakeGeneCoverage: zero-length hit at row {} (WDL range step undefined)", index + 1));
+        }
+        let interval = if start < end { (start, end) } else {
+            (end.checked_add(1).ok_or_else(|| anyhow!("coordinate overflow"))?,
+             start.checked_add(1).ok_or_else(|| anyhow!("coordinate overflow"))?)
+        };
+        groups.entry((aro, model)).or_default().push(interval);
+    }
+    let mut output = String::from("ID\tgene_coverage_bps\tdb_seq_length\tgene_coverage_perc\n");
+    for ((aro, model), mut intervals) in groups {
+        intervals.sort_unstable();
+        let mut merged: Option<(i64, i64)> = None;
+        let mut covered = 0i128;
+        for (start, end) in intervals {
+            match merged {
+                Some((lo, hi)) if start <= hi => merged = Some((lo, hi.max(end))),
+                Some((lo, hi)) => {
+                    covered += i128::from(hi) - i128::from(lo);
+                    merged = Some((start, end));
+                }
+                None => merged = Some((start, end)),
+            }
+        }
+        if let Some((lo, hi)) = merged { covered += i128::from(hi) - i128::from(lo); }
+        let length = lengths[&model];
+        if length == 0 { return Err(anyhow!("MakeGeneCoverage: zero reference length for model {}", model)); }
+        let scaled = (covered as f64 / length as f64) * 100.0 * 10000.0;
+        // NumPy round uses ties-to-even; do not cap coverage at 100 percent.
+        let percentage = scaled.round_ties_even() / 10000.0;
+        let mut formatted = format!("{:.4}", percentage);
+        while formatted.ends_with('0') { formatted.pop(); }
+        if formatted.ends_with('.') { formatted.push('0'); }
+        output.push_str(&format!("{}\t{}\t{}\t{}\n", aro, covered, length, formatted));
+    }
+    Ok(output)
+}
+
+async fn make_gene_coverage(
+    config: Arc<RunConfig>,
+    main: &RgiMainOutputs,
+) -> Result<GeneCoverageOutputs, PipelineError> {
+    let tsv_path = main.main_amr_results.clone();
+    let json_path = main.output_json.clone();
+    let input_bytes = tokio::fs::metadata(&json_path).await
+        .map_err(|e| PipelineError::IOError(e.to_string()))?.len();
+    let work_dir = crate::utils::file::choose_temp_dir(
+        input_bytes.max(1), &config.ram_temp_dir, &config.args.nvme_scratch, 4, false,
+    ).await?;
+    let output_gene_coverage = work_dir.path().join("gene_coverage.tsv");
+    let output = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let tsv = std::fs::read_to_string(&tsv_path)
+            .map_err(|e| anyhow!("MakeGeneCoverage: {}: {}", tsv_path.display(), e))?;
+        let file = std::fs::File::open(&json_path)
+            .map_err(|e| anyhow!("MakeGeneCoverage: {}: {}", json_path.display(), e))?;
+        let json = serde_json::from_reader(std::io::BufReader::new(file))?;
+        gene_coverage_table(&tsv, &json)
+    }).await.map_err(|e| PipelineError::Other(anyhow!("MakeGeneCoverage worker: {}", e)))?
+        .map_err(PipelineError::Other)?;
+    tokio::fs::write(&output_gene_coverage, output).await
+        .map_err(|e| PipelineError::IOError(format!("MakeGeneCoverage output: {}", e)))?;
+    Ok(GeneCoverageOutputs { _work_dir: work_dir, output_gene_coverage })
+}
+
+#[derive(Debug)]
 struct RgiKmerBwtOutputs {
     /// Owns returned scratch paths until downstream readers/packaging finish.
     _work_dir: TempDir,
@@ -2377,6 +2521,20 @@ pub async fn run(
         );
     }
 
+    // Consume scratch results directly; publication copies are independent.
+    // Defer errors until all already-scheduled writers have drained.
+    let coverage_result = match &main_result {
+        Ok(main) => Some(make_gene_coverage(config.clone(), main).await),
+        Err(_) => None,
+    };
+    if let Some(Ok(coverage)) = &coverage_result {
+        info!("[AMR] MakeGeneCoverage complete: {}", coverage.output_gene_coverage.display());
+        schedule_rgi_artifact_copies(
+            config.clone(), std::slice::from_ref(&coverage.output_gene_coverage),
+            &mut cleanup_tasks,
+        );
+    }
+
     // Future downstream analysis belongs ABOVE final cleanup. It reads the
     // scratch paths, never waits for publication copies, and must retain owners.
 
@@ -2397,12 +2555,46 @@ pub async fn run(
     // Propagate analysis failures only after their independent writers finish.
     let rgi_kmer_bwt = kmer_result?;
     let rgi_main = main_result?;
+    let gene_coverage = coverage_result
+        .ok_or_else(|| PipelineError::Other(anyhow!("MakeGeneCoverage was not scheduled")))??;
     if let Some(e) = publication_error {
         return Err(PipelineError::Other(e));
     }
+    drop(gene_coverage);
     drop(rgi_main);
     drop(rgi_kmer_bwt);
     drop(rgi_bwt_kma);
 
     Ok(())
+}
+
+
+
+#[cfg(test)]
+mod gene_coverage_tests {
+    use super::*;
+    const HEADER: &str = "ORF_ID\tID\tARO\tModel_ID\tHit_Start\tHit_End\tPercentage Length of Reference Sequence\n";
+
+    #[test]
+    fn empty_report() {
+        assert_eq!(gene_coverage_table(HEADER, &serde_json::json!({})).unwrap(),
+                   "ID\tgene_coverage_bps\tdb_seq_length\tgene_coverage_perc\n");
+    }
+
+    #[test]
+    fn overlapping_forward_and_reverse_ranges() {
+        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\nb\th\t10\t20\t7\t3\t0\n", HEADER);
+        let json = serde_json::json!({
+            "a": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}},
+            "b": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}}
+        });
+        // range(0,5) U range(7,3,-1) = {0,1,2,3,4,5,6,7}.
+        assert!(gene_coverage_table(&tsv, &json).unwrap().ends_with("10\t8\t10\t80.0\n"));
+    }
+
+    #[test]
+    fn missing_json_hit_is_an_error() {
+        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\n", HEADER);
+        assert!(gene_coverage_table(&tsv, &serde_json::json!({})).is_err());
+    }
 }
