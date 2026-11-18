@@ -1759,86 +1759,17 @@ fn amr_bam_contig_name(name: &str) -> &str {
     }
 }
 
-// BGZF framing around gzip's DEFLATE payload and CRC/ISIZE trailer. A 32 KiB
-// input block stays below BGZF's 64 KiB limit even for incompressible data.
-struct AmrBgzfWriter {
-    output: std::fs::File,
-    pending: Vec<u8>,
-}
-impl AmrBgzfWriter {
-    fn new(output: std::fs::File) -> Self { Self { output, pending: Vec::new() } }
-    fn block(&mut self, input: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gzip.write_all(input)?;
-        let gzip = gzip.finish()?;
-        // GzEncoder's default header is ten bytes; replace it with BGZF's header.
-        let total = 18 + gzip.len() - 10;
-        let size = u16::try_from(total - 1).map_err(|_| std::io::Error::new(
-            std::io::ErrorKind::InvalidData, "BGZF block too large"))?;
-        self.output.write_all(&[31, 139, 8, 4, 0, 0, 0, 0, 0, 255, 6, 0, 66, 67, 2, 0])?;
-        self.output.write_all(&size.to_le_bytes())?;
-        self.output.write_all(&gzip[10..])
-    }
-    fn finish(mut self) -> std::io::Result<()> {
-        use std::io::Write;
-        let tail = std::mem::take(&mut self.pending);
-        if !tail.is_empty() { self.block(&tail)?; }
-        self.block(&[])?; // canonical empty BGZF EOF block
-        self.output.flush()
-    }
-}
-impl std::io::Write for AmrBgzfWriter {
-    fn write(&mut self, mut input: &[u8]) -> std::io::Result<usize> {
-        let count = input.len();
-        while !input.is_empty() {
-            let n = input.len().min(32768 - self.pending.len());
-            self.pending.extend_from_slice(&input[..n]);
-            input = &input[n..];
-            if self.pending.len() == 32768 {
-                let block = std::mem::take(&mut self.pending);
-                self.block(&block)?;
-            }
-        }
-        Ok(count)
-    }
-    fn flush(&mut self) -> std::io::Result<()> { std::io::Write::flush(&mut self.output) }
-}
-
-fn amr_contig_bam_record(reference: usize, name: &str, sequence: &[u8]) -> anyhow::Result<Vec<u8>> {
-    // pysam AlignedSegment defaults: flag=0, MAPQ=0, empty CIGAR,
-    // mate reference/position=-1, template length=0, missing qualities.
-    let name_len = u8::try_from(name.len() + 1)?;
-    if name.as_bytes().contains(&0) { return Err(anyhow!("NUL in BAM query name")); }
-    let mut record = Vec::new();
-    record.extend_from_slice(&i32::try_from(reference)?.to_le_bytes());
-    record.extend_from_slice(&1i32.to_le_bytes()); // zero-based reference_start
-    // Empty CIGAR has an effective reference span of one base for binning.
-    record.extend_from_slice(&((4681u32 << 16) | u32::from(name_len)).to_le_bytes());
-    record.extend_from_slice(&0u32.to_le_bytes()); // flag and n_cigar_op
-    record.extend_from_slice(&i32::try_from(sequence.len())?.to_le_bytes());
-    record.extend_from_slice(&(-1i32).to_le_bytes());
-    record.extend_from_slice(&(-1i32).to_le_bytes());
-    record.extend_from_slice(&0i32.to_le_bytes());
-    record.extend_from_slice(name.as_bytes());
-    record.push(0);
-    let encode = |b: u8| -> u8 {
-        b"=ACMGRSVTWYHKDBN".iter().position(|&v| v == b.to_ascii_uppercase())
-            .unwrap_or(15) as u8
-    };
-    for pair in sequence.chunks(2) {
-        record.push((encode(pair[0]) << 4) | pair.get(1).map(|&b| encode(b)).unwrap_or(0));
-    }
-    record.extend(std::iter::repeat(255u8).take(sequence.len()));
-    Ok(record)
-}
-
 /// Direct BAM serialization preserves the WDL's synthetic records, including
 /// flag=0 and an empty CIGAR. No SAM parser, alignment, or sorting is involved.
 fn amr_write_contig_bam(
     contigs: &std::path::Path, summary: &std::path::Path, bam: &std::path::Path,
 ) -> anyhow::Result<()> {
-    use std::io::{BufRead, Write};
+    use std::io::BufRead;
+    use std::num::NonZeroUsize;
+    use noodles::{bam, sam};
+    use sam::alignment::{io::Write as _, record::{Flags, MappingQuality}, record_buf::Sequence, RecordBuf};
+    use sam::header::record::value::{map::ReferenceSequence, Map};
+
     let mut fasta = std::io::BufReader::new(std::fs::File::open(contigs)?);
     let mut first = String::new();
     fasta.read_line(&mut first)?;
@@ -1881,28 +1812,38 @@ fn amr_write_contig_bam(
         }
         if keep { sequences.entry(name).or_insert(sequence); }
     }
-    let mut writer = AmrBgzfWriter::new(std::fs::File::create(bam)?);
     if references.is_empty() { references.push("NoGenes".to_owned()); }
-    let header: String = references.iter().map(|r| format!("@SQ\tSN:{}\tLN:100\n", r)).collect();
-    writer.write_all(b"BAM\x01")?;
-    writer.write_all(&i32::try_from(header.len())?.to_le_bytes())?;
-    writer.write_all(header.as_bytes())?;
-    writer.write_all(&i32::try_from(references.len())?.to_le_bytes())?;
+    let mut builder = sam::Header::builder();
     for reference in &references {
-        writer.write_all(&i32::try_from(reference.len() + 1)?.to_le_bytes())?;
-        writer.write_all(reference.as_bytes())?;
-        writer.write_all(&[0])?;
-        writer.write_all(&100i32.to_le_bytes())?;
+        builder = builder.add_reference_sequence(
+            reference.as_bytes(),
+            Map::<ReferenceSequence>::new(NonZeroUsize::new(100).unwrap()),
+        );
     }
+    let header = builder.build();
+    let reference_ids: HashMap<&str, usize> = references.iter()
+        .enumerate().map(|(i, name)| (name.as_str(), i)).collect();
+    let mut writer = bam::io::Writer::new(std::fs::File::create(bam)?);
+    writer.write_header(&header)?;
     for (aro, name) in rows {
         let sequence = sequences.get(&name)
             .ok_or_else(|| anyhow!("tsvToSam: contig {:?} not found in {}", name, contigs.display()))?;
-        let reference_id = references.iter().position(|r| r == &aro).unwrap();
-        let record = amr_contig_bam_record(reference_id, &name, sequence.as_bytes())?;
-        writer.write_all(&i32::try_from(record.len())?.to_le_bytes())?;
-        writer.write_all(&record)?;
+        // Set pysam's defaults explicitly: RecordBuf defaults to UNMAPPED,
+        // unlike pysam.AlignedSegment. Leave CIGAR, mate fields and qualities
+        // unset. Noodles encodes these fields directly, without SAM parsing.
+        let record = RecordBuf::builder()
+            .set_name(name.as_bytes())
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(reference_ids[aro.as_str()])
+            // Noodles positions are 1-based; pysam reference_start=1 is 2 here.
+            .set_alignment_start("2".parse()?)
+            .set_mapping_quality(MappingQuality::new(0).unwrap())
+            .set_sequence(Sequence::from(sequence.as_bytes()))
+            .build();
+        writer.write_alignment_record(&header, &record)?;
     }
-    writer.finish()?;
+    // Explicitly finish BGZF and propagate errors before indexing the file.
+    writer.try_finish()?;
     Ok(())
 }
 
