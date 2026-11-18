@@ -323,4 +323,8 @@ pub struct Arguments {
     )]
     pub amr_card_json: Option<String>,
 
+    #[arg(long = "amr-card-ontology", help = "AMR reporting: CARD ontology.json containing highLevelDrugClasses (not card.json)")]
+    pub amr_card_ontology: Option<String>,
+    
+
 }

@@ -52,6 +52,8 @@ impl AmrInputMode {
 
 #[derive(Debug)]
 struct AmrPreparedInputs {
+    /// Sample basename returned by validate_file_inputs for the selected input mode.
+    sample_base: String,
     /// WDL-equivalent `non_host_reads_fa`: durable RunRedup FASTA files.
     non_host_reads_fa: Vec<PathBuf>,
     /// WDL-equivalent `contigs_fa`: raw SPAdes contigs or filtered-sample contigs.
@@ -128,7 +130,7 @@ async fn resolve_amr_rgi_root(config: &RunConfig) -> Result<PathBuf, PipelineErr
     Ok(local_db.parent().unwrap().to_path_buf())
 }
 
-/// AMR-only launcher: 
+/// AMR-only launcher:
 /// stderr goes directly to a durable file, so it cannot fill a pipe.
 /// The returned completed task preserves the callers' existing join contract.
 async fn spawn_amr_rgi(
@@ -850,35 +852,6 @@ async fn make_gene_coverage(
     Ok(GeneCoverageOutputs { _work_dir: work_dir, output_gene_coverage })
 }
 
-#[cfg(test)]
-mod gene_coverage_tests {
-    use super::*;
-    const HEADER: &str = "ORF_ID\tID\tARO\tModel_ID\tHit_Start\tHit_End\tPercentage Length of Reference Sequence\n";
-
-    #[test]
-    fn empty_report() {
-        assert_eq!(gene_coverage_table(HEADER, &serde_json::json!({})).unwrap(),
-                   "ID\tgene_coverage_bps\tdb_seq_length\tgene_coverage_perc\n");
-    }
-
-    #[test]
-    fn overlapping_forward_and_reverse_ranges() {
-        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\nb\th\t10\t20\t7\t3\t0\n", HEADER);
-        let json = serde_json::json!({
-            "a": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}},
-            "b": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}}
-        });
-        // range(0,5) U range(7,3,-1) = {0,1,2,3,4,5,6,7}.
-        assert!(gene_coverage_table(&tsv, &json).unwrap().ends_with("10\t8\t10\t80.0\n"));
-    }
-
-    #[test]
-    fn missing_json_hit_is_an_error() {
-        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\n", HEADER);
-        assert!(gene_coverage_table(&tsv, &serde_json::json!({})).is_err());
-    }
-}
-
 #[derive(Debug)]
 struct RgiKmerBwtOutputs {
     /// Owns returned scratch paths until downstream readers/packaging finish.
@@ -1387,6 +1360,388 @@ async fn run_rgi_kmer_main(
         output_kmer_main,
         species_calling,
     })
+}
+
+// Native RunResultsPerSample. No dataframe runtime: indexed outer joins retain
+// duplicate-key Cartesian products; sets are sorted for reproducible output.
+type AmrResultRow = HashMap<String, Option<String>>;
+
+#[derive(Clone, Debug)]
+struct AmrResultTable {
+    columns: Vec<String>,
+    rows: Vec<AmrResultRow>,
+}
+
+fn amr_result_na(s: &str) -> bool {
+    matches!(s, "" | "#N/A" | "#N/A N/A" | "#NA" | "-1.#IND" | "-1.#QNAN" |
+        "-NaN" | "-nan" | "1.#IND" | "1.#QNAN" | "<NA>" | "N/A" | "NA" |
+        "NULL" | "NaN" | "None" | "n/a" | "nan" | "null")
+}
+
+impl AmrResultTable {
+    fn read(path: &std::path::Path) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let mut reader = csv::ReaderBuilder::new().delimiter(b'\t').from_path(path)
+            .with_context(|| format!("RunResultsPerSample: reading {}", path.display()))?;
+        let columns: Vec<String> = reader.headers()?.iter().map(str::to_owned).collect();
+        if columns.is_empty() { return Err(anyhow!("Missing TSV header: {}", path.display())); }
+        let mut seen = HashSet::new();
+        for c in &columns {
+            if !seen.insert(c) { return Err(anyhow!("Duplicate column {:?} in {}", c, path.display())); }
+        }
+        let mut rows = Vec::new();
+        for record in reader.records() {
+            let record = record.with_context(|| format!("Invalid TSV in {}", path.display()))?;
+            rows.push(columns.iter().cloned().zip(record.iter().map(|v| {
+                if amr_result_na(v) { None } else { Some(v.to_owned()) }
+            })).collect());
+        }
+        Ok(Self { columns, rows })
+    }
+
+    fn require(&self, names: &[&str]) -> anyhow::Result<()> {
+        for name in names {
+            if !self.columns.iter().any(|c| c == name) {
+                return Err(anyhow!("RunResultsPerSample: missing column {:?}", name));
+            }
+        }
+        Ok(())
+    }
+
+    fn clean_sort(&mut self, name: &str) -> anyhow::Result<()> {
+        self.require(&[name])?;
+        for row in &mut self.rows {
+            if let Some(Some(v)) = row.get_mut(name) { *v = v.trim().to_owned(); }
+        }
+        self.sort(name);
+        Ok(())
+    }
+
+    fn sort(&mut self, name: &str) {
+        self.rows.sort_by(|a, b| match (amr_cell(a, name), amr_cell(b, name)) {
+            (Some(a), Some(b)) => a.cmp(b),
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, _) => std::cmp::Ordering::Greater,
+            (_, None) => std::cmp::Ordering::Less,
+        });
+    }
+
+    fn suffix(&mut self, suffix: &str) {
+        self.columns = self.columns.iter().map(|c| format!("{}{}", c, suffix)).collect();
+        for row in &mut self.rows {
+            *row = std::mem::take(row).into_iter().map(|(k, v)| (format!("{}{}", k, suffix), v)).collect();
+        }
+    }
+
+    fn coalesce(&mut self, dest: &str, left: &str, right: &str) -> anyhow::Result<()> {
+        self.require(&[left, right])?;
+        self.columns.push(dest.to_owned());
+        for row in &mut self.rows {
+            let value = row.get(left).cloned().flatten().or_else(|| row.get(right).cloned().flatten());
+            row.insert(dest.to_owned(), value);
+        }
+        Ok(())
+    }
+
+    // Reproduce pandas astype(str) after an outer join: integer columns with
+    // missing values are promoted to float, and missing cells become "nan".
+    fn accession_strings(&mut self, column: &str) -> anyhow::Result<()> {
+        self.require(&[column])?;
+        let missing = self.rows.iter().any(|r| amr_cell(r, column).is_none());
+        let numeric = self.rows.iter().filter_map(|r| amr_cell(r, column))
+            .all(|s| s.parse::<f64>().is_ok());
+        let floating = missing || self.rows.iter().filter_map(|r| amr_cell(r, column))
+            .any(|s| s.contains('.') || s.contains('e') || s.contains('E'));
+        for row in &mut self.rows {
+            let value = match amr_cell(row, column) {
+                None => "nan".to_owned(),
+                Some(v) if numeric && floating => amr_float(v.parse::<f64>()?),
+                Some(v) => v.to_owned(),
+            };
+            row.insert(column.to_owned(), Some(value));
+        }
+        Ok(())
+    }
+
+    fn outer(&self, other: &Self, left: &[&str], right: &[&str]) -> anyhow::Result<Self> {
+        self.require(left)?;
+        other.require(right)?;
+        if left.len() != right.len() { return Err(anyhow!("Join key length mismatch")); }
+        if other.columns.iter().any(|c| self.columns.contains(c)) {
+            return Err(anyhow!("RunResultsPerSample: overlapping join columns"));
+        }
+        let key = |row: &AmrResultRow, cols: &[&str]| -> Vec<Option<String>> {
+            cols.iter().map(|c| row.get(*c).cloned().flatten()).collect()
+        };
+        let mut index: HashMap<Vec<Option<String>>, Vec<usize>> = HashMap::new();
+        for (i, row) in other.rows.iter().enumerate() {
+            index.entry(key(row, right)).or_default().push(i);
+        }
+        let mut used = vec![false; other.rows.len()];
+        let mut rows = Vec::new();
+        for row in &self.rows {
+            if let Some(matches) = index.get(&key(row, left)) {
+                for &i in matches {
+                    let mut merged = row.clone();
+                    merged.extend(other.rows[i].clone());
+                    rows.push(merged);
+                    used[i] = true;
+                }
+            } else { rows.push(row.clone()); }
+        }
+        for (i, row) in other.rows.iter().enumerate() {
+            if !used[i] { rows.push(row.clone()); }
+        }
+        let columns = self.columns.iter().chain(&other.columns).cloned().collect();
+        Ok(Self { columns, rows })
+    }
+
+    fn write(&self, path: &std::path::Path, selected: Option<&[&str]>) -> anyhow::Result<()> {
+        let columns: Vec<&str> = selected.map(|v| v.to_vec())
+            .unwrap_or_else(|| self.columns.iter().map(String::as_str).collect());
+        self.require(&columns)?;
+        let mut writer = csv::WriterBuilder::new().delimiter(b'\t')
+            .terminator(csv::Terminator::Any(b'\n')).from_path(path)?;
+        writer.write_record(&columns)?;
+        for row in &self.rows {
+            writer.write_record(columns.iter().map(|c| amr_cell(row, c).unwrap_or("")))?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+}
+
+fn amr_cell<'a>(row: &'a AmrResultRow, column: &str) -> Option<&'a str> {
+    row.get(column).and_then(|v| v.as_deref())
+}
+
+fn amr_float(value: f64) -> String {
+    let mut s = value.to_string();
+    if !s.contains('.') && !s.contains('e') && value.is_finite() { s.push_str(".0"); }
+    s
+}
+
+fn amr_unique(rows: &[&AmrResultRow], columns: &[&str]) -> std::collections::BTreeSet<String> {
+    rows.iter().flat_map(|row| columns.iter().filter_map(move |c| {
+        amr_cell(row, c).filter(|s| !amr_result_na(s)).map(str::to_owned)
+    })).collect()
+}
+
+fn amr_join(values: &std::collections::BTreeSet<String>, separator: &str) -> Option<String> {
+    if values.is_empty() { None } else { Some(values.iter().cloned().collect::<Vec<_>>().join(separator)) }
+}
+
+fn amr_numbers(rows: &[&AmrResultRow], column: &str) -> anyhow::Result<Vec<f64>> {
+    let mut numbers = Vec::new();
+    for value in amr_unique(rows, &[column]) {
+        let n = value.parse::<f64>().map_err(|e| anyhow!("RunResultsPerSample: invalid {} {:?}: {}", column, value, e))?;
+        if n.is_finite() && !numbers.contains(&n) { numbers.push(n); }
+    }
+    Ok(numbers)
+}
+
+fn amr_max(rows: &[&AmrResultRow], column: &str) -> anyhow::Result<Option<String>> {
+    Ok(amr_numbers(rows, column)?.into_iter().reduce(f64::max).map(amr_float))
+}
+
+const AMR_BIG_COLUMNS: &[&str] = &[
+    "ARO_overall", "Gene_Family_overall", "Drug_Class_overall", "Resistance_Mechanism_overall",
+    "model_overall", "All Mapped Reads_kma_amr", "Percent Coverage_kma_amr", "Depth_kma_amr",
+    "CARD*kmer Prediction_kma_sp", "Cut_Off_contig_amr",
+    "Percentage Length of Reference Sequence_contig_amr", "Best_Identities_contig_amr",
+    "CARD*kmer Prediction_contig_sp",
+];
+const AMR_PRIMARY_COLUMNS: &[&str] = &[
+    "gene_name", "sample_name", "gene_family", "aro_accession", "drug_class", "high_level_drug_class",
+    "resistance_mechanism", "model_type", "num_contigs", "cutoff", "contig_coverage_breadth",
+    "contig_percent_id", "contig_species", "num_reads", "read_gene_id", "read_coverage_breadth",
+    "read_coverage_depth", "read_species",
+];
+
+/// Pure file-backed transformation, also usable for fixture/differential tests.
+fn amr_results_per_sample_files(
+    inputs: &[PathBuf; 5], ontology_path: &std::path::Path, sample: &str,
+    directory: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut main = AmrResultTable::read(&inputs[0])?;
+    let mut main_sp = AmrResultTable::read(&inputs[1])?;
+    let mut kma = AmrResultTable::read(&inputs[2])?;
+    let mut kma_sp = AmrResultTable::read(&inputs[3])?;
+    main.clean_sort("Best_Hit_ARO")?;
+    main_sp.clean_sort("Best_Hit_ARO")?;
+    kma.clean_sort("ARO Term")?;
+    kma_sp.clean_sort("ARO term")?;
+    main.suffix("_contig_amr");
+    main_sp.suffix("_contig_sp");
+    main.require(&["Contig_contig_amr"])?;
+    for row in &mut main.rows {
+        if let Some(Some(v)) = row.get_mut("Contig_contig_amr") { *v = v.trim().to_owned(); }
+    }
+    let mut a = main.outer(&main_sp,
+                           &["Best_Hit_ARO_contig_amr", "Contig_contig_amr"],
+                           &["Best_Hit_ARO_contig_sp", "Contig_contig_sp"])?;
+    a.coalesce("ARO_contig", "Best_Hit_ARO_contig_amr", "Best_Hit_ARO_contig_sp")?;
+    a.write(&directory.join("merge_a.tsv"), None)?;
+    a.accession_strings("ARO_contig_amr")?;
+    kma.suffix("_kma_amr");
+    kma_sp.suffix("_kma_sp");
+    let mut b = kma.outer(&kma_sp, &["ARO Term_kma_amr"], &["ARO term_kma_sp"])?;
+    b.accession_strings("ARO Accession_kma_amr")?;
+    b.require(&["Reference Model Type_kma_amr"])?;
+    b.rows.retain(|r| !matches!(amr_cell(r, "Reference Model Type_kma_amr"),
+        Some("protein variant model" | "rRNA gene variant model")));
+    b.coalesce("ARO_kma", "ARO Term_kma_amr", "ARO term_kma_sp")?;
+    b.write(&directory.join("merge_b.tsv"), None)?;
+    let mut x = a.outer(&b, &["ARO_contig_amr"], &["ARO Accession_kma_amr"])?;
+    for (dest, left, right) in [
+        ("ARO_accession", "ARO_contig_amr", "ARO Accession_kma_amr"),
+        ("ARO_overall", "ARO_contig", "ARO_kma"),
+        ("Gene_Family_overall", "AMR Gene Family_contig_amr", "AMR Gene Family_kma_amr"),
+        ("Drug_Class_overall", "Drug Class_contig_amr", "Drug Class_kma_amr"),
+        ("model_overall", "Model_type_contig_amr", "Reference Model Type_kma_amr"),
+        ("Resistance_Mechanism_overall", "Resistance Mechanism_contig_amr", "Resistance Mechanism_kma_amr"),
+    ] { x.coalesce(dest, left, right)?; }
+    x.write(&directory.join("comprehensive_AMR_metrics.tsv"), None)?;
+    // WDL rereads this file with pandas, turning literal "nan" back into NA.
+    for row in &mut x.rows {
+        for value in row.values_mut() {
+            if value.as_deref().map(amr_result_na).unwrap_or(false) { *value = None; }
+        }
+        if let Some(value) = amr_cell(row, "ARO_contig_amr") {
+            let n: f64 = value.parse()?;
+            row.insert("ARO_contig_amr".into(), Some(format!("{:.0}", n)));
+        }
+    }
+    x.require(AMR_BIG_COLUMNS)?;
+    let mut big = x.clone();
+    big.sort("Gene_Family_overall");
+    big.write(&directory.join("bigtable_report.tsv"), Some(AMR_BIG_COLUMNS))?;
+    if x.rows.is_empty() {
+        std::fs::write(directory.join("primary_AMR_report.tsv"), b"")?;
+        return Ok(());
+    }
+    let coverage = AmrResultTable::read(&inputs[4])?;
+    coverage.require(&["ID", "gene_coverage_perc"])?;
+    let ontology: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(ontology_path)?))?;
+    if !ontology.is_object() { return Err(anyhow!("CARD ontology must be a JSON object")); }
+    x.require(&["Nudged_contig_amr", "Reference Sequence_kma_amr"])?;
+    let mut groups: std::collections::BTreeMap<String, Vec<&AmrResultRow>> = std::collections::BTreeMap::new();
+    for row in &x.rows {
+        if let Some(name) = amr_cell(row, "ARO_overall") { groups.entry(name.to_owned()).or_default().push(row); }
+    }
+    let mut primary = AmrResultTable { columns: AMR_PRIMARY_COLUMNS.iter().map(|s| (*s).to_owned()).collect(), rows: Vec::new() };
+    for (name, rows) in groups {
+        let mut out = AmrResultRow::new();
+        out.insert("gene_name".into(), Some(name.clone()));
+        out.insert("sample_name".into(), Some(sample.to_owned()));
+        for (dest, cols) in [
+            ("gene_family", ["AMR Gene Family_contig_amr", "AMR Gene Family_kma_amr"]),
+            ("drug_class", ["Drug Class_contig_amr", "Drug Class_kma_amr"]),
+            ("resistance_mechanism", ["Resistance Mechanism_contig_amr", "Resistance Mechanism_kma_amr"]),
+        ] { out.insert(dest.into(), amr_join(&amr_unique(&rows, &cols), ";")); }
+        let accessions = amr_unique(&rows, &["ARO_accession"]).into_iter().map(|s| {
+            let n: f64 = s.parse()?;
+            if !n.is_finite() { return Err(anyhow!("Invalid ARO accession {:?}", s)); }
+            Ok(format!("ARO:{:.0}", n.trunc()))
+        }).collect::<anyhow::Result<std::collections::BTreeSet<_>>>()?;
+        out.insert("aro_accession".into(), amr_join(&accessions, ";"));
+        let mut high = std::collections::BTreeSet::new();
+        for dc in amr_unique(&rows, &["Drug Class_contig_amr", "Drug Class_kma_amr"]) {
+            for class in dc.split("; ") {
+                if let Some(entry) = ontology.get(class) {
+                    if let Some(classes) = entry.get("highLevelDrugClasses") {
+                        let classes = classes.as_array().ok_or_else(|| anyhow!("Invalid highLevelDrugClasses for {}", class))?;
+                        for c in classes {
+                            high.insert(c.as_str().ok_or_else(|| anyhow!("Non-string drug class"))?.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        out.insert("high_level_drug_class".into(), amr_join(&high, "; "));
+        let mut cutoffs = std::collections::BTreeSet::new();
+        for row in &rows {
+            if let Some(c) = amr_cell(row, "Cut_Off_contig_amr") {
+                let nudged = amr_cell(row, "Nudged_contig_amr").map(|s| s.eq_ignore_ascii_case("true")).unwrap_or(false);
+                cutoffs.insert(if c == "Strict" && nudged { "Nudged".to_owned() } else { c.to_owned() });
+            }
+        }
+        out.insert("cutoff".into(), amr_join(&cutoffs, ";"));
+        let models: Vec<String> = amr_unique(&rows, &["Model_type_contig_amr", "Reference Model Type_kma_amr"])
+            .into_iter().map(|s| { let mut words: Vec<&str> = s.split(' ').collect(); words.pop(); words.join(" ") }).collect();
+        out.insert("model_type".into(), if models.is_empty() { None } else { Some(models.join(";")) });
+        for (dest, col) in [("read_coverage_breadth", "Percent Coverage_kma_amr"),
+            ("read_coverage_depth", "Depth_kma_amr"), ("num_reads", "All Mapped Reads_kma_amr")] {
+            out.insert(dest.into(), amr_max(&rows, col)?);
+        }
+        let gene_id = amr_join(&amr_unique(&rows, &["ARO_contig_amr"]), ";");
+        let breadth = match gene_id {
+            None => None,
+            Some(id) => {
+                let row = coverage.rows.iter().find(|r| amr_cell(r, "ID") == Some(id.as_str()))
+                    .ok_or_else(|| anyhow!("RunResultsPerSample: no gene coverage for {:?} (gene {:?})", id, name))?;
+                amr_cell(row, "gene_coverage_perc").map(str::to_owned)
+            }
+        };
+        out.insert("contig_coverage_breadth".into(), breadth);
+        out.insert("num_contigs".into(), Some(amr_unique(&rows, &["Contig_contig_amr"]).len().to_string()));
+        out.insert("read_gene_id".into(), amr_join(&amr_unique(&rows, &["Reference Sequence_kma_amr"]), ";"));
+        let ids = amr_numbers(&rows, "Best_Identities_contig_amr")?;
+        out.insert("contig_percent_id".into(), if ids.is_empty() { None } else { Some(amr_float(ids.iter().sum::<f64>() / ids.len() as f64)) });
+        for (dest, col) in [("contig_species", "CARD*kmer Prediction_contig_sp"), ("read_species", "CARD*kmer Prediction_kma_sp")] {
+            out.insert(dest.into(), Some(amr_join(&amr_unique(&rows, &[col]), " ").unwrap_or_default()));
+        }
+        // Preserve validation performed by the WDL's otherwise-unused species
+        // dictionary; its contents do not contribute to the output columns.
+        for prediction in amr_unique(&rows, &["CARD*kmer Prediction_contig_sp", "CARD*kmer Prediction_kma_sp"]) {
+            if prediction.contains("Unknown") { continue; }
+            for item in prediction.split(';') {
+                if item.trim().contains(':') {
+                    let count = item.split(':').nth(1).unwrap_or("").trim();
+                    count.parse::<i64>().map_err(|e| anyhow!("Invalid species count {:?}: {}", count, e))?;
+                }
+            }
+        }
+        if out.get("drug_class").and_then(|v| v.as_ref()).is_some() { primary.rows.push(out); }
+    }
+    primary.write(&directory.join("primary_AMR_report.tsv"), None)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ResultsPerSampleOutputs {
+    _work_dir: TempDir,
+    artifacts: Vec<PathBuf>,
+    final_summary: PathBuf,
+    synthesized_report: PathBuf,
+}
+
+async fn run_results_per_sample(
+    config: Arc<RunConfig>, main: &RgiMainOutputs, main_species: &RgiKmerMainOutputs,
+    kma: &RgiBwtKmaOutputs, kma_species: &RgiKmerBwtOutputs, coverage: &GeneCoverageOutputs,
+    ontology: &std::path::Path, sample: &str,
+) -> Result<ResultsPerSampleOutputs, PipelineError> {
+    let inputs = [main.main_amr_results.clone(), main_species.species_calling.clone(),
+        kma.kma_amr_results.clone(), kma_species.kma_species_calling.clone(), coverage.output_gene_coverage.clone()];
+    let mut bytes = 0u64;
+    for path in &inputs {
+        bytes = bytes.saturating_add(tokio::fs::metadata(path).await
+            .map_err(|e| PipelineError::IOError(format!("RunResultsPerSample {}: {}", path.display(), e)))?.len());
+    }
+    let work_dir = crate::utils::file::choose_temp_dir(bytes.saturating_mul(4).max(1),
+                                                       &config.ram_temp_dir, &config.args.nvme_scratch, 4, false).await?;
+    let directory = work_dir.path().to_path_buf();
+    let worker_dir = directory.clone();
+    let ontology = ontology.to_path_buf();
+    let sample = sample.to_owned();
+    tokio::task::spawn_blocking(move || amr_results_per_sample_files(&inputs, &ontology, &sample, &worker_dir))
+        .await.map_err(|e| PipelineError::Other(anyhow!("RunResultsPerSample worker: {}", e)))?
+        .map_err(PipelineError::Other)?;
+    let artifacts = ["merge_a.tsv", "merge_b.tsv", "comprehensive_AMR_metrics.tsv", "bigtable_report.tsv", "primary_AMR_report.tsv"]
+        .iter().map(|name| directory.join(name)).collect();
+    Ok(ResultsPerSampleOutputs { _work_dir: work_dir, artifacts,
+        final_summary: directory.join("comprehensive_AMR_metrics.tsv"),
+        synthesized_report: directory.join("primary_AMR_report.tsv") })
 }
 
 /// Native streaming equivalent of the WDL RunRedup task.
@@ -1916,6 +2271,10 @@ pub async fn run(
     let out_dir = config.out_dir.clone();
 
     info!("Starting AMR pipeline.");
+    // Fail fast on report-only configuration before expensive analysis starts.
+    let report_ontology = config.args.amr_card_ontology.as_deref().ok_or_else(||
+        PipelineError::InvalidConfig("--amr-card-ontology is required for AMR reporting (ontology.json, not card.json)".into()))?;
+    let report_ontology = resolve_existing_input_path(report_ontology, &cwd, true)?;
     let rgi_db_root = resolve_amr_rgi_root(&config).await?;
     info!("[AMR] prepared RGI database: {}", rgi_db_root.display());
 
@@ -1933,7 +2292,7 @@ pub async fn run(
                 file1_path,
                 file2_path,
                 sample_base_buf,
-                _sample_base,
+                sample_base,
             ) = validate_file_inputs(
                 &config,
                 &cwd,
@@ -2575,6 +2934,7 @@ pub async fn run(
             );
 
             AmrPreparedInputs {
+                sample_base,
                 non_host_reads_fa: redup_paths,
                 contigs_fa: spades.contigs_path,
             }
@@ -2603,7 +2963,7 @@ pub async fn run(
             );
 
 
-            let (file1_path, file2_path, _, _) =
+            let (file1_path, file2_path, _, sample_base) =
                 validate_file_inputs(&config, &cwd, true).await?;
 
             let paired = file2_path.is_some();
@@ -2742,6 +3102,7 @@ pub async fn run(
             }
 
             AmrPreparedInputs {
+                sample_base,
                 non_host_reads_fa: redup_paths,
                 contigs_fa: filtered_contigs,
             }
@@ -2834,6 +3195,19 @@ pub async fn run(
         );
     }
 
+    let results_result = match (&main_result, &main_kmer_result, &kmer_result, &coverage_result) {
+        (Ok(main), Some(Ok(main_species)), Ok(kma_species), Some(Ok(coverage))) => {
+            Some(run_results_per_sample(config.clone(), main, main_species,
+                                        &rgi_bwt_kma, kma_species, coverage, &report_ontology, &prepared.sample_base).await)
+        }
+        _ => None,
+    };
+    if let Some(Ok(results)) = &results_result {
+        info!("[AMR] RunResultsPerSample complete: summary={}, primary={}",
+            results.final_summary.display(), results.synthesized_report.display());
+        schedule_rgi_artifact_copies(config.clone(), &results.artifacts, &mut cleanup_tasks);
+    }
+
     // Future downstream analysis belongs ABOVE final cleanup. It reads the
     // scratch paths, never waits for publication copies, and must retain owners.
 
@@ -2858,9 +3232,12 @@ pub async fn run(
         .ok_or_else(|| PipelineError::Other(anyhow!("MakeGeneCoverage was not scheduled")))??;
     let rgi_kmer_main = main_kmer_result
         .ok_or_else(|| PipelineError::Other(anyhow!("RunRgiKmerMain was not scheduled")))??;
+    let results = results_result
+        .ok_or_else(|| PipelineError::Other(anyhow!("RunResultsPerSample was not scheduled")))??;
     if let Some(e) = publication_error {
         return Err(PipelineError::Other(e));
     }
+    drop(results);
     drop(rgi_kmer_main);
     drop(gene_coverage);
     drop(rgi_main);
@@ -2868,4 +3245,148 @@ pub async fn run(
     drop(rgi_bwt_kma);
 
     Ok(())
+}
+
+
+
+#[cfg(test)]
+mod amr_results_tests {
+    use super::*;
+
+    fn table(columns: &[&str], rows: &[&[&str]]) -> AmrResultTable {
+        AmrResultTable {
+            columns: columns.iter().map(|s| (*s).to_owned()).collect(),
+            rows: rows.iter().map(|row| columns.iter().zip(row.iter()).map(|(k,v)|
+                ((*k).to_owned(), if v.is_empty() { None } else { Some((*v).to_owned()) })).collect()).collect(),
+        }
+    }
+
+    #[test]
+    fn outer_join_preserves_cartesian_duplicates_and_unmatched_rows() {
+        let a = table(&["a", "left"], &[&["x", "1"], &["x", "2"], &["z", "3"]]);
+        let b = table(&["b", "right"], &[&["x", "4"], &["x", "5"], &["y", "6"]]);
+        let joined = a.outer(&b, &["a"], &["b"]).unwrap();
+        assert_eq!(joined.rows.len(), 6);
+        assert_eq!(joined.rows.iter().filter(|r| amr_cell(r, "a") == Some("x")).count(), 4);
+    }
+
+    #[test]
+    fn accession_stringification_retains_pandas_nan_and_float_promotion() {
+        let mut t = table(&["id"], &[&["3001"], &[""]]);
+        t.accession_strings("id").unwrap();
+        assert_eq!(amr_cell(&t.rows[0], "id"), Some("3001.0"));
+        assert_eq!(amr_cell(&t.rows[1], "id"), Some("nan"));
+    }
+
+    fn fixture(root: &std::path::Path, populated: bool, variant: bool) -> [PathBuf; 5] {
+        let inputs = ["main.tsv", "main_sp.tsv", "kma.tsv", "kma_sp.tsv", "coverage.tsv"].map(|s| root.join(s));
+        let main_cols = ["Best_Hit_ARO", "Contig", "ARO", "AMR Gene Family", "Drug Class", "Model_type",
+            "Resistance Mechanism", "Cut_Off", "Nudged", "Percentage Length of Reference Sequence", "Best_Identities"];
+        let main_sp_cols = ["Best_Hit_ARO", "Contig", "CARD*kmer Prediction"];
+        let kma_cols = ["ARO Term", "ARO Accession", "Reference Model Type", "AMR Gene Family", "Drug Class",
+            "Resistance Mechanism", "All Mapped Reads", "Percent Coverage", "Depth", "Reference Sequence"];
+        let kma_sp_cols = ["ARO term", "CARD*kmer Prediction"];
+        let main_row: &[&str] = &[" gene ", " ctg ", "3001", "family", "class", "protein homolog model", "mechanism", "Strict", "True", "90", "95"];
+        let main_sp_row: &[&str] = &["gene", "ctg", "Species A: 2"];
+        let kma_row: &[&str] = &["gene", "3001", if variant { "protein variant model" } else { "protein homolog model" },
+            "family", "class", "mechanism", "20", "80", "3", "ref"];
+        let kma_sp_row: &[&str] = &["gene", "Species A: 3"];
+        let main_rows = [main_row];
+        let main_sp_rows = [main_sp_row];
+        let kma_rows = [kma_row];
+        let kma_sp_rows = [kma_sp_row];
+        let coverage_row: &[&str] = &["3001", "90.0"];
+        let coverage_rows = [coverage_row];
+
+        let data = [
+            table(
+                &main_cols,
+                if populated { &main_rows } else { &[] },
+            ),
+            table(
+                &main_sp_cols,
+                if populated { &main_sp_rows } else { &[] },
+            ),
+            table(
+                &kma_cols,
+                if populated { &kma_rows } else { &[] },
+            ),
+            table(
+                &kma_sp_cols,
+                if populated { &kma_sp_rows } else { &[] },
+            ),
+            table(
+                &["ID", "gene_coverage_perc"],
+                if populated { &coverage_rows } else { &[] },
+            ),
+        ];
+        for (t, path) in data.iter().zip(&inputs) { t.write(path, None).unwrap(); }
+        std::fs::write(root.join("ontology.json"), r#"{"class":{"highLevelDrugClasses":["high class"]}}"#).unwrap();
+        inputs
+    }
+
+    #[test]
+    fn populated_reports_include_ontology_nudge_and_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = fixture(dir.path(), true, false);
+        amr_results_per_sample_files(&inputs, &dir.path().join("ontology.json"), "sample", dir.path()).unwrap();
+        let report = AmrResultTable::read(&dir.path().join("primary_AMR_report.tsv")).unwrap();
+        assert_eq!(report.rows.len(), 1);
+        let r = &report.rows[0];
+        assert_eq!(amr_cell(r, "gene_name"), Some("gene"));
+        assert_eq!(amr_cell(r, "cutoff"), Some("Nudged"));
+        assert_eq!(amr_cell(r, "high_level_drug_class"), Some("high class"));
+        assert_eq!(amr_cell(r, "num_reads"), Some("20.0"));
+        assert_eq!(amr_cell(r, "contig_coverage_breadth"), Some("90.0"));
+    }
+
+    #[test]
+    fn empty_primary_is_zero_bytes_as_in_wdl() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = fixture(dir.path(), false, false);
+        amr_results_per_sample_files(&inputs, &dir.path().join("missing_ontology.json"), "sample", dir.path()).unwrap();
+        assert_eq!(std::fs::metadata(dir.path().join("primary_AMR_report.tsv")).unwrap().len(), 0);
+        assert!(dir.path().join("comprehensive_AMR_metrics.tsv").is_file());
+    }
+
+    #[test]
+    fn kma_variant_rows_are_removed_before_final_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let inputs = fixture(dir.path(), true, true);
+        amr_results_per_sample_files(&inputs, &dir.path().join("ontology.json"), "sample", dir.path()).unwrap();
+        let b = AmrResultTable::read(&dir.path().join("merge_b.tsv")).unwrap();
+        assert!(b.rows.is_empty());
+        let primary = AmrResultTable::read(&dir.path().join("primary_AMR_report.tsv")).unwrap();
+        assert_eq!(primary.rows.len(), 1);
+        assert_eq!(amr_cell(&primary.rows[0], "num_reads"), None);
+    }
+}
+
+#[cfg(test)]
+mod gene_coverage_tests {
+    use super::*;
+    const HEADER: &str = "ORF_ID\tID\tARO\tModel_ID\tHit_Start\tHit_End\tPercentage Length of Reference Sequence\n";
+
+    #[test]
+    fn empty_report() {
+        assert_eq!(gene_coverage_table(HEADER, &serde_json::json!({})).unwrap(),
+                   "ID\tgene_coverage_bps\tdb_seq_length\tgene_coverage_perc\n");
+    }
+
+    #[test]
+    fn overlapping_forward_and_reverse_ranges() {
+        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\nb\th\t10\t20\t7\t3\t0\n", HEADER);
+        let json = serde_json::json!({
+            "a": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}},
+            "b": {"h": {"dna_sequence_from_broadstreet": "AAAAAAAAAA"}}
+        });
+        // range(0,5) U range(7,3,-1) = {0,1,2,3,4,5,6,7}.
+        assert!(gene_coverage_table(&tsv, &json).unwrap().ends_with("10\t8\t10\t80.0\n"));
+    }
+
+    #[test]
+    fn missing_json_hit_is_an_error() {
+        let tsv = format!("{}a\th\t10\t20\t0\t5\t0\n", HEADER);
+        assert!(gene_coverage_table(&tsv, &serde_json::json!({})).is_err());
+    }
 }
