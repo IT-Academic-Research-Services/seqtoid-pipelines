@@ -93,7 +93,7 @@ use crate::utils::fastx::{
 use crate::utils::file::{
     choose_temp_dir, file_path_manipulator, file_size, rename_file_path, resolve_optional_path,
     validate_file_inputs, write_byte_stream_to_file, write_parse_output_to_file,
-    write_vecu8_to_file, copy_file_streaming,
+    write_vecu8_to_file, copy_file_streaming, write_count_file
 };
 use crate::utils::paf::paf_to_m8;
 use crate::utils::plotting::plot_insert_sizes;
@@ -128,36 +128,47 @@ const DISTRIBUTED_WORKER_STALE_SECS: u64 = 30;
 
 
 pub struct HostFilterOutputs {
-    pub non_host_r1: PathBuf,
-    pub non_host_r2: Option<PathBuf>,
-    pub duplicate_clusters: Arc<DashMap<String, ClusterInfo>>,
-    pub pre_dedup_r1: Option<PathBuf>,
-    pub pre_dedup_r2: Option<PathBuf>,
+    /// Live, deinterleaved subsampled non-host FASTQ streams used by the
+    /// existing short-read checkpoint/alignment path.
+    pub non_host_r1: ReceiverStream<ParseOutput>,
+    pub non_host_r2: Option<ReceiverStream<ParseOutput>>,
+
+    /// Optional live interleaved subsampled FASTQ stream retained before the
+    /// existing short-read deinterleave/serialization boundary.
+    pub subsampled_interleaved: Option<ReceiverStream<ParseOutput>>,
+
+    /// Completes after dedup reaches EOF and returns the complete cluster map.
+    /// Consumers of the FASTQ streams must be installed before awaiting this.
+    pub duplicate_clusters: JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>>,
+
+    /// Optional live structured interleaved FASTQ stream containing the exact
+    /// host-filtered records entering dedup.
+    pub pre_dedup_interleaved: Option<ReceiverStream<ParseOutput>>,
 }
 
-struct HostFilterCompletion {
-    outputs: HostFilterOutputs,
+pub(crate) struct HostFilterCompletion {
+    pub(crate) outputs: HostFilterOutputs,
 
-    val_count_task: JoinHandle<Result<ReadStats, anyhow::Error>>,
-    qc_count_result_rx: oneshot::Receiver<Result<u64, anyhow::Error>>,
-    ercc_count_rx: oneshot::Receiver<u64>,
+    pub(crate) val_count_task: JoinHandle<Result<ReadStats, anyhow::Error>>,
+    pub(crate) qc_count_result_rx: oneshot::Receiver<Result<u64, anyhow::Error>>,
+    pub(crate) ercc_count_rx: oneshot::Receiver<u64>,
 
-    ercc_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
-    host_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
-    optional_human_bam_write_handle: Option<JoinHandle<Result<()>>>,
+    pub(crate) ercc_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
+    pub(crate) host_bt2_bam_write_handle: JoinHandle<Result<(), anyhow::Error>>,
+    pub(crate) optional_human_bam_write_handle: Option<JoinHandle<Result<()>>>,
 
-    host_bt2_count_rx: oneshot::Receiver<u64>,
+    pub(crate) host_bt2_count_rx: oneshot::Receiver<u64>,
 
-    ercc_bt2_bam_path: PathBuf,
-    host_hisat2_count_rx: oneshot::Receiver<u64>,
-    host_bt2_bam_path: PathBuf,
+    pub(crate) ercc_bt2_bam_path: PathBuf,
+    pub(crate) host_hisat2_count_rx: oneshot::Receiver<u64>,
+    pub(crate) host_bt2_bam_path: PathBuf,
 
-    kallisto_exit_task: JoinHandle<Result<(), anyhow::Error>>,
-    kallisto_ercc_tx: oneshot::Sender<KallistoResults>,
-    kallisto_ercc_rx: oneshot::Receiver<KallistoResults>,
+    pub(crate) kallisto_exit_task: JoinHandle<Result<(), anyhow::Error>>,
+    pub(crate) kallisto_ercc_tx: oneshot::Sender<KallistoResults>,
+    pub(crate) kallisto_ercc_rx: oneshot::Receiver<KallistoResults>,
 
-    dedup_count_rx: oneshot::Receiver<u64>,
-    subsample_count_rx: oneshot::Receiver<u64>,
+    pub(crate) dedup_count_rx: oneshot::Receiver<u64>,
+    pub(crate) subsample_count_rx: oneshot::Receiver<u64>,
 }
 
 /// Holds the results from a Kallisto quantification run.
@@ -1930,7 +1941,7 @@ async fn kallisto_quant(
 /// # Returns
 ///
 /// Result containing a handle to the processing task.
-async fn kallisto_results(
+pub(crate) async fn kallisto_results(
     kallisto_out_dir: PathBuf,
     ercc_tx: oneshot::Sender<KallistoResults>,
 ) -> Result<JoinHandle<Result<(), anyhow::Error>>, PipelineError> {
@@ -9316,30 +9327,7 @@ async fn collect_m8_accession_map(
 }
 
 
-async fn write_count_file(
-    out_dir: &PathBuf,
-    filename: &str,
-    count: u64,
-) -> Result<(), PipelineError> {
-    let path = out_dir.join(filename);
-
-    tokio::fs::write(&path, format!("{}\n", count))
-        .await
-        .map_err(|e| {
-            PipelineError::IOError(format!(
-                "Failed to write count file {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-    info!("Wrote {}: {}", path.display(), count);
-
-    Ok(())
-}
-
-
-async fn run_host_filter(
+pub(crate) async fn run_host_filter(
     config: Arc<RunConfig>,
     cwd: &PathBuf,
     out_dir: &PathBuf,
@@ -9348,6 +9336,7 @@ async fn run_host_filter(
     sample_base_buf: &PathBuf,
     paired: bool,
     retain_pre_dedup: bool,
+    retain_subsampled_interleaved: bool,
     final_temp_dirs: &mut Vec<TempDir>,
     cleanup_tasks: &mut Vec<JoinHandle<anyhow::Result<(), anyhow::Error>>>,
     cleanup_receivers: &mut Vec<oneshot::Receiver<anyhow::Result<(), anyhow::Error>>>,
@@ -9607,20 +9596,14 @@ async fn run_host_filter(
             post_filter_stream.into_inner()
         };
 
-    // AMR optionally needs the exact host-filtered records entering dedup().
-    // Preserve the normal mNGS path when retention is disabled. When enabled,
-    // fan out the parsed interleaved stream before dedup so both branches see
-    // the same records in the same order.
-    let (
-        pre_dedup_for_dedup,
-        pre_dedup_r1_path,
-        pre_dedup_r2_path_opt,
-        pre_dedup_retention_task,
-    ) = if retain_pre_dedup {
+    // Optionally expose the exact host-filtered records entering dedup as
+    // live, deinterleaved streams. The dedup branch and the retained branch
+    // are installed concurrently; no FASTQ checkpoint is created here.
+    let (pre_dedup_for_dedup, pre_dedup_interleaved) = if retain_pre_dedup {
         let (pre_dedup_streams, pre_dedup_router_done_rx) = fanout_to_channels(
             ReceiverStream::new(pre_dedup_parsed_stream),
             2,
-            "pre_dedup_retention",
+            "pre_dedup_output",
             &config,
             StreamDataType::IlluminaFastq,
         )
@@ -9630,98 +9613,26 @@ async fn run_host_filter(
         cleanup_receivers.push(pre_dedup_router_done_rx);
 
         let mut pre_dedup_streams = pre_dedup_streams.into_iter();
+
         let dedup_input = pre_dedup_streams
             .next()
             .ok_or(PipelineError::EmptyStream)?;
-        let retention_input = ReceiverStream::new(
+
+        let retained_input = ReceiverStream::new(
             pre_dedup_streams
                 .next()
                 .ok_or(PipelineError::EmptyStream)?,
         );
 
-        let retention_temp_dir = choose_temp_dir(
-            config.input_size * 2,
-            &config.ram_temp_dir,
-            &config.args.nvme_scratch,
-            4,
-            true,
-        )
-            .await
-            .map_err(|e| PipelineError::Other(e.into()))?;
-
-        let pre_dedup_r1_path =
-            retention_temp_dir.path().join("amr_pre_dedup_R1.fastq");
-        let pre_dedup_r2_path_opt = if paired {
-            Some(retention_temp_dir.path().join("amr_pre_dedup_R2.fastq"))
-        } else {
-            None
-        };
-
-        let (r1_rx, r2_rx_opt, deinterleave_handle) =
-            deinterleave_fastq_stream(
-                retention_input,
-                paired,
-                config.base_buffer_size * 4,
-            )
-                .await
-                .map_err(PipelineError::Other)?;
-
-        let r1_write_task = write_parse_output_to_file(
-            &pre_dedup_r1_path,
-            ReceiverStream::new(r1_rx),
-            Some(config.base_buffer_size * 4),
-        )
-            .await?;
-
-        let r2_write_task_opt = match r2_rx_opt {
-            Some(r2_rx) => {
-                let r2_path = pre_dedup_r2_path_opt
-                    .as_ref()
-                    .expect("paired retention must have an R2 path");
-
-                Some(
-                    write_parse_output_to_file(
-                        r2_path,
-                        ReceiverStream::new(r2_rx),
-                        Some(config.base_buffer_size * 4),
-                    )
-                        .await?,
-                )
-            }
-            None => None,
-        };
-
-        // Keep the directory alive for AMR consumers after this function
-        // returns. Join the retention side-chain before returning so the
-        // paths in HostFilterOutputs always refer to complete FASTQ files.
-        final_temp_dirs.push(retention_temp_dir);
-
-        let retention_task = tokio::spawn(async move {
-            r1_write_task
-                .await
-                .map_err(|e| anyhow!("Pre-dedup R1 writer task panicked: {}", e))??;
-
-            if let Some(r2_write_task) = r2_write_task_opt {
-                r2_write_task
-                    .await
-                    .map_err(|e| anyhow!("Pre-dedup R2 writer task panicked: {}", e))??;
-            }
-
-            deinterleave_handle
-                .await
-                .map_err(|e| anyhow!("Pre-dedup deinterleave task panicked: {}", e))??;
-
-            Ok::<(), anyhow::Error>(())
-        });
-
         (
             dedup_input,
-            Some(pre_dedup_r1_path),
-            pre_dedup_r2_path_opt,
-            Some(retention_task),
+            Some(retained_input),
         )
     } else {
-        (pre_dedup_parsed_stream, None, None, None)
+        (
+            pre_dedup_parsed_stream,
+            None,
+        )
     };
 
     let (
@@ -9766,127 +9677,68 @@ async fn run_host_filter(
 
 
 
-    //write de-interleaved non-host file. easier for the scatter-gather
-    let (r1_rx, r2_rx_opt, deinterleave_handle) =
-        deinterleave_fastq_stream(subsampled_stream, paired, config.base_buffer_size * 4)
-            .await
-            .map_err(|e| PipelineError::Other(e))?;
+    // Optionally retain the structured interleaved post-subsample stream for
+    // AMR before the existing short-read deinterleave/serialization boundary.
+    // The normal short-read branch remains unchanged.
+    let (subsampled_for_short_read, subsampled_interleaved) =
+        if retain_subsampled_interleaved {
+            let (subsampled_streams, subsampled_router_done_rx) = fanout_to_channels(
+                subsampled_stream,
+                2,
+                "subsampled_output",
+                &config,
+                StreamDataType::IlluminaFastq,
+            )
+                .await
+                .map_err(|_| PipelineError::StreamDataDropped)?;
 
-    let non_host_temp_dir = choose_temp_dir(
-        config.input_size * 2,
-        &config.ram_temp_dir,
-        &config.args.nvme_scratch,
-        4,
-        true,
-    )
-        .await
-        .map_err(|e| PipelineError::Other(e.into()))?;
+            cleanup_receivers.push(subsampled_router_done_rx);
 
-    // Compute paths after temp_dir but before moving rx (only borrows with as_ref())
-    let non_host_r1_path = non_host_temp_dir.path().join("nonhost_R1.fastq");
-    let non_host_r2_path_opt = r2_rx_opt
-        .as_ref()
-        .map(|_| non_host_temp_dir.path().join("nonhost_R2.fastq"));
+            let mut subsampled_streams = subsampled_streams.into_iter();
+            let short_read_stream = ReceiverStream::new(
+                subsampled_streams.next().ok_or(PipelineError::EmptyStream)?,
+            );
+            let amr_stream = ReceiverStream::new(
+                subsampled_streams.next().ok_or(PipelineError::EmptyStream)?,
+            );
 
-    info!("Checkpoint: deinterleaving and writing non-host R1/R2 to temp (forces upstream completion). Writing to: {:?}", non_host_temp_dir);
-    final_temp_dirs.push(non_host_temp_dir);
-
-    let r1_write_task_fut = write_parse_output_to_file(
-        &non_host_r1_path,
-        ReceiverStream::new(r1_rx),
-        Some(config.base_buffer_size * 4),
-    );
-
-    let r2_write_task_fut_opt = r2_rx_opt.map(|r2_rx| {
-        let r2_path = non_host_r2_path_opt
-            .as_ref()
-            .expect("R2 path should exist when r2_rx_opt is Some");
-
-        write_parse_output_to_file(
-            r2_path,
-            ReceiverStream::new(r2_rx),
-            Some(config.base_buffer_size * 4),
-        )
-    });
-
-    // start both writer tasks concurrently
-    let (r1_write_task, r2_write_task_opt) = tokio::try_join!(r1_write_task_fut, async {
-        match r2_write_task_fut_opt {
-            Some(fut) => fut.await.map(Some),
-            None => Ok(None),
-        }
-    })?;
-
-    // then wait for both background writes and deinterleave together
-    tokio::try_join!(
-        async {
-            r1_write_task.await?;
-            Ok::<(), anyhow::Error>(())
-        },
-        async {
-            if let Some(task) = r2_write_task_opt {
-                task.await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        },
-        async {
-            deinterleave_handle.await?;
-            Ok::<(), anyhow::Error>(())
-        },
-    )?;
-
-    let duplicate_clusters = dedup_finalize_task
-        .await
-        .map_err(|e| {
-            PipelineError::Other(anyhow!(
-            "Dedup finalization task panicked: {}",
-            e
-        ))
-        })?
-        .map_err(PipelineError::Other)?;
-
-    if let Some(retention_task) = pre_dedup_retention_task {
-        retention_task
-            .await
-            .map_err(|e| {
-                PipelineError::Other(anyhow!(
-                    "Pre-dedup retention task panicked: {}",
-                    e
-                ))
-            })?
-            .map_err(PipelineError::Other)?;
-    }
-
-    for rx in hisat2_cleanup_receivers {
-        rx.await??;
-    }
-
-    info!(
-        "Checkpoint complete. Files: r1:{:?}   r2:{:?}",
-        non_host_r1_path, non_host_r2_path_opt
-    );
-
-    // Early cleanup upstream temp dirs (host filter, etc.)
-    for td in &host_filter_temp_dirs {
-        if let Err(e) = std::fs::remove_dir_all(td.path()) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                warn!("Early temp dir cleanup failed (non-fatal): {}", e);
-            } else {
-                debug!("Temp dir already gone: {}", td.path().display());
-            }
+            (short_read_stream, Some(amr_stream))
         } else {
-            info!("Early cleanup: removed temp dir {}", td.path().display());
-        }
-    }
-    host_filter_temp_dirs.clear();
+            (subsampled_stream, None)
+        };
 
+    // Existing short-read boundary: expose deinterleaved serialized FASTQ
+    // streams for checkpointing/distributed alignment. Do not change this path.
+    let (non_host_r1_rx, non_host_r2_rx_opt, non_host_deinterleave_handle) =
+        deinterleave_fastq_stream(
+            subsampled_for_short_read,
+            paired,
+            config.base_buffer_size * 4,
+        )
+            .await
+            .map_err(PipelineError::Other)?;
+
+    cleanup_tasks.push(non_host_deinterleave_handle);
+
+    let non_host_r1 = ReceiverStream::new(non_host_r1_rx);
+    let non_host_r2 = non_host_r2_rx_opt.map(ReceiverStream::new);
+
+    // Do not await dedup finalization or host-filter router completion here.
+    // Those producers can be backpressured by the live streams returned below.
+    // The caller must install stream consumers before draining completion/cleanup.
+    cleanup_receivers.extend(hisat2_cleanup_receivers);
+
+    // The returned streams may still be backed by files/directories created by
+    // host-filter stages. Transfer ownership to the caller so TempDir::drop does
+    // not remove them while producers are still running.
+    final_temp_dirs.append(&mut host_filter_temp_dirs);
 
     let outputs = HostFilterOutputs {
-        non_host_r1: non_host_r1_path,
-        non_host_r2: non_host_r2_path_opt,
-        duplicate_clusters,
-        pre_dedup_r1: pre_dedup_r1_path,
-        pre_dedup_r2: pre_dedup_r2_path_opt,
+        non_host_r1,
+        non_host_r2,
+        subsampled_interleaved,
+        duplicate_clusters: dedup_finalize_task,
+        pre_dedup_interleaved,
     };
 
     Ok(HostFilterCompletion {
@@ -10027,6 +9879,7 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         file2_path.clone(),
         &sample_base_buf,
         paired,
+        true,
         false,
         &mut final_temp_dirs,
         &mut cleanup_tasks,
@@ -10053,42 +9906,182 @@ pub async fn run(config: Arc<RunConfig>) -> anyhow::Result<(), PipelineError> {
         subsample_count_rx
     } = host_filter;
 
-    let non_host_r1_path = outputs.non_host_r1;
-    let non_host_r2_path_opt = outputs.non_host_r2;
-    let duplicate_clusters = outputs.duplicate_clusters;
+    let HostFilterOutputs {
+        non_host_r1,
+        non_host_r2,
+        subsampled_interleaved: _,
+        duplicate_clusters: duplicate_clusters_task,
+        pre_dedup_interleaved,
+    } = outputs;
 
-    // Clone paths **before** moving them into async copy tasks
-    let non_host_r1_path_clone = non_host_r1_path.clone();
-    let non_host_r2_path_opt_clone = non_host_r2_path_opt.clone();
+    // The normal short-read pipeline requires separate R1/R2 pre-dedup
+    // checkpoint files. Keep that representation change here, at the
+    // short-read caller boundary, rather than inside run_host_filter().
+    let pre_dedup_interleaved = pre_dedup_interleaved.ok_or_else(|| {
+        PipelineError::InvalidConfig(
+            "short-read host filter requested pre-dedup stream but it was absent"
+                .to_string(),
+        )
+    })?;
 
-    // Async copy to out_dir (non-blocking)
-    let out_dir_clone = out_dir.clone();
-    let r1_copy_task = tokio::spawn(async move {
-        let dest_r1 = out_dir_clone.join("nonhost_R1.fastq");
-        if let Err(e) = tokio::fs::copy(&non_host_r1_path_clone, &dest_r1).await {
-            warn!("Failed to copy non-host R1 to out_dir: {}", e);
-        } else {
-            info!("Copied non-host R1 to {}", dest_r1.display());
-        }
-        Ok(())
-    });
-    cleanup_tasks.push(r1_copy_task);
+    let (
+        pre_dedup_r1_rx,
+        pre_dedup_r2_rx_opt,
+        pre_dedup_deinterleave_handle,
+    ) = deinterleave_fastq_stream(
+        pre_dedup_interleaved,
+        paired,
+        config.base_buffer_size * 4,
+    )
+        .await
+        .map_err(PipelineError::Other)?;
 
-    if let Some(r2_path) = non_host_r2_path_opt_clone {
-        let r2_path_clone = r2_path.clone();
-        let out_dir_clone = out_dir.clone();
-        let r2_copy_task = tokio::spawn(async move {
-            let dest_r2 = out_dir_clone.join("nonhost_R2.fastq");
-            if let Err(e) = tokio::fs::copy(&r2_path_clone, &dest_r2).await {
-                warn!("Failed to copy non-host R2 to out_dir: {}", e);
-            } else {
-                info!("Copied non-host R2 to {}", dest_r2.display());
+    cleanup_tasks.push(pre_dedup_deinterleave_handle);
+
+    let pre_dedup_r1 = ReceiverStream::new(pre_dedup_r1_rx);
+    let pre_dedup_r2 = pre_dedup_r2_rx_opt.map(ReceiverStream::new);
+
+    // ---------------------------------------------------------------------
+    // Short-read hard checkpoint.
+    //
+    // The distributed/scatter-gather architecture requires stable non-host
+    // FASTQ files.  run_host_filter() deliberately returns streams; this
+    // caller owns the conversion from those streams to checkpoint files.
+    //
+    // Start every consumer before awaiting any producer/finalizer.  In
+    // particular, the pre-dedup streams are live fanout branches and must be
+    // drained even though the normal short-read pipeline does not consume
+    // them downstream.  We retain them as sidecars for AMR/debugging parity.
+    // ---------------------------------------------------------------------
+    let non_host_r1_path = out_dir.join("nonhost_R1.fastq");
+    let non_host_r2_path_opt = paired.then(|| out_dir.join("nonhost_R2.fastq"));
+
+    let pre_dedup_r1_path = out_dir.join("pre_dedup_R1.fastq");
+    let pre_dedup_r2_path_opt = paired.then(|| out_dir.join("pre_dedup_R2.fastq"));
+
+    info!(
+        "Checkpoint: writing host-filter streams to short-read sidecars: \
+         non_host_r1={}, non_host_r2={:?}, pre_dedup_r1={}, pre_dedup_r2={:?}",
+        non_host_r1_path.display(),
+        non_host_r2_path_opt.as_ref().map(|p| p.display().to_string()),
+        pre_dedup_r1_path.display(),
+        pre_dedup_r2_path_opt.as_ref().map(|p| p.display().to_string()),
+    );
+
+    let r1_write_task_fut = write_parse_output_to_file(
+        &non_host_r1_path,
+        non_host_r1,
+        Some(config.base_buffer_size * 4),
+    );
+
+    let r2_write_task_fut = async {
+        match (non_host_r2, non_host_r2_path_opt.as_ref()) {
+            (Some(stream), Some(path)) => {
+                write_parse_output_to_file(
+                    path,
+                    stream,
+                    Some(config.base_buffer_size * 4),
+                )
+                    .await
+                    .map(Some)
             }
-            Ok(())
-        });
-        cleanup_tasks.push(r2_copy_task);
-    }
+            (None, None) => Ok(None),
+            _ => Err(anyhow!(
+            "non-host R2 stream/path cardinality mismatch"
+        )),
+        }
+    };
 
+    let pre_dedup_r1_write_task_fut = write_parse_output_to_file(
+        &pre_dedup_r1_path,
+        pre_dedup_r1,
+        Some(config.base_buffer_size * 4),
+    );
+
+    let pre_dedup_r2_write_task_fut = async {
+        match (pre_dedup_r2, pre_dedup_r2_path_opt.as_ref()) {
+            (Some(stream), Some(path)) => {
+                write_parse_output_to_file(
+                    path,
+                    stream,
+                    Some(config.base_buffer_size * 4),
+                )
+                    .await
+                    .map(Some)
+            }
+            (None, None) => Ok(None),
+            _ => Err(anyhow!(
+            "pre-dedup R2 stream/path cardinality mismatch"
+        )),
+        }
+    };
+
+    // Installing all four writers concurrently is important: pre-dedup R1/R2
+    // and the dedup branch share a bounded fanout upstream.
+    let (
+        r1_write_task,
+        r2_write_task_opt,
+        pre_dedup_r1_write_task,
+        pre_dedup_r2_write_task_opt,
+    ) = tokio::try_join!(
+        r1_write_task_fut,
+        r2_write_task_fut,
+        pre_dedup_r1_write_task_fut,
+        pre_dedup_r2_write_task_fut,
+    )?;
+
+    // This is intentionally the hard file boundary for short-read mNGS.
+    // Once these complete, the distributed non-host alignment stages can open
+    // stable files without constraining run_host_filter() or AMR to files.
+    tokio::try_join!(
+        async {
+            r1_write_task
+                .await
+                .map_err(|e| anyhow!("Non-host R1 writer task panicked: {}", e))??;
+            Ok::<(), anyhow::Error>(())
+        },
+        async {
+            if let Some(task) = r2_write_task_opt {
+                task.await
+                    .map_err(|e| anyhow!("Non-host R2 writer task panicked: {}", e))??;
+            }
+            Ok::<(), anyhow::Error>(())
+        },
+        async {
+            pre_dedup_r1_write_task
+                .await
+                .map_err(|e| anyhow!("Pre-dedup R1 sidecar writer task panicked: {}", e))??;
+            Ok::<(), anyhow::Error>(())
+        },
+        async {
+            if let Some(task) = pre_dedup_r2_write_task_opt {
+                task.await
+                    .map_err(|e| anyhow!("Pre-dedup R2 sidecar writer task panicked: {}", e))??;
+            }
+            Ok::<(), anyhow::Error>(())
+        },
+    )
+        .map_err(PipelineError::Other)?;
+
+    // Dedup finalization can only complete after its stream reaches EOF.  At
+    // this point all live output branches have been drained, so it is safe to
+    // collect the complete duplicate-cluster map.
+    let duplicate_clusters = duplicate_clusters_task
+        .await
+        .map_err(|e| {
+            PipelineError::Other(anyhow!(
+                "Dedup finalization task panicked: {}",
+                e
+            ))
+        })?
+        .map_err(PipelineError::Other)?;
+
+    info!(
+        "Short-read host-filter checkpoint complete: r1={}, r2={:?}, duplicate_clusters={}",
+        non_host_r1_path.display(),
+        non_host_r2_path_opt.as_ref().map(|p| p.display().to_string()),
+        duplicate_clusters.len(),
+    );
 
     // =====================================================================
     // Non-host Alignment

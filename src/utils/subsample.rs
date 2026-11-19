@@ -1,8 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use dashmap::DashMap;
 use log::{info, warn};
 use rand::prelude::*;
 use rand::prelude::SliceRandom;
@@ -516,4 +518,57 @@ pub async fn subsample_uniform_reservoir(
         base_count_rx,
         task,
     ))
+}
+
+
+pub fn load_duplicate_clusters_csv(
+    path: PathBuf,
+) -> JoinHandle<Result<Arc<DashMap<String, ClusterInfo>>, anyhow::Error>> {
+    tokio::spawn(async move {
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| anyhow!("Failed to read duplicate-cluster CSV {}: {}", path.display(), e))?;
+
+        let clusters = Arc::new(DashMap::<String, ClusterInfo>::new());
+
+        for (line_index, line) in text.lines().enumerate() {
+            if line_index == 0 && line.trim() == "representative read id,read id" {
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let (rep_id, member_id) = line.split_once(',').ok_or_else(|| {
+                anyhow!(
+                    "Malformed duplicate-cluster CSV {} at line {}: expected two comma-separated columns",
+                    path.display(),
+                    line_index + 1
+                )
+            })?;
+
+            let rep_id = rep_id.trim();
+            let member_id = member_id.trim();
+            if rep_id.is_empty() || member_id.is_empty() {
+                return Err(anyhow!(
+                    "Malformed duplicate-cluster CSV {} at line {}: empty representative/member id",
+                    path.display(),
+                    line_index + 1
+                ));
+            }
+
+            clusters
+                .entry(rep_id.to_string())
+                .and_modify(|info| {
+                    info.size += 1;
+                    info.members.push(member_id.to_string());
+                })
+                .or_insert_with(|| ClusterInfo {
+                    size: 1,
+                    members: vec![member_id.to_string()],
+                });
+        }
+
+        Ok(clusters)
+    })
 }

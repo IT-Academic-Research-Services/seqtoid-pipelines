@@ -46,6 +46,7 @@ use pipelines::consensus_genome;
 use pipelines::db;
 use pipelines::short_read_mngs;
 use pipelines::long_read_mngs;
+use pipelines::amr;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -231,6 +232,7 @@ async fn main() -> Result<()> {
         "build_accession2taxid" => build_accession2taxid_run(run_config).await,
         "build_fasta_offset" => build_fasta_offset_db_run(run_config).await,
         "long_read_mngs" => long_read_mngs_run(run_config).await,
+        "amr" => amr_run(run_config).await,
         _ => Err(PipelineError::InvalidConfig(format!(
             "Invalid module: {}",
             module
@@ -273,6 +275,10 @@ async fn build_fasta_offset_db_run(run_config: Arc<RunConfig>) -> Result<(), Pip
 
 async fn long_read_mngs_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
     long_read_mngs::run(run_config).await
+}
+
+async fn amr_run(run_config: Arc<RunConfig>) -> Result<(), PipelineError> {
+    amr::run(run_config).await
 }
 
 /// Sets up output directory

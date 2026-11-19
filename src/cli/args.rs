@@ -228,7 +228,7 @@ pub struct Arguments {
 
     #[arg(long, default_value = "nt_info.tab")]
     pub nt_info_tab: Option<String>,
-    
+
     #[arg(long, default_value = "nt_split")]
     pub nt_split_dir: String,
 
@@ -273,5 +273,58 @@ pub struct Arguments {
         help = "Number of Flye polishing iterations."
     )]
     pub polishing_iterations: usize,
+
+    /// AMR input mode.
+    ///
+    /// raw:
+    ///   Input FASTQs require host filtering.
+    ///
+    /// filtered:
+    ///   Input is assumed to have already passed the host-filtering stage.
+    #[arg(
+    long = "amr-input-mode",
+    default_value = "raw",
+    value_parser = ["raw", "filtered"]
+    )]
+    pub amr_input_mode: String,
+
+    #[arg(long = "amr-pre-dedup-file1", help = "Filtered AMR mode: host-filtered/pre-dedup R1 FASTQ used for duplicate re-expansion")]
+    pub amr_pre_dedup_file1: Option<String>,
+
+    #[arg(long = "amr-pre-dedup-file2", help = "Filtered AMR mode: optional host-filtered/pre-dedup R2 FASTQ used for duplicate re-expansion")]
+    pub amr_pre_dedup_file2: Option<String>,
+
+    #[arg(long = "amr-duplicate-clusters", help = "Filtered AMR mode: CZ ID clusters.csv mapping representative read id to read id")]
+    pub amr_duplicate_clusters: Option<String>,
+
+    #[arg(
+        long = "amr-filtered-contigs",
+        help = "Filtered AMR mode: contigs FASTA corresponding to the supplied filtered sample"
+    )]
+    pub amr_filtered_contigs: Option<String>,
+
+    /// Root of a prepared local RGI database; must contain localDB/.
+    #[arg(
+        long = "amr-rgi-db",
+        help = "AMR: prepared RGI database root containing localDB/"
+    )]
+    pub amr_rgi_db: Option<String>,
+
+
+    #[arg(
+        long = "amr-kma-db",
+        help = "AMR: KMA CARD reference database prefix"
+    )]
+    pub amr_kma_db: Option<String>,
+
+    #[arg(
+        long = "amr-card-json",
+        help = "AMR: path to the CARD card.json model metadata database"
+    )]
+    pub amr_card_json: Option<String>,
+
+    #[arg(long = "amr-card-ontology", help = "AMR reporting: CARD ontology.json containing highLevelDrugClasses (not card.json)")]
+    pub amr_card_ontology: Option<String>,
+    
 
 }

@@ -1000,6 +1000,31 @@ pub async fn copy_file_streaming(
     Ok(task)
 }
 
+
+pub async fn write_count_file(
+    out_dir: &PathBuf,
+    filename: &str,
+    count: u64,
+) -> Result<(), PipelineError> {
+    let path = out_dir.join(filename);
+
+    tokio::fs::write(&path, format!("{}\n", count))
+        .await
+        .map_err(|e| {
+            PipelineError::IOError(format!(
+                "Failed to write count file {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+    info!("Wrote {}: {}", path.display(), count);
+
+    Ok(())
+}
+
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

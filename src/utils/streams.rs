@@ -1394,7 +1394,8 @@ pub async fn deinterleave_fastq_stream_to_fifos(
 
 
 
-/// Interleaves two FASTQ streams into a single stream.
+/// Interleaves two matching FASTQ or FASTA streams, preserving records and order.
+/// The existing function name is retained for current FASTQ callers.
 ///
 /// # Arguments
 ///
@@ -1404,7 +1405,7 @@ pub async fn deinterleave_fastq_stream_to_fifos(
 ///
 /// # Returns
 /// A result containing the interleaved receiver and the interleaving task handle.
-pub async fn interleave_fastq_streams(
+pub async fn interleave_fastx_streams(
     r1_rx: mpsc::Receiver<ParseOutput>,
     r2_rx: mpsc::Receiver<ParseOutput>,
     buffer_size: usize,
@@ -1414,27 +1415,21 @@ pub async fn interleave_fastq_streams(
         let mut r1_stream = ReceiverStream::new(r1_rx);
         let mut r2_stream = ReceiverStream::new(r2_rx);
         let mut record_count = 0;
-        while let (Some(r1), Some(r2)) = (r1_stream.next().await, r2_stream.next().await) {
-            record_count += 2;
-            match (&r1, &r2) {
-                (ParseOutput::Fastq(_), ParseOutput::Fastq(_)) => {
-                    inter_tx.send(r1).await
-                        .map_err(|_| PipelineError::StreamDataDropped)
-                        .map_err(Into::<anyhow::Error>::into)?;
-                    inter_tx.send(r2).await
-                        .map_err(|_| PipelineError::StreamDataDropped)
-                        .map_err(Into::<anyhow::Error>::into)?;
+        loop {
+            match (r1_stream.next().await, r2_stream.next().await) {
+                (None, None) => break,
+                (Some(r1), Some(r2)) => {
+                    match (&r1, &r2) {
+                        (ParseOutput::Fastq(_), ParseOutput::Fastq(_)) |
+                        (ParseOutput::Fasta(_), ParseOutput::Fasta(_)) => {}
+                        _ => return Err(anyhow!("Expected matching FASTQ or FASTA records in interleave stream")),
+                    }
+                    inter_tx.send(r1).await.map_err(|_| anyhow!("Interleave receiver dropped"))?;
+                    inter_tx.send(r2).await.map_err(|_| anyhow!("Interleave receiver dropped"))?;
+                    record_count += 2;
                 }
-                _ => return Err(PipelineError::InvalidFastqFormat("Non-FASTQ in interleave stream".to_string()))
-                    .map_err(Into::<anyhow::Error>::into),
+                _ => return Err(anyhow!("Uneven paired-end streams after {} records", record_count)),
             }
-        }
-        // Check if one stream ended early
-        if r1_stream.next().await.is_some() || r2_stream.next().await.is_some() {
-            return Err(PipelineError::InvalidFastqFormat(format!(
-                "Uneven paired-end streams: {} records", record_count
-            )))
-                .map_err(Into::<anyhow::Error>::into);
         }
         debug!("interleave_fastq_streams: Interleaved {} records", record_count);
         Ok(())
@@ -1987,7 +1982,7 @@ mod tests {
 
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
         let run_id = format!("run_streams_test_{ts}");
-        
+
         let distributed_workers =
             resolve_distributed_workers(args.distributed, args.distributed_workers).unwrap();
 
@@ -3653,4 +3648,48 @@ mod tests {
         Ok(())
     }
 
+}
+#[cfg(test)]
+mod interleave_fastx_tests {
+    use super::*;
+
+    async fn run(left: usize, right: usize, fasta: bool) -> (usize, bool) {
+        let (tx1, rx1) = mpsc::channel(8);
+        let (tx2, rx2) = mpsc::channel(8);
+        for (tx, count) in [(&tx1, left), (&tx2, right)] {
+            for i in 0..count {
+                let item = if fasta {
+                    ParseOutput::Fasta(SequenceRecord::Fasta {
+                        id: i.to_string(), desc: None, seq: Bytes::from_static(b"AC"),
+                    })
+                } else {
+                    ParseOutput::Fastq(SequenceRecord::Fastq {
+                        id: i.to_string(), desc: None, seq: Bytes::from_static(b"AC"),
+                        qual: Bytes::from_static(b"II"),
+                    })
+                };
+                tx.send(item).await.unwrap();
+            }
+        }
+        drop(tx1);
+        drop(tx2);
+        let (mut rx, task) = interleave_fastx_streams(rx1, rx2, 2).await.unwrap();
+        let mut count = 0;
+        while rx.recv().await.is_some() { count += 1; }
+        (count, task.await.unwrap().is_ok())
+    }
+
+    #[tokio::test]
+    async fn matching_fasta_and_fastq() {
+        assert_eq!(run(2, 2, true).await, (4, true));
+        assert_eq!(run(2, 2, false).await, (4, true));
+        assert_eq!(run(0, 0, true).await, (0, true));
+    }
+
+    #[tokio::test]
+    async fn detects_one_extra_record_on_either_side() {
+        assert_eq!(run(2, 1, true).await, (2, false));
+        assert_eq!(run(1, 2, true).await, (2, false));
+        assert_eq!(run(0, 1, false).await, (0, false));
+    }
 }
