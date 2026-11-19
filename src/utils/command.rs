@@ -4849,10 +4849,11 @@ pub mod rgi {
         ///
         /// Examples:
         ///
-        ///     ("-i", Some("card.json"))
-        ///     ("--clean", None)
-        ///     ("--include_nudge", None)
-        ///
+        /// ```text
+        /// ("-i", Some("card.json"))
+        /// ("--clean", None)
+        /// ("--include_nudge", None)
+        /// ```
         /// Vec is intentional:
         /// - preserves command-line order;
         /// - permits repeated options;
