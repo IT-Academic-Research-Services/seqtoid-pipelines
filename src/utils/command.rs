@@ -2965,9 +2965,18 @@ pub mod diamond {
         available_ram_bytes: u64,
         output: Option<PathBuf>,
     ) -> Result<DiamondConfig> {
-        let _ = available_ram_bytes;
-        let block_size: f64 = 20.0;
-        let index_chunks: usize = 1;
+        let block_size = compute_optimal_diamond_block_size(
+            &db,
+            &tmpdir,
+            available_ram_bytes,
+        )
+            .await
+            .unwrap_or(12.0);
+
+        let index_chunks = compute_diamond_index_chunks(
+            threads,
+            available_ram_bytes,
+        );
 
         let mut subcommand_fields = HashMap::from([
             (
@@ -3140,7 +3149,7 @@ pub mod diamond {
 
         block_size = block_size.min(total_letters_billions);
         block_size = block_size.max(6.0);
-        block_size = block_size.min(200.0);
+        block_size = block_size.min(20.0);
 
         let scratch_avail =
             available_space_for_path(scratch_path)
@@ -3218,23 +3227,19 @@ pub mod diamond {
         threads: usize,
         available_ram_bytes: u64,
     ) -> usize {
-        let mut index_chunks = if threads >= 192 {
-            32
-        } else if threads >= 128 {
-            24
-        } else if threads >= 96 {
-            16
-        } else if threads >= 64 {
-            12
-        } else {
-            4
-        };
+        // Planning heuristic, not a DIAMOND peak-memory guarantee:
+        // budget half the available RAM for index work, with a nominal
+        // unchunked working-set allowance of 2 GiB per search thread.
+        // More available RAM reduces chunking; more threads increase it.
+        // Keep the public API unchanged for existing callers.
+        let available_gib =
+            available_ram_bytes as f64 / 1_073_741_824.0;
+        let index_budget_gib = (available_gib * 0.5).max(1.0);
+        let estimated_unchunked_gib = threads.max(1) as f64 * 2.0;
 
-        index_chunks = index_chunks
-            .min((available_ram_bytes / 12_000_000_000) as usize)
-            .max(1);
-
-        index_chunks
+        (estimated_unchunked_gib / index_budget_gib)
+            .ceil()
+            .clamp(1.0, 32.0) as usize
     }
 
     async fn get_diamond_db_stats(
@@ -3291,6 +3296,7 @@ pub mod diamond {
         Ok((sequences, letters))
     }
 }
+
 
 pub mod spades {
     // command.rs spades mod - no changes needed (presence check was not failing; kept as is with -v)

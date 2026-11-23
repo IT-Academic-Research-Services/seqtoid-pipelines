@@ -106,7 +106,7 @@ lazy_static! {
         m.insert("minimap2", 64);
         m.insert("samtools", 32);     // Sort is I/O-bound
         m.insert("spades", 128);      // Compute-heavy
-        m.insert("diamond", 256);  // warp factor 10
+        // DIAMOND is bounded by the caller's CPU budget, not a fixed cap.
         m.insert("fastp", 32);        // I/O-bound
         m.insert("pigz", 16);         // Compression scales poorly >16
         m.insert("kraken2", 64);      // Memory/I/O heavy
@@ -397,9 +397,9 @@ pub fn allocate_tool_threads(
     if prefer_physical && use_smt {
         allocation =
             allocation.min(physical_cores);
-    } else if tag == DIAMOND_TAG && use_smt {
-        allocation = allocation.min(112);
-    } else if !prefer_physical && use_smt {
+    } else if !prefer_physical && use_smt && tag != DIAMOND_TAG {
+        // DIAMOND keeps the caller's allocation; other tools retain
+        // the existing modest-SMT policy.
         let modest_max =
             (physical_cores as f32
                 * SMT_MODEST_MULTIPLIER)
