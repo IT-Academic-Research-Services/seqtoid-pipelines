@@ -2965,8 +2965,6 @@ pub mod diamond {
         available_ram_bytes: u64,
         output: Option<PathBuf>,
     ) -> Result<DiamondConfig> {
-        // EXPERIMENTAL r6id.32xlarge benchmark settings, not auto-tuning.
-        // Keep the API stable for single-node and distributed callers.
         let _ = available_ram_bytes;
         let block_size: f64 = 20.0;
         let index_chunks: usize = 1;
