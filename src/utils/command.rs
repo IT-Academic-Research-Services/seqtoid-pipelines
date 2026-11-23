@@ -2965,18 +2965,11 @@ pub mod diamond {
         available_ram_bytes: u64,
         output: Option<PathBuf>,
     ) -> Result<DiamondConfig> {
-        let block_size = compute_optimal_diamond_block_size(
-            &db,
-            &tmpdir,
-            available_ram_bytes,
-        )
-            .await
-            .unwrap_or(12.0);
-
-        let index_chunks = compute_diamond_index_chunks(
-            threads,
-            available_ram_bytes,
-        );
+        // EXPERIMENTAL r6id.32xlarge benchmark settings, not auto-tuning.
+        // Keep the API stable for single-node and distributed callers.
+        let _ = available_ram_bytes;
+        let block_size: f64 = 20.0;
+        let index_chunks: usize = 1;
 
         let mut subcommand_fields = HashMap::from([
             (

@@ -397,6 +397,10 @@ pub fn allocate_tool_threads(
     if prefer_physical && use_smt {
         allocation =
             allocation.min(physical_cores);
+    } else if tag == DIAMOND_TAG && use_smt {
+        // EXPERIMENTAL: allow DIAMOND up to 112 logical CPUs while
+        // respecting both the CLI request and detected CPU availability.
+        allocation = allocation.min(112);
     } else if !prefer_physical && use_smt {
         let modest_max =
             (physical_cores as f32
