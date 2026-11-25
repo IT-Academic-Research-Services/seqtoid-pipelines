@@ -26,8 +26,8 @@ pub trait ArgGenerator {
 }
 
 /// Checks the version of a CLI external tool.
-/// NB: ONLY keeps tracks of major plus minor, i.e. 2.1, 4.3, not a point release like 3.4.5
-/// Strips all non digit parts of the version.
+/// Parses major/minor/patch from the selected token. Missing components are zero.
+/// Prefixes, suffixes, and fourth/build components are ignored.
 /// # Arguments
 ///
 /// * `command_tag` - Executable name of tool.
@@ -37,7 +37,7 @@ pub trait ArgGenerator {
 /// * `child_stream` - Is the verion on stdout or stderr.
 ///
 /// # Returns
-/// Result<f32>major/minor version number
+/// Result<crate::config::defs::ToolVersion>major/minor version number
 /// Checks for the presence and version of an external command.
 ///
 /// # Arguments
@@ -52,7 +52,7 @@ pub trait ArgGenerator {
 ///
 /// # Returns
 ///
-/// Result<f32>: the parsed version number
+/// Result<crate::config::defs::ToolVersion>: the parsed version number
 pub async fn version_check(
     command_tag: &str,
     version_args: Vec<&str>,
@@ -61,7 +61,7 @@ pub async fn version_check(
     child_stream: ChildStream,
     version_file: Option<PathBuf>,
     config: &RunConfig,
-) -> Result<f32> {
+) -> Result<crate::config::defs::ToolVersion> {
     let cmd_tag_owned = command_tag.to_string();
     debug!("Running command: {}", &cmd_tag_owned);
     let args: Vec<&str> = version_args;
@@ -122,17 +122,9 @@ pub async fn version_check(
         ));
     }
 
-    let version_parts: Vec<_> = version_string.split(".").collect();
-    let major_version = version_parts[0];
-    let major_version_digits: String = major_version.chars().filter(|c| c.is_digit(10)).collect();
-    let mut minor_version = "0";
-    if version_parts.len() > 1 {
-        minor_version = version_parts[1];
-    }
-    let minor_version_digits: String = minor_version.chars().filter(|c| c.is_digit(10)).collect();
-    let version_string_formatted = format!("{}.{}", major_version_digits, minor_version_digits);
-    let version = version_string_formatted.parse::<f32>()?;
-    Ok(version)
+    version_string.parse::<crate::config::defs::ToolVersion>()
+        .map_err(|e| anyhow!("Failed to parse {} version token {:?}: {}",
+            cmd_tag_owned, version_string, e))
 }
 
 pub mod fastp {
@@ -183,10 +175,10 @@ pub mod fastp {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the fastp version
+    /// Result<crate::config::defs::ToolVersion>: the fastp version
     pub async fn fastp_presence_check(
         config: &RunConfig,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             FASTP_TAG,
             vec!["-v"],
@@ -246,9 +238,9 @@ mod pigz {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the pigz version
+    /// Result<crate::config::defs::ToolVersion>: the pigz version
     #[allow(dead_code)]
-    pub async fn pigz_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn pigz_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             PIGZ_TAG,
             vec!["--version"],
@@ -290,8 +282,8 @@ mod h5dump {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the h5dump version
-    pub async fn h5dump_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the h5dump version
+    pub async fn h5dump_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             H5DUMP_TAG,
             vec!["-V"],
@@ -374,7 +366,7 @@ pub mod minimap2 {
     pub async fn minimap2_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             MINIMAP2_TAG,
             vec!["--version"],
@@ -980,7 +972,7 @@ pub mod samtools {
     /// Checks if `samtools` is present and returns its version.
     pub async fn samtools_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             SAMTOOLS_TAG,
             vec!["--version"],
@@ -1138,10 +1130,10 @@ pub mod bcftools {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the bcftools version
+    /// Result<crate::config::defs::ToolVersion>: the bcftools version
     pub async fn bcftools_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             BCFTOOLS_TAG,
             vec!["-v"],
@@ -1227,8 +1219,8 @@ pub mod kraken2 {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the kraken2 version
-    pub async fn kraken2_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the kraken2 version
+    pub async fn kraken2_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             KRAKEN2_TAG,
             vec!["--version"],
@@ -1321,8 +1313,8 @@ pub mod ivar {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the ivar version
-    pub async fn ivar_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the ivar version
+    pub async fn ivar_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             IVAR_TAG,
             vec!["version"],
@@ -1387,8 +1379,8 @@ pub mod muscle {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the muscle version
-    pub async fn muscle_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the muscle version
+    pub async fn muscle_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             MUSCLE_TAG,
             vec!["-version"],
@@ -1417,8 +1409,8 @@ pub mod mafft {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the mafft version
-    pub async fn mafft_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the mafft version
+    pub async fn mafft_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             MAFFT_TAG,
             vec!["--version"],
@@ -1473,8 +1465,8 @@ pub mod quast {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the quast version
-    pub async fn quast_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the quast version
+    pub async fn quast_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             QUAST_TAG,
             vec!["-v"],
@@ -1542,8 +1534,8 @@ pub mod nucmer {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the nucmer version
-    pub async fn nucmer_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the nucmer version
+    pub async fn nucmer_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             NUCMER_TAG,
             vec!["--version"],
@@ -1671,10 +1663,10 @@ pub mod seqkit {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the seqkit version
+    /// Result<crate::config::defs::ToolVersion>: the seqkit version
     pub async fn seqkit_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             SEQKIT_TAG,
             vec!["--help"],
@@ -1795,10 +1787,10 @@ pub mod bowtie2 {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the bowtie2 version
+    /// Result<crate::config::defs::ToolVersion>: the bowtie2 version
     pub async fn bowtie2_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             BOWTIE2_TAG,
             vec!["-h"],
@@ -2143,7 +2135,7 @@ pub mod hisat2 {
 
     pub async fn hisat2_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             HISAT2_TAG,
             vec!["--version"],
@@ -2483,7 +2475,7 @@ pub mod kallisto {
 
     pub async fn kallisto_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             KALLISTO_TAG,
             vec!["version"],
@@ -2559,7 +2551,7 @@ pub mod star {
 
     pub struct StarArgGenerator;
 
-    pub async fn star_presence_check(config: &RunConfig) -> anyhow::Result<f32> {
+    pub async fn star_presence_check(config: &RunConfig) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             STAR_TAG,
             vec!["--version"],
@@ -2777,8 +2769,8 @@ pub mod czid_dedup {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the czid-dedup version
-    pub async fn czid_dedup_presence_check(config: &RunConfig) -> Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the czid-dedup version
+    pub async fn czid_dedup_presence_check(config: &RunConfig) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             CZID_DEDUP_TAG,
             vec!["--help"],
@@ -2883,7 +2875,7 @@ pub mod diamond {
     pub async fn diamond_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             DIAMOND_TAG,
             vec!["help"],
@@ -3327,11 +3319,11 @@ pub mod spades {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the spades version
+    /// Result<crate::config::defs::ToolVersion>: the spades version
     pub async fn spades_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             SPADES_TAG,
             vec!["-v"],
@@ -3458,7 +3450,7 @@ pub mod makeblastdb {
     /// Checks if `makeblastdb` is present and returns its version.
     pub async fn makeblastdb_presence_check(
         config: &RunConfig,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             MAKEBLASTDB_TAG,
             vec!["-version"],
@@ -3546,7 +3538,7 @@ pub mod blastn {
     /// Checks if `blastn` is present and returns its version.
     pub async fn blastn_presence_check(
         config: &RunConfig,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             BLASTN_TAG,
             vec!["-version"],
@@ -3634,7 +3626,7 @@ pub mod blastx {
     /// Checks if `blastx` is present and returns its version.
     pub async fn blastx_presence_check(
         config: &RunConfig,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             BLASTX_TAG,
             vec!["-version"],
@@ -3709,8 +3701,8 @@ pub mod sort {
     ///
     /// # Returns
     ///
-    /// Result<f32>: the sort version
-    pub async fn sort_presence_check(config: &RunConfig) -> Result<f32> {
+    /// Result<crate::config::defs::ToolVersion>: the sort version
+    pub async fn sort_presence_check(config: &RunConfig) -> Result<crate::config::defs::ToolVersion> {
         // GNU sort doesn't have a clean --version that always works the same way,
         // but "sort --version" is reliable on all modern coreutils.
         let version = version_check(
@@ -4411,7 +4403,7 @@ pub mod mmseqs {
 
     pub async fn mmseqs_presence_check(
         _config: &RunConfig,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let output = Command::new(MMSEQS_TAG)
             .arg("version")
             .output()
@@ -4430,7 +4422,7 @@ pub mod mmseqs {
             ));
         }
 
-        Ok(0.0)
+        Ok(crate::config::defs::ToolVersion::new(0, 0, 0))
     }
 
     pub async fn spawn_gpuserver(
@@ -4758,7 +4750,7 @@ pub mod flye {
     pub async fn flye_presence_check(
         config: &RunConfig,
         version_file: Option<PathBuf>,
-    ) -> Result<f32> {
+    ) -> Result<crate::config::defs::ToolVersion> {
         let version = version_check(
             FLYE_TAG,
             vec!["--version"],
@@ -4943,7 +4935,7 @@ pub mod rgi {
 
     pub async fn rgi_presence_check(
         config: &RunConfig,
-    ) -> anyhow::Result<f32> {
+    ) -> anyhow::Result<crate::config::defs::ToolVersion> {
         version_check(
             RGI_TAG,
             vec!["main", "--version"],
