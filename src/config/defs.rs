@@ -69,31 +69,113 @@ pub static SIMD_LEVEL: Lazy<SimdLevel> = Lazy::new(|| {
 });
 
 
+/// Numeric tool version; suffixes and fourth/build components are ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ToolVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl ToolVersion {
+    pub const fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self { major, minor, patch }
+    }
+}
+
+impl std::fmt::Display for ToolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+impl std::str::FromStr for ToolVersion {
+    type Err = String;
+
+    fn from_str(token: &str) -> Result<Self, Self::Err> {
+        let start = token.find(|c: char| c.is_ascii_digit())
+            .ok_or_else(|| format!("No numeric version found in {:?}", token))?;
+        let mut values = [0_u32; 3];
+        for (value, part) in values.iter_mut().zip(token[start..].split('.')) {
+            let digits: String = part.chars()
+                .take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return Err(format!("Invalid version component in {:?}", token));
+            }
+            *value = digits.parse::<u32>()
+                .map_err(|e| format!("Invalid version {:?}: {}", token, e))?;
+            // Stop at suffixes: 24-r1122 is 24, not 241122.
+            if digits.len() != part.len() {
+                break;
+            }
+        }
+        Ok(Self::new(values[0], values[1], values[2]))
+    }
+}
+
+#[cfg(test)]
+mod tool_version_tests {
+    use super::ToolVersion;
+
+    #[test]
+    fn parses_tool_tokens() {
+        for (token, expected) in [
+            ("v2.2.8.188", (2, 2, 8)),
+            ("v2.2.9.190", (2, 2, 9)),
+            ("2.24-r1122", (2, 24, 0)),
+            ("2.2.1", (2, 2, 1)),
+            ("2.12.0+", (2, 12, 0)),
+            ("7.525", (7, 525, 0)),
+            ("1.19", (1, 19, 0)),
+            ("2", (2, 0, 0)),
+            ("2.2.9-rc1", (2, 2, 9)),
+        ] {
+            assert_eq!(token.parse::<ToolVersion>().unwrap(),
+                       ToolVersion::new(expected.0, expected.1, expected.2));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_tokens() {
+        for token in ["", "version", "v", "2..9", "2.", "4294967296.0.0"] {
+            assert!(token.parse::<ToolVersion>().is_err(), "{}", token);
+        }
+    }
+
+    #[test]
+    fn compares_numeric_components() {
+        assert!(ToolVersion::new(2, 2, 8) < ToolVersion::new(2, 2, 9));
+        assert!(ToolVersion::new(2, 3, 0) > ToolVersion::new(2, 2, 9));
+        assert!(ToolVersion::new(2, 10, 0) > ToolVersion::new(2, 9, 99));
+        assert_eq!(ToolVersion::new(2, 2, 9).to_string(), "2.2.9");
+    }
+}
+
 lazy_static! {
-    pub static ref TOOL_VERSIONS: HashMap<&'static str, f32> = {
+    pub static ref TOOL_VERSIONS: HashMap<&'static str, ToolVersion> = {
         let mut m = HashMap::new();
-        m.insert(SAMTOOLS_TAG, 1.19);
-        m.insert(BCFTOOLS_TAG, 1.19);
-        m.insert(MINIMAP2_TAG, 2.24);
-        m.insert(KRAKEN2_TAG, 2.1);
-        m.insert(PIGZ_TAG, 2.5);
-        m.insert(FASTP_TAG, 1.0);
-        m.insert(MAFFT_TAG, 7.5);
-        m.insert(QUAST_TAG, 5.20);
-        m.insert(SEQKIT_TAG, 2.10);
-        m.insert(BOWTIE2_TAG, 2.50);
-        m.insert(KALLISTO_TAG, 0.5);
-        m.insert(HISAT2_TAG, 2.20);
-        m.insert(STAR_TAG, 2.7);
-        m.insert(CZID_DEDUP_TAG, 0.1);
-        m.insert(DIAMOND_TAG, 2.1);
-        m.insert(SPADES_TAG, 4.2);
-        m.insert(BLASTN_TAG, 2.12);
-        m.insert(BLASTX_TAG, 2.12);
-        m.insert(MAKEBLASTDB_TAG, 2.12);
-        m.insert(MMSEQS_TAG, 0.0);
-        m.insert(FLYE_TAG, 2.9);
-        m.insert(RGI_TAG, 6.0);
+        m.insert(SAMTOOLS_TAG, ToolVersion::new(1, 19, 0));
+        m.insert(BCFTOOLS_TAG, ToolVersion::new(1, 19, 0));
+        m.insert(MINIMAP2_TAG, ToolVersion::new(2, 24, 0));
+        m.insert(KRAKEN2_TAG, ToolVersion::new(2, 1, 0));
+        m.insert(PIGZ_TAG, ToolVersion::new(2, 5, 0));
+        m.insert(FASTP_TAG, ToolVersion::new(1, 0, 0));
+        m.insert(MAFFT_TAG, ToolVersion::new(7, 5, 0));
+        m.insert(QUAST_TAG, ToolVersion::new(5, 2, 0));
+        m.insert(SEQKIT_TAG, ToolVersion::new(2, 10, 0));
+        m.insert(BOWTIE2_TAG, ToolVersion::new(2, 5, 0));
+        m.insert(KALLISTO_TAG, ToolVersion::new(0, 5, 0));
+        m.insert(HISAT2_TAG, ToolVersion::new(2, 2, 0));
+        m.insert(STAR_TAG, ToolVersion::new(2, 7, 0));
+        m.insert(CZID_DEDUP_TAG, ToolVersion::new(0, 1, 0));
+        m.insert(DIAMOND_TAG, ToolVersion::new(2, 2, 9));
+        m.insert(SPADES_TAG, ToolVersion::new(4, 2, 0));
+        m.insert(BLASTN_TAG, ToolVersion::new(2, 12, 0));
+        m.insert(BLASTX_TAG, ToolVersion::new(2, 12, 0));
+        m.insert(MAKEBLASTDB_TAG, ToolVersion::new(2, 12, 0));
+        m.insert(MMSEQS_TAG, ToolVersion::new(0, 0, 0));
+        m.insert(FLYE_TAG, ToolVersion::new(2, 9, 0));
+        m.insert(RGI_TAG, ToolVersion::new(6, 0, 0));
         m
     };
 }
