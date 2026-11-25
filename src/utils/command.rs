@@ -3709,7 +3709,7 @@ pub mod sort {
             "sort",
             vec!["--version"],
             0,
-            1,
+            3,
             ChildStream::Stdout,
             None,
             &config,
